@@ -20,6 +20,7 @@ typedef struct {
 typedef struct {
     h2o_multithread_receiver_t receiver;
     h2o_linklist_t generators;
+    uint64_t drain_deadline_ns;
 } php_context_t;
 typedef struct {
     h2o_multithread_message_t super;
@@ -276,7 +277,7 @@ static void pump_input(php_generator_t *g)
 static int write_request(void *data, int is_end_stream)
 {
     php_generator_t *g = data;
-    if (!g->native || g->aborted) return -1;
+    if (!g->native || g->aborted || (g->finalized && !g->started)) return -1;
     g->input_waiting = 1;
     g->input_offset = 0;
     g->input_eof = is_end_stream;
@@ -439,11 +440,25 @@ static int handle_request(h2o_handler_t *self, h2o_req_t *req)
     h2o_linklist_insert(&ctx->generators, &g->context_link);
     r->notify = notify_request; r->notify_data = &ctx->receiver; r->network_data = g;
     uint64_t timeout = handler->config.timeout_ms ? handler->config.timeout_ms : hp_config.request_timeout_ms;
-    if (timeout) { r->deadline_ns = hp_now_ns() + timeout * 1000000; h2o_timer_link(req->conn->ctx->loop, timeout, &g->timeout); }
+    uint64_t now = hp_now_ns();
+    r->deadline_ns = now + timeout * 1000000;
+    if (req->conn->ctx->shutdown_requested) {
+        uint64_t remaining = ctx->drain_deadline_ns
+            ? (ctx->drain_deadline_ns > now ? (ctx->drain_deadline_ns - now + 999999) / 1000000 : 0)
+            : hp_config.shutdown_timeout_ms;
+        if (remaining < timeout) timeout = remaining;
+    }
+    h2o_timer_link(req->conn->ctx->loop, timeout, &g->timeout);
     g->input_waiting = 1; g->input_eof = req->proceed_req == NULL;
     if (req->proceed_req) { req->write_req.cb = write_request; req->write_req.ctx = g; }
     if (hp_runtime_submit(r) != 0) {
-        close_generator(g);
+        /* The core error generator can itself wait on network flow control.
+         * Retain our context and timer until pool disposal so rejected work
+         * remains bounded, including streams dispatched after drain began. */
+        pthread_mutex_lock(&r->mutex);
+        r->status = 503; r->headers_ready = true; r->response_finished = true; r->state = HP_FAILED;
+        pthread_mutex_unlock(&r->mutex);
+        g->finalized = 1;
         h2o_send_error_503(req, "Service Unavailable", "PHP request queue is full or draining\n", H2O_SEND_ERROR_HTTP1_CLOSE_CONNECTION);
         return 0;
     }
@@ -470,6 +485,7 @@ void hp_h2o_register(h2o_pathconf_t *path, const hp_route_config_t *config)
 void h2o_php_context_shutdown(void *context)
 {
     h2o_context_t *ctx = context;
+    uint64_t drain_deadline_ns = hp_now_ns() + hp_config.shutdown_timeout_ms * 1000000;
     /* Called by the owning loop after listener shutdown. PHP execution can
      * already have completed while its final response still waits on TCP or
      * HTTP/2 flow control, so the scheduler's active list alone is insufficient. */
@@ -480,6 +496,7 @@ void h2o_php_context_shutdown(void *context)
             h2o_handler_t *handler = path->handlers.entries[j];
             if (handler->on_context_init != context_init) continue;
             php_context_t *p = h2o_context_get_handler_context(ctx, handler);
+            p->drain_deadline_ns = drain_deadline_ns;
             for (h2o_linklist_t *link = p->generators.next; link != &p->generators; link = link->next) {
                 php_generator_t *g = H2O_STRUCT_FROM_MEMBER(php_generator_t, context_link, link);
                 if (h2o_timer_is_linked(&g->timeout)) h2o_timer_unlink(&g->timeout);
