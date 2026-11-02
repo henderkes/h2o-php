@@ -33,6 +33,7 @@ typedef struct {
     h2o_timer_t timeout;
     h2o_linklist_t context_link;
     size_t input_offset;
+    int abort_status;
     unsigned started : 1, in_flight : 1, finalized : 1, input_waiting : 1, input_eof : 1, aborted : 1;
 } php_generator_t;
 
@@ -169,15 +170,24 @@ static void abort_response(php_generator_t *g, int status)
         h2o_send(req, NULL, 0, H2O_SEND_STATE_ERROR);
     }
 }
+static void schedule_abort(php_generator_t *g, int status)
+{
+    if (!g->native || !g->req || g->aborted) return;
+    if (!g->abort_status) g->abort_status = status;
+    /* Input/proceed callbacks can have protocol frames above them that still
+     * use the request. Tear down transport only from an independent timer. */
+    if (h2o_timer_is_linked(&g->timeout)) h2o_timer_unlink(&g->timeout);
+    h2o_timer_link(g->req->conn->ctx->loop, 0, &g->timeout);
+}
 static void pump_output(php_generator_t *g)
 {
     if (!g->native || g->aborted) return;
     hp_request_t *r = g->native;
     pthread_mutex_lock(&r->mutex);
     bool cancelled = r->cancelled;
-    int cancellation_status = r->status >= 500 ? r->status : 504;
+    int status = r->status >= 500 ? r->status : 504;
     pthread_mutex_unlock(&r->mutex);
-    if (cancelled) { abort_response(g, cancellation_status); return; }
+    if (cancelled) { schedule_abort(g, status); return; }
     if (g->finalized || g->in_flight) return;
     for (;;) {
         pthread_mutex_lock(&r->mutex);
@@ -252,7 +262,7 @@ static void pump_input(php_generator_t *g)
     if (n || eof) {
         if (hp_request_body_push(r, g->req->entity.base ? g->req->entity.base + g->input_offset : "", n, eof) != 0) {
             hp_request_cancel(r);
-            abort_response(g, 503);
+            schedule_abort(g, 503);
             return;
         }
         g->input_offset += n;
@@ -286,10 +296,11 @@ static void on_timeout(h2o_timer_t *timer)
         return;
     }
     pthread_mutex_lock(&g->native->mutex);
-    g->native->state = HP_TIMED_OUT;
+    if (!g->abort_status) g->native->state = HP_TIMED_OUT;
+    int status = g->abort_status ? g->abort_status : 504;
     pthread_mutex_unlock(&g->native->mutex);
     hp_request_cancel(g->native);
-    abort_response(g, 504);
+    abort_response(g, status);
 }
 static void set_address(h2o_req_t *req, hp_request_t *r, int peer)
 {
