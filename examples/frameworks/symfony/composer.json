@@ -1,0 +1,11 @@
+{
+  "name": "h2o-php/symfony-worker-example",
+  "type": "project",
+  "require": {
+    "php": "^8.5",
+    "symfony/runtime": "^8.0",
+    "symfony/http-kernel": "^8.0",
+    "symfony/routing": "^8.0"
+  },
+  "config": {"allow-plugins": {"symfony/runtime": true}}
+}

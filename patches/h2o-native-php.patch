@@ -1,0 +1,173 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8a25b1b..e6814f6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -128,7 +128,7 @@ IF(OPENSSL_VERSION VERSION_EQUAL "1.1.0" AND OPENSSL_VERSION STRLESS "1.1.0g")
+                 "   *************************************************************************\n")
+ ENDIF(OPENSSL_VERSION VERSION_EQUAL "1.1.0" AND OPENSSL_VERSION STRLESS "1.1.0g")
+ 
+-CHECK_DTRACE(${CMAKE_SOURCE_DIR}/deps/picotls/picotls-probes.d)
++CHECK_DTRACE(${CMAKE_CURRENT_SOURCE_DIR}/deps/picotls/picotls-probes.d)
+ OPTION(WITH_DTRACE "use USDT (userspace Dtrace probes)" ${HAVE_DTRACE})
+ IF (WITH_DTRACE)
+     MESSAGE(STATUS "Enabling USDT support")
+@@ -500,9 +500,9 @@ IF (WITH_ZSTD)
+ ENDIF (WITH_ZSTD)
+ 
+ IF (WITH_DTRACE)
+-    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_SOURCE_DIR}/deps/picotls/picotls-probes.d picotls)
+-    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_SOURCE_DIR}/deps/quicly/quicly-probes.d quicly)
+-    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_SOURCE_DIR}/h2o-probes.d h2o)
++    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_CURRENT_SOURCE_DIR}/deps/picotls/picotls-probes.d picotls)
++    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_CURRENT_SOURCE_DIR}/deps/quicly/quicly-probes.d quicly)
++    DEFINE_DTRACE_DEPENDENCIES(${CMAKE_CURRENT_SOURCE_DIR}/h2o-probes.d h2o)
+     LIST(APPEND LIB_SOURCE_FILES
+          ${CMAKE_CURRENT_BINARY_DIR}/picotls-probes.h
+          ${CMAKE_CURRENT_BINARY_DIR}/quicly-probes.h
+diff --git a/include/h2o.h b/include/h2o.h
+index 48333ec..1d26cb2 100644
+--- a/include/h2o.h
++++ b/include/h2o.h
+@@ -120,6 +120,11 @@ typedef struct st_h2o_handler_t {
+     void (*on_context_init)(struct st_h2o_handler_t *self, h2o_context_t *ctx);
+     void (*on_context_dispose)(struct st_h2o_handler_t *self, h2o_context_t *ctx);
+     void (*dispose)(struct st_h2o_handler_t *self);
++    /**
++     * Returns 0 when dispatched, -1 when declined. A streaming-capable dispatcher
++     * may return -2 before consuming input to request full-body redispatch when
++     * its selected downstream handler does not support request streaming.
++     */
+     int (*on_req)(struct st_h2o_handler_t *self, h2o_req_t *req);
+     /**
+      * If the flag is set, protocol handler may invoke the request handler before receiving the end of the request body. The request
+diff --git a/lib/core/request.c b/lib/core/request.c
+index 773e117..43fe073 100644
+--- a/lib/core/request.c
++++ b/lib/core/request.c
+@@ -172,7 +172,13 @@ static void call_handlers(h2o_req_t *req, h2o_handler_t **handler)
+         if (!(*handler)->supports_request_streaming && !req->dispatched && req->proceed_req != NULL && !req->is_tunnel_req)
+             return;
+         req->handler = *handler;
+-        if ((*handler)->on_req(*handler, req) == 0) {
++        int handler_result = (*handler)->on_req(*handler, req);
++#ifdef H2O_WITH_PHP
++        /* File dispatch can select a legacy nonstreaming extension handler. */
++        if (handler_result == -2 && !req->dispatched && req->proceed_req != NULL)
++            return;
++#endif
++        if (handler_result == 0) {
+             req->dispatched = 1;
+             return;
+         }
+diff --git a/lib/handler/file.c b/lib/handler/file.c
+index 0c2aec2..651e675 100644
+--- a/lib/handler/file.c
++++ b/lib/handler/file.c
+@@ -668,6 +668,13 @@ static int delegate_dynamic_request(h2o_req_t *req, h2o_iovec_t script_name, h2o
+     assert(mime_type->data.dynamic.pathconf.handlers.size == 1);
+     assert(mime_type->data.dynamic.pathconf._filters.size == 0);
+     assert(mime_type->data.dynamic.pathconf._loggers.size == 0);
++#ifdef H2O_WITH_PHP
++    /* Defer before touching file metadata or environment; the protocol layer
++     * retains the body and retries after EOF for legacy extension handlers. */
++    if (req->proceed_req != NULL && !req->dispatched &&
++        !mime_type->data.dynamic.pathconf.handlers.entries[0]->supports_request_streaming)
++        return -2;
++#endif
+ 
+     /* setup CGI attributes (e.g., PATH_INFO) */
+     filereq = h2o_mem_alloc_pool(&req->pool, *filereq, 1);
+@@ -967,8 +974,11 @@ static int on_req(h2o_handler_t *_self, h2o_req_t *req)
+     if (errno == ENFILE || errno == EMFILE) {
+         h2o_send_error_503(req, "Service Unavailable", "please try again later", 0);
+     } else {
+-        if (h2o_mimemap_has_dynamic_type(self->mimemap) && try_dynamic_request(self, req, rpath, rpath_len) == 0)
+-            return 0;
++        if (h2o_mimemap_has_dynamic_type(self->mimemap)) {
++            int dynamic_result = try_dynamic_request(self, req, rpath, rpath_len);
++            if (dynamic_result == 0 || dynamic_result == -2)
++                return dynamic_result;
++        }
+         if (errno == ENOENT || errno == ENOTDIR) {
+             return -1;
+         } else {
+@@ -1028,6 +1038,9 @@ h2o_file_handler_t *h2o_file_register(h2o_pathconf_t *pathconf, const char *real
+     self->super.on_context_dispose = on_context_dispose;
+     self->super.dispose = on_handler_dispose;
+     self->super.on_req = on_req;
++#ifdef H2O_WITH_PHP
++    self->super.supports_request_streaming = 1;
++#endif
+ 
+     /* setup attributes */
+     self->conf_path = h2o_strdup_slashed(NULL, pathconf->path.base, pathconf->path.len);
+@@ -1108,6 +1121,9 @@ h2o_handler_t *h2o_file_register_file(h2o_pathconf_t *pathconf, const char *real
+     self->super.on_context_dispose = specific_handler_on_context_dispose;
+     self->super.dispose = specific_handler_on_dispose;
+     self->super.on_req = specific_handler_on_req;
++#ifdef H2O_WITH_PHP
++    self->super.supports_request_streaming = 1;
++#endif
+ 
+     self->real_path = h2o_strdup(NULL, real_path, SIZE_MAX);
+     h2o_mem_addref_shared(mime_type);
+diff --git a/src/main.c b/src/main.c
+index 826599c..f541176 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -99,6 +99,7 @@
+ #include "h2o/io_uring.h"
+ #endif
+ #include "standalone.h"
++#include "h2o_php.h"
+ #include "../lib/probes_.h"
+ 
+ #if defined(__linux__)
+@@ -4863,6 +4864,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+             listeners[i].http3.ctx.super.acceptor = NULL;
+         }
+     }
++    hp_runtime_begin_shutdown();
+     h2o_context_request_shutdown(&conf.threads[thread_index].ctx);
+ 
+     /* Wait until all the connections get closed. At least one worker thread that closed the last connection, turning
+@@ -4875,6 +4877,9 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+     static pthread_mutex_t cleanup_lock = PTHREAD_MUTEX_INITIALIZER;
+     pthread_mutex_lock(&cleanup_lock);
+ 
++    /* Connections have drained; execution threads must stop before PHP module shutdown. */
++    hp_runtime_stop();
++
+     /* remove the pid file */
+     if (conf.pid_file != NULL)
+         unlink(conf.pid_file);
+@@ -5193,6 +5198,7 @@ static void setup_configurators(void)
+     h2o_errordoc_register_configurator(&conf.globalconf);
+     h2o_fastcgi_register_configurator(&conf.globalconf);
+     h2o_file_register_configurator(&conf.globalconf);
++    h2o_php_register_configurator(&conf.globalconf);
+     h2o_throttle_resp_register_configurator(&conf.globalconf);
+     h2o_headers_register_configurator(&conf.globalconf);
+     h2o_proxy_register_configurator(&conf.globalconf);
+@@ -5342,6 +5348,8 @@ int main(int argc, char **argv)
+                 break;
+             case 'v':
+                 printf("h2o version " H2O_VERSION "\n");
++                printf("h2o-php runtime revision: %s\nH2O revision: %s\nPHP: %s (ZTS: YES, ABI: %d)\n",
++                       H2O_PHP_REVISION, H2O_PHP_H2O_REVISION, H2O_PHP_PHP_VERSION, H2O_PHP_PHP_ABI);
+                 printf("OpenSSL: %s\n", OpenSSL_version(OPENSSL_VERSION));
+ #if H2O_USE_MRUBY
+                 printf(
+@@ -5719,6 +5727,12 @@ int main(int argc, char **argv)
+         error_log_fd = -1;
+     }
+ 
++    /* The PHP engine is initialized only after process setup and privilege dropping. */
++    if (hp_runtime_start() != 0) {
++        fprintf(stderr, "failed to initialize embedded PHP runtime\n");
++        return EX_SOFTWARE;
++    }
++
+     /* start the threads */
+     conf.threads = h2o_mem_alloc(sizeof(conf.threads[0]) * conf.thread_map.size);
+     for (size_t i = 1; i != conf.thread_map.size; ++i) {

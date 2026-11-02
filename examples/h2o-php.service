@@ -1,0 +1,19 @@
+[Unit]
+Description=H2O with embedded ZTS PHP
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/h2o-php -m worker -c /etc/h2o-php/h2o.conf
+KillSignal=SIGTERM
+TimeoutStopSec=35
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+User=www-data
+Group=www-data
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

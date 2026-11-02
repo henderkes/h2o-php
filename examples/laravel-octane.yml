@@ -1,0 +1,27 @@
+listen:
+  host: 127.0.0.1
+  port: 18085
+num-threads: 2
+php.runtime:
+  threads: 2
+  max-threads: 16
+  request-timeout: 10s
+php.ini:
+  opcache.enable: '1'
+  opcache.validate_timestamps: '0'
+hosts:
+  laravel.local:18085:
+    paths:
+      /:
+        php.root: /home/m/h2o-php/build/frameworks/laravel/public
+        php.worker:
+          file: /home/m/h2o-php/build/frameworks/laravel/vendor/laravel/octane/bin/frankenphp-worker.php
+          num: 1
+          env:
+            APP_BASE_PATH: /home/m/h2o-php/build/frameworks/laravel
+            APP_ENV: production
+            APP_DEBUG: 'false'
+            SESSION_DRIVER: array
+            CACHE_STORE: array
+            LOG_CHANNEL: stderr
+            MAX_REQUESTS: '1000'

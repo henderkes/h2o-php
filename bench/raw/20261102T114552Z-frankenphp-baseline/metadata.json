@@ -1,0 +1,18 @@
+{
+  "base_url": "http://127.0.0.1:18081",
+  "pid": 30653,
+  "label": "frankenphp-baseline",
+  "duration": 10,
+  "warmup": 3,
+  "repeat": 3,
+  "threads": 4,
+  "connections": "1,8,32,128",
+  "workloads": "minimal,json,worker",
+  "stability": 0,
+  "utc": "20261102T114552Z",
+  "git_commit": "c3177b5b3e5bcd4287e93fc56f8830685886d01e",
+  "machine": "Linux M-TH 6.18.33.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Fri Jun  5 01:12:21 UTC 2026 x86_64 GNU/Linux",
+  "compiler": "cc (static-php GCC) 16.1.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "php": "8.5.12",
+  "h2o": "7bbb3e39bf03027344f36b4650e5383c3b6b1014"
+}

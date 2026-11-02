@@ -1,0 +1,13 @@
+listen: 18083
+num-threads: 2
+hosts:
+  "localhost:18083":
+    paths:
+      "/":
+        file.dir: /home/m/h2o-php/examples/bench
+        file.custom-handler:
+          extension: .php
+          fastcgi.connect:
+            host: 127.0.0.1
+            port: 19000
+            type: tcp

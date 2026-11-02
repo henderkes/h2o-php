@@ -1,0 +1,30 @@
+listen: 18107
+num-threads: 2
+send-informational: all
+php.runtime:
+  threads: 2
+  max-threads: 8
+  request-timeout: 5s
+php.root: /home/m/h2o-php/examples/smoke
+php.ini:
+  output_buffering: 0
+hosts:
+  "localhost:18107":
+    paths:
+      "/worker":
+        php.worker:
+          file: /home/m/h2o-php/examples/smoke/worker.php
+          num: 1
+      "/mounted":
+        php.front-controller: index.php
+        php.classic: ON
+      "/upstream":
+        file.file: /home/m/h2o-php/examples/smoke/static.txt
+      "/proxy":
+        proxy.reverse.url: http://127.0.0.1:18107/upstream
+      "/":
+        file.dir: /home/m/h2o-php/examples/smoke
+        file.index: [index.php, index.html]
+        file.custom-handler:
+          extension: .php
+          php.classic: ON

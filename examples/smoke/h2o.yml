@@ -1,0 +1,37 @@
+listen: 18080
+num-threads: 2
+send-informational: all
+php.runtime:
+  threads: 2
+  max-threads: 16
+  request-timeout: 5s
+php.root: /home/m/h2o-php/examples/smoke
+php.ini:
+  display_errors: 1
+  output_buffering: 0
+hosts:
+  "localhost:18080":
+    paths:
+      "/worker":
+        php.worker:
+          file: /home/m/h2o-php/examples/smoke/worker.php
+          num: 1
+          max-requests: 100
+          watch:
+            - /home/m/h2o-php/examples/smoke/worker.php
+      "/metrics":
+        php.metrics: ON
+      "/restart":
+        php.restart: ON
+      "/":
+        php.front-controller: index.php
+        php.classic: ON
+        file.dir: /home/m/h2o-php/examples/smoke
+        file.custom-handler:
+          extension: .php
+          php.classic: ON
+  "second:18080":
+    paths:
+      "/":
+        php.front-controller: index.php
+        php.classic: ON

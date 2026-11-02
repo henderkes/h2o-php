@@ -1,0 +1,16 @@
+$ wrk -t 4 -c 8 -d 10s --timeout 10s --latency -s /home/m/h2o-php/bench/latency.lua http://127.0.0.1:18081/minimal.php
+Running 10s test @ http://127.0.0.1:18081/minimal.php
+  4 threads and 8 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   392.92us   98.24us   1.54ms   78.98%
+    Req/Sec     5.10k   179.50     5.57k    68.00%
+  Latency Distribution
+     50%  376.00us
+     75%  430.00us
+     90%  502.00us
+     99%  770.00us
+  202953 requests in 10.00s, 37.16MB read
+  Socket errors: connect 0, read 0, write 0, timeout 8
+Requests/sec:  20295.84
+Transfer/sec:      3.72MB
+H2O_PHP_METRICS {"requests":202953,"duration_us":9999735,"rps":20295.8378,"p50_ms":0.376000,"p95_ms":0.568000,"p99_ms":0.770000,"errors_connect":0,"errors_read":0,"errors_write":0,"errors_status":0,"errors_timeout":8}

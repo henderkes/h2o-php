@@ -1,0 +1,24 @@
+listen:
+  host: 127.0.0.1
+  port: 18084
+num-threads: 2
+php.runtime:
+  threads: 2
+  max-threads: 16
+  request-timeout: 10s
+php.ini:
+  opcache.enable: '1'
+  opcache.validate_timestamps: '0'
+hosts:
+  symfony.local:18084:
+    paths:
+      /:
+        php.root: /home/m/h2o-php/examples/frameworks/symfony
+        php.worker:
+          file: /home/m/h2o-php/examples/frameworks/symfony/index.php
+          num: 1
+          env:
+            APP_ENV: prod
+            APP_DEBUG: '0'
+      /metrics:
+        php.metrics: true

@@ -1,0 +1,27 @@
+Warning: failed to load the default certificates file at /usr/local/share/h2o/ca-bundle.crt. Proxying to HTTPS servers may fail.
+[INFO] raised RLIMIT_NOFILE to 10240
+h2o server (pid:35950) is ready to serve requests with 2 threads
+received fatal signal 4
+build/release/h2o-php[0x4eea4d]
+r/lib64/libc.so.6(+0x41570)[0x7ab1570]
+eceived fatal signal 4
+build/release/h2o-php[0x41d650]
+build/release/h2o-php[0x41da43]
+build/release/h2o-php[0x4eea4d]
+build/release/h2o-php[0x4ae7be]
+build/release/h2o-php[0x4753de]
+build/release/h2o-php[0x47b246]
+/lib64/libc.so.6(+0x41570)[0x7ab1570]
+build/release/h2o-php[0x4f129d]
+build/release/h2o-php[0x41d650]
+build/release/h2o-php[0x40f129]
+/lib64/libc.so.6(+0x2a5c8)[0x7a9a5c8]
+build/release/h2o-php[0x41da43]
+build/release/h2o-php[0x4ae7be]
+build/release/h2o-php[0x4753de]
+/lib64/libc.so.6(__libc_start_main+0x8b)[0x7a9a68b]
+build/release/h2o-php[0x47b246]
+build/release/h2o-php[0x40f235]
+build/release/h2o-php[0x4f129d]
+/lib64/libc.so.6(+0x98cbd)[0x7b08cbd]
+/lib64/libc.so.6(__clone+0x44)[0x7b7b8b4]

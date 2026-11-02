@@ -1,0 +1,11 @@
+# Native runtime architecture and ownership
+
+The real H2O standalone target owns every connection and HTTP protocol. Dedicated pthreads own stable TSRM state and execute PHP. No H2O request is dereferenced by a PHP thread. The common C ABI is `include/h2o_php.h`; Zend calls and bailout boundaries stay in C.
+
+A heap request copies HTTP metadata. The network request owns one reference; scheduler admission owns another until execution ends; each queued completion notification owns another. Network-pool disposal clears `network_data` on its owning loop and cancels the native request. Completion messages coalesce to one pending notification per request. Receivers outlive PHP producers. Output chunks transfer from the synchronized queue to the H2O generator and remain alive through the next `proceed` callback. Input readers block only PHP threads; consumption notifications let the network thread resume H2O input.
+
+The request mutex protects body/output queues, response headers, cancellation, completion, and state. Scheduler mutex protects dispatch queues, drain state, and worker inventory; never execute PHP while holding it. Do not nest a request mutex inside the scheduler mutex. Notification callbacks run without the request lock. Reference counts and metrics use C11 atomics.
+
+Request states: CREATED → QUEUED → RUNNING → RESPONDING → COMPLETED, or CANCELLED/TIMED_OUT/FAILED. Worker states: STARTING → BOOTSTRAPPING → READY ↔ BUSY → DRAINING → STOPPED, with RESTARTING/FAILED paths. Worker queues are per application, so one application's backlog cannot consume another application's execution threads. The process admission budget bounds all queues together. Input and output have independent byte budgets; producers wait on conditions and are awakened on cancellation/drain.
+
+Ownership: coordinator owns common ABI, bridge, scheduler and integration review; SAPI agent owns `src/sapi` and `src/php`; H2O agent owns `src/h2o`, `src/config`, and standalone lifecycle patch; build/benchmark agent owns CMake, `cmake`, `bench`, benchmark documentation and install instructions. Shared-workspace integration is used with nonoverlapping ownership. Source changes are integrated and validated by the coordinator before acceptance.

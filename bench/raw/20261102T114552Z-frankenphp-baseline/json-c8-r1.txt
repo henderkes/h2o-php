@@ -1,0 +1,15 @@
+$ wrk -t 4 -c 8 -d 10s --timeout 10s --latency -s /home/m/h2o-php/bench/latency.lua http://127.0.0.1:18081/json.php
+Running 10s test @ http://127.0.0.1:18081/json.php
+  4 threads and 8 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   559.52us  139.09us   2.79ms   73.25%
+    Req/Sec     3.58k   145.16     4.08k    70.54%
+  Latency Distribution
+     50%  539.00us
+     75%  630.00us
+     90%  735.00us
+     99%    1.00ms
+  143834 requests in 10.10s, 1.32GB read
+Requests/sec:  14240.91
+Transfer/sec:    133.59MB
+H2O_PHP_METRICS {"requests":143834,"duration_us":10100058,"rps":14240.9083,"p50_ms":0.539000,"p95_ms":0.815000,"p99_ms":0.998000,"errors_connect":0,"errors_read":0,"errors_write":0,"errors_status":0,"errors_timeout":0}

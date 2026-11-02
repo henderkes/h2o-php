@@ -1,0 +1,18 @@
+listen: 18105
+num-threads: 2
+send-informational: all
+php.runtime:
+  threads: 2
+  max-threads: 8
+  request-timeout: 5s
+php.root: /home/m/h2o-php/examples/smoke
+php.ini:
+  output_buffering: 0
+hosts:
+  "localhost:18105":
+    paths:
+      "/":
+        php.worker:
+          file: /home/m/h2o-php/examples/smoke/worker.php
+          num: 1
+          max-requests: 1000

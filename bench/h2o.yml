@@ -1,0 +1,37 @@
+listen: 18080
+num-threads: 2
+send-informational: all
+php.runtime:
+  threads: 4
+  max-threads: 8
+  queue-limit: 1024
+  max-wait-time: 10s
+  request-timeout: 30s
+  shutdown-timeout: 30s
+  max-buffered-body: 262144
+  max-buffered-response: 262144
+  max-buffered-global: 67108864
+php.root: /home/m/h2o-php/examples/bench
+php.ini:
+  opcache.enable: 1
+  opcache.enable_cli: 1
+  opcache.jit: off
+  output_buffering: 0
+  display_errors: 0
+hosts:
+  "localhost:18080":
+    paths:
+      "/worker":
+        php.worker:
+          file: /home/m/h2o-php/examples/bench/worker.php
+          num: 4
+          max-requests: 10000
+      "/metrics":
+        php.metrics: ON
+      "/restart":
+        php.restart: ON
+      "/":
+        file.dir: /home/m/h2o-php/examples/bench
+        file.custom-handler:
+          extension: .php
+          php.classic: ON

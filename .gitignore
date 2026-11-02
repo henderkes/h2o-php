@@ -1,2 +1,9 @@
 .idea
+build/
+install/
+upstream/
+__pycache__/
+.tmp.dprobes.h
 
+vendor/
+.tmp.dprobes.h

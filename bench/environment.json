@@ -1,0 +1,124 @@
+{
+  "recorded_at": "2026-11-02T11:42:05.709872+00:00",
+  "kernel": {
+    "command": [
+      "uname",
+      "-a"
+    ],
+    "exit_code": 0,
+    "output": "Linux M-TH 6.18.33.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Fri Jun  5 01:12:21 UTC 2026 x86_64 GNU/Linux\n"
+  },
+  "cpu": {
+    "command": [
+      "lscpu"
+    ],
+    "exit_code": 0,
+    "output": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  24\nOn-line CPU(s) list:                     0-23\nVendor ID:                               GenuineIntel\nModel name:                              13th Gen Intel(R) Core(TM) i7-13700\nCPU family:                              6\nModel:                                   183\nThread(s) per core:                      2\nCore(s) per socket:                      12\nSocket(s):                               1\nStepping:                                1\nBogoMIPS:                                4223.99\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves avx_vnni vnmi umip waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize ibt flush_l1d arch_capabilities\nVirtualization:                          VT-x\nHypervisor vendor:                       Microsoft\nVirtualization type:                     full\nL1d cache:                               576 KiB (12 instances)\nL1i cache:                               384 KiB (12 instances)\nL2 cache:                                24 MiB (12 instances)\nL3 cache:                                30 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-23\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n"
+  },
+  "memory": {
+    "command": [
+      "free",
+      "-m"
+    ],
+    "exit_code": 0,
+    "output": "               total        used        free      shared  buff/cache   available\nMem:           24029        3442       19037          13        1871       20587\nSwap:           6144           0        6144\n"
+  },
+  "compiler": {
+    "command": [
+      "/usr/bin/gcc",
+      "--version"
+    ],
+    "exit_code": 0,
+    "output": "gcc (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4)\nCopyright (C) 2024 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+  },
+  "cmake": {
+    "command": [
+      "cmake",
+      "--version"
+    ],
+    "exit_code": 0,
+    "output": "cmake version 3.31.8\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).\n"
+  },
+  "php": {
+    "command": [
+      "php-zts",
+      "-v"
+    ],
+    "exit_code": 0,
+    "output": "PHP 8.5.12 (cli) (built: Oct 22 2026 16:32:14) (ZTS gcc 16.2.0 x86_64)\nCopyright (c) The PHP Group\nBuilt by Marc Henderkes <pkg@henderkes.com> #StandWithUkraine\nZend Engine v4.5.12, Copyright (c) Zend Technologies\n    with Zend OPcache v8.5.12, Copyright (c), by Zend Technologies\n"
+  },
+  "php_config": {
+    "command": [
+      "php-config-zts",
+      "--configure-options"
+    ],
+    "exit_code": 0,
+    "output": "--prefix= --with-valgrind=no --disable-shared --enable-static --disable-all --disable-phpdbg --disable-debug --with-pic --enable-rtld-now --enable-re2c-cgoto --disable-rpath --enable-zts --disable-zend-signals --enable-zend-max-execution-timers --with-config-file-path=/etc/php-zts --with-config-file-scan-dir=/etc/php-zts/conf.d --sysconfdir=/etc/php-zts --enable-cli --disable-fpm --disable-cgi --enable-embed=shared --enable-calendar --enable-ctype --with-curl --with-libxml=/__w/packages/packages/build/8.5 --enable-xml --enable-dom --enable-exif --enable-fileinfo --enable-filter --with-iconv=/__w/packages/packages/build/8.5 --enable-mbstring --enable-mbregex --enable-opcache-jit --with-zlib --with-zlib-dir=/__w/packages/packages/build/8.5 --with-openssl=/__w/packages/packages/build/8.5 --with-openssl-argon2 --without-password-argon2 --enable-pcntl --enable-phar --enable-posix --with-libedit --without-readline --enable-session --enable-simplexml --enable-sockets --with-sodium --enable-tokenizer --enable-xmlreader --enable-xmlwriter --enable-mysqlnd=shared --with-mysqli=shared --with-sqlite3=shared,/__w/packages/packages/build/8.5 --enable-shmop=shared --enable-soap=shared --enable-xhprof=shared --with-xsl=shared,/__w/packages/packages/build/8.5\n"
+  },
+  "frankenphp": {
+    "command": [
+      "frankenphp",
+      "version"
+    ],
+    "exit_code": 0,
+    "output": "FrankenPHP v1.13.4 PHP 8.5 Caddy v2.11.7 h1:yj0Y4fYZGPkSvibBJ1sTWE33xC0fxztVyXEW5iIdUT4=\n"
+  },
+  "php_fpm": {
+    "command": [
+      "php-fpm-zts",
+      "-v"
+    ],
+    "exit_code": 0,
+    "output": "PHP 8.5.12 (fpm-fcgi) (built: Oct 22 2026 16:32:14) (ZTS gcc 16.2.0 x86_64)\nCopyright (c) The PHP Group\nBuilt by Marc Henderkes <pkg@henderkes.com> #StandWithUkraine\nZend Engine v4.5.12, Copyright (c) Zend Technologies\n    with Zend OPcache v8.5.12, Copyright (c), by Zend Technologies\n"
+  },
+  "php_ldd": {
+    "command": [
+      "ldd",
+      "/usr/lib64/libphp-zts.so"
+    ],
+    "exit_code": 0,
+    "output": "\tlinux-vdso.so.1 (0x00007aa5ed98b000)\n\tlibresolv.so.2 => /lib64/libresolv.so.2 (0x00007aa5ed969000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007aa5ed8bd000)\n\tlibgcc_s.so.1 => /lib64/libgcc_s.so.1 (0x00007aa5ed890000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007aa5eae26000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007aa5ed98d000)\n"
+  },
+  "php_elf": {
+    "command": [
+      "readelf",
+      "-d",
+      "/usr/lib64/libphp-zts.so"
+    ],
+    "exit_code": 0,
+    "output": "\nDynamic section at offset 0x2771b90 contains 34 entries:\n  Tag        Type                         Name/Value\n 0x0000000000000001 (NEEDED)             Shared library: [libresolv.so.2]\n 0x0000000000000001 (NEEDED)             Shared library: [libm.so.6]\n 0x0000000000000001 (NEEDED)             Shared library: [libgcc_s.so.1]\n 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]\n 0x0000000000000001 (NEEDED)             Shared library: [ld-linux-x86-64.so.2]\n 0x000000000000000e (SONAME)             Library soname: [libphp-zts-85.so]\n 0x000000000000000c (INIT)               0x182000\n 0x000000000000000d (FINI)               0x14001a4\n 0x0000000000000019 (INIT_ARRAY)         0x25f2750\n 0x000000000000001b (INIT_ARRAYSZ)       16 (bytes)\n 0x000000000000001a (FINI_ARRAY)         0x25f2760\n 0x000000000000001c (FINI_ARRAYSZ)       24 (bytes)\n 0x0000000000000004 (HASH)               0x370\n 0x000000006ffffef5 (GNU_HASH)           0x264a0\n 0x0000000000000005 (STRTAB)             0xd4208\n 0x0000000000000006 (SYMTAB)             0x4fda0\n 0x000000000000000a (STRSZ)              538215 (bytes)\n 0x000000000000000b (SYMENT)             24 (bytes)\n 0x0000000000000003 (PLTGOT)             0x2771e00\n 0x0000000000000002 (PLTRELSZ)           48 (bytes)\n 0x0000000000000014 (PLTREL)             RELA\n 0x0000000000000017 (JMPREL)             0x17b608\n 0x0000000000000007 (RELA)               0x162b70\n 0x0000000000000008 (RELASZ)             101016 (bytes)\n 0x0000000000000009 (RELAENT)            24 (bytes)\n 0x000000000000001e (FLAGS)              BIND_NOW STATIC_TLS\n 0x000000006ffffffb (FLAGS_1)            Flags: NOW\n 0x000000006ffffffe (VERNEED)            0x1628d0\n 0x000000006fffffff (VERNEEDNUM)         5\n 0x000000006ffffff0 (VERSYM)             0x157870\n 0x0000000000000024 (RELR)               0x17b638\n 0x0000000000000023 (RELRSZ)             25848 (bytes)\n 0x0000000000000025 (RELRENT)            8 (bytes)\n 0x0000000000000000 (NULL)               0x0\n"
+  },
+  "h2o_commit": {
+    "command": [
+      "git",
+      "-C",
+      "upstream/h2o",
+      "rev-parse",
+      "HEAD"
+    ],
+    "exit_code": 0,
+    "output": "7bbb3e39bf03027344f36b4650e5383c3b6b1014\n"
+  },
+  "frankenphp_commit": {
+    "command": [
+      "git",
+      "-C",
+      "upstream/frankenphp",
+      "rev-parse",
+      "HEAD"
+    ],
+    "exit_code": 0,
+    "output": "4384c506d219cd2f8750edfceae57d3db8eb54f3\n"
+  },
+  "php_src_commit": {
+    "command": [
+      "git",
+      "-C",
+      "upstream/php-src",
+      "rev-parse",
+      "HEAD"
+    ],
+    "exit_code": 0,
+    "output": "136e049ac10b032c83018e65b63b6df858943750\n"
+  }
+}
