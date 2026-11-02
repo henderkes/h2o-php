@@ -18,7 +18,7 @@ struct hp_worker_group {
     atomic_uint generation;
     uint64_t watch_hash;
     unsigned started, queued_count;
-    atomic_uint live, ready, busy;
+    atomic_uint live, ready, busy, failed_threads;
 };
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -50,7 +50,7 @@ hp_worker_group_t *hp_worker_group_create(const hp_worker_config_t *c) {
     g->config.max_consecutive_failures = c->max_consecutive_failures ? c->max_consecutive_failures : 10;
     g->config.watch = calloc(c->num_watch, sizeof(char *));
     for (size_t i = 0; i < c->num_watch; ++i) g->config.watch[i] = strdup(c->watch[i]);
-    atomic_init(&g->generation, 1); atomic_init(&g->live, 0); atomic_init(&g->ready, 0); atomic_init(&g->busy, 0);
+    atomic_init(&g->generation, 1); atomic_init(&g->live, 0); atomic_init(&g->ready, 0); atomic_init(&g->busy, 0); atomic_init(&g->failed_threads, 0);
     g->next = groups; groups = g; return g;
 }
 const hp_worker_config_t *hp_worker_group_config(hp_worker_group_t *g) { return &g->config; }
@@ -81,7 +81,7 @@ Retry:
     activate(r);
     pthread_mutex_unlock(&lock);
     pthread_mutex_lock(&r->mutex);
-    r->started_ns = hp_now_ns(); r->state = HP_RUNNING;
+    r->started_ns = hp_now_ns(); if (!r->cancelled) r->state = HP_RUNNING;
     if (r->started_ns - r->queued_ns > hp_config.max_wait_ms * 1000000ULL || r->started_ns >= r->deadline_ns) {
         r->state = HP_TIMED_OUT; r->cancelled = true;
         r->status = 504; r->headers_ready = r->response_finished = true;
@@ -134,12 +134,13 @@ static void *classic_main(void *unused) {
     }
     hp_sapi_thread_shutdown(); thread_ended(); return NULL;
 }
-static bool wait_restart(unsigned ms) {
+static bool wait_restart(unsigned ms, hp_worker_group_t *g) {
     struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
     until.tv_sec += ms / 1000; until.tv_nsec += (ms % 1000) * 1000000L;
     if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
     pthread_mutex_lock(&lock);
-    while (!draining) if (pthread_cond_timedwait(&cond, &lock, &until) == ETIMEDOUT) break;
+    while (!draining && atomic_load(&g->generation) == local_generation)
+        if (pthread_cond_timedwait(&cond, &lock, &until) == ETIMEDOUT) break;
     bool stop = draining; pthread_mutex_unlock(&lock); return stop;
 }
 static void *worker_main(void *arg) {
@@ -157,9 +158,18 @@ static void *worker_main(void *arg) {
         if (rc != 0 && local_requests == 0) {
             atomic_fetch_add(&startup_failures, 1); ++failures;
             fprintf(stderr, "{\"component\":\"php.worker\",\"event\":\"startup_failed\",\"attempt\":%u,\"code\":%d}\n", failures, rc);
-            if (failures >= g->config.max_consecutive_failures) break;
+            if (failures >= g->config.max_consecutive_failures) {
+                /* Park a failed worker without busy retrying. An explicit
+                 * generation change (admin/watch/OPcache) enables recovery. */
+                pthread_mutex_lock(&lock); atomic_fetch_add(&g->failed_threads, 1);
+                while (!draining && atomic_load(&g->generation) == local_generation) pthread_cond_wait(&cond, &lock);
+                atomic_fetch_sub(&g->failed_threads, 1); stop = draining;
+                pthread_mutex_unlock(&lock);
+                failures = 0; if (stop) break; else continue;
+            }
             unsigned delay = 100U << (failures < 7 ? failures - 1 : 6);
-            if (wait_restart(delay)) break;
+            if (wait_restart(delay, g)) break;
+            if (atomic_load(&g->generation) != local_generation) failures = 0;
         } else failures = 0;
     }
     hp_sapi_thread_shutdown(); atomic_fetch_sub(&g->live, 1); thread_ended(); return NULL;
@@ -171,7 +181,7 @@ int hp_runtime_submit(hp_request_t *r) {
     unsigned share = hp_config.queue_limit / applications; if (!share) share = 1;
     unsigned waiting = r->group ? r->group->queued_count : classic_queued;
     if (draining || start_state != 2 || queued >= hp_config.queue_limit || waiting >= share ||
-        (r->group && !atomic_load(&r->group->live))) { pthread_mutex_unlock(&lock); return -1; }
+        (r->group && atomic_load(&r->group->failed_threads) >= atomic_load(&r->group->live))) { pthread_mutex_unlock(&lock); return -1; }
     hp_request_retain(r);
     hp_request_t **head = r->group ? &r->group->head : &classic_head;
     hp_request_t **tail = r->group ? &r->group->tail : &classic_tail;
@@ -373,13 +383,14 @@ void hp_runtime_stop(void) {
 }
 void hp_metrics_json(char *out, size_t cap) {
     pthread_mutex_lock(&lock); unsigned q = queued, t = alive; pthread_mutex_unlock(&lock);
-    unsigned scripts = 0, busy_workers = 0, bootstrapping = 0;
+    unsigned scripts = 0, busy_workers = 0, bootstrapping = 0, failed_workers = 0;
     for (hp_worker_group_t *g = groups; g; g = g->next) {
-        unsigned l = atomic_load(&g->live), rd = atomic_load(&g->ready), b = atomic_load(&g->busy);
+        unsigned l = atomic_load(&g->live), rd = atomic_load(&g->ready), b = atomic_load(&g->busy), f = atomic_load(&g->failed_threads);
+        failed_workers += f; if (l >= f) l -= f;
         scripts += l; busy_workers += b; if (l > rd + b) bootstrapping += l - rd - b;
     }
-    snprintf(out, cap, "{\"active_php_threads\":%u,\"idle_php_threads\":%u,\"threads\":%u,\"active_worker_scripts\":%u,\"busy_workers\":%u,\"bootstrapping_workers\":%u,\"ready_workers\":%u,\"queued_requests\":%u,\"completed\":%llu,\"failed\":%llu,\"timed_out\":%llu,\"worker_restarts\":%llu,\"worker_startup_failures\":%llu,\"queue_wait_ns_total\":%llu,\"execution_ns_total\":%llu,\"buffered_bytes\":%zu}\n",
-        atomic_load(&active_count), t >= atomic_load(&active_count) ? t - atomic_load(&active_count) : 0, t, scripts, busy_workers, bootstrapping, atomic_load(&ready_workers), q,
+    snprintf(out, cap, "{\"active_php_threads\":%u,\"idle_php_threads\":%u,\"threads\":%u,\"active_worker_scripts\":%u,\"busy_workers\":%u,\"bootstrapping_workers\":%u,\"failed_workers\":%u,\"ready_workers\":%u,\"queued_requests\":%u,\"completed\":%llu,\"failed\":%llu,\"timed_out\":%llu,\"worker_restarts\":%llu,\"worker_startup_failures\":%llu,\"queue_wait_ns_total\":%llu,\"execution_ns_total\":%llu,\"buffered_bytes\":%zu}\n",
+        atomic_load(&active_count), t >= atomic_load(&active_count) ? t - atomic_load(&active_count) : 0, t, scripts, busy_workers, bootstrapping, failed_workers, atomic_load(&ready_workers), q,
         (unsigned long long)atomic_load(&completed), (unsigned long long)atomic_load(&failed), (unsigned long long)atomic_load(&timed_out),
         (unsigned long long)atomic_load(&restarts), (unsigned long long)atomic_load(&startup_failures),
         (unsigned long long)atomic_load(&queue_ns), (unsigned long long)atomic_load(&execution_ns), hp_bridge_buffered_bytes());
