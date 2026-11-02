@@ -74,6 +74,9 @@ hp_worker_group_t *hp_worker_group_create(const hp_worker_config_t *);
 const hp_worker_config_t *hp_worker_group_config(hp_worker_group_t *);
 int hp_runtime_start(void);
 void hp_runtime_begin_shutdown(void);
+/* Request controller shutdown without blocking an H2O event loop. */
+void hp_runtime_request_stop(void);
+bool hp_runtime_stopped(void);
 void hp_runtime_stop(void);
 int hp_runtime_submit(hp_request_t *); /* retains on success; -1 saturated/draining */
 /* worker next returns scheduler-owned reference; done releases it */
@@ -93,4 +96,5 @@ int hp_sapi_execute(hp_request_t *);
 int hp_sapi_worker(hp_worker_group_t *, const char *);
 void h2o_php_register_configurator(void *globalconf);
 void h2o_php_context_shutdown(void *context);
+size_t h2o_php_context_pending(void *context);
 #endif

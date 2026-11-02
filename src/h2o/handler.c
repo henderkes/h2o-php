@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -21,6 +22,7 @@ typedef struct {
     h2o_multithread_receiver_t receiver;
     h2o_linklist_t generators;
     uint64_t drain_deadline_ns;
+    atomic_size_t pending_messages;
 } php_context_t;
 typedef struct {
     h2o_multithread_message_t super;
@@ -42,6 +44,24 @@ static void pump_output(php_generator_t *g);
 static void pump_input(php_generator_t *g);
 
 static char *copy_iov(h2o_iovec_t v) { return strndup(v.base ? v.base : "", v.len); }
+static char *join_cookie_fields(const hp_header_t *headers)
+{
+    size_t size = 1, count = 0;
+    for (const hp_header_t *h = headers; h; h = h->next) {
+        if (strcasecmp(h->name, "cookie") != 0) continue;
+        size += strlen(h->value) + (count++ ? 2 : 0);
+    }
+    char *joined = h2o_mem_alloc(size), *at = joined;
+    count = 0;
+    for (const hp_header_t *h = headers; h; h = h->next) {
+        if (strcasecmp(h->name, "cookie") != 0) continue;
+        if (count++) { memcpy(at, "; ", 2); at += 2; }
+        size_t length = strlen(h->value);
+        memcpy(at, h->value, length); at += length;
+    }
+    *at = '\0';
+    return joined;
+}
 static void notify_request(hp_request_t *r)
 {
     if (atomic_exchange_explicit(&r->notification_pending, true, memory_order_acq_rel))
@@ -50,11 +70,13 @@ static void notify_request(hp_request_t *r)
     if (!m) abort();
     hp_request_retain(r);
     m->request = r;
+    php_context_t *context = H2O_STRUCT_FROM_MEMBER(php_context_t, receiver, (h2o_multithread_receiver_t *)r->notify_data);
+    atomic_fetch_add_explicit(&context->pending_messages, 1, memory_order_relaxed);
     h2o_multithread_send_message((h2o_multithread_receiver_t *)r->notify_data, &m->super);
 }
 static void receive_messages(h2o_multithread_receiver_t *receiver, h2o_linklist_t *messages)
 {
-    (void)receiver;
+    php_context_t *context = H2O_STRUCT_FROM_MEMBER(php_context_t, receiver, receiver);
     while (!h2o_linklist_is_empty(messages)) {
         php_message_t *m = H2O_STRUCT_FROM_MEMBER(php_message_t, super.link, messages->next);
         h2o_linklist_unlink(&m->super.link);
@@ -69,12 +91,14 @@ static void receive_messages(h2o_multithread_receiver_t *receiver, h2o_linklist_
         }
         hp_request_release(r);
         free(m);
+        atomic_fetch_sub_explicit(&context->pending_messages, 1, memory_order_release);
     }
 }
 static void context_init(h2o_handler_t *handler, h2o_context_t *ctx)
 {
     php_context_t *p = calloc(1, sizeof(*p));
     if (!p) abort();
+    atomic_init(&p->pending_messages, 0);
     h2o_linklist_init_anchor(&p->generators);
     h2o_multithread_register_receiver(ctx->queue, &p->receiver, receive_messages);
     h2o_context_set_handler_context(ctx, handler, p);
@@ -428,7 +452,7 @@ static int handle_request(h2o_handler_t *self, h2o_req_t *req)
     char *authority = copy_iov(req->authority);
     hp_header_add(&r->headers, "Host", authority); free(authority);
     const char *value = hp_header_get(r->headers, "content-type"); r->content_type = strdup(value ? value : "");
-    value = hp_header_get(r->headers, "cookie"); r->cookie = strdup(value ? value : "");
+    r->cookie = join_cookie_fields(r->headers);
     r->env = hp_headers_clone(handler->config.env);
     for (size_t i = 0; i + 1 < req->env.size; i += 2) {
         char *name = copy_iov(req->env.entries[i]), *v = copy_iov(req->env.entries[i + 1]);
@@ -511,4 +535,23 @@ void h2o_php_context_shutdown(void *context)
             }
         }
     }
+}
+
+size_t h2o_php_context_pending(void *context)
+{
+    h2o_context_t *ctx = context;
+    size_t pending = 0;
+    /* Called only by this context's owning loop. After controller stop and
+     * the all-loop publication barrier, producers cannot add new messages. */
+    for (size_t i = 0; i < ctx->_pathconfs_inited.size; ++i) {
+        h2o_pathconf_t *path = ctx->_pathconfs_inited.entries[i];
+        if (!path) continue;
+        for (size_t j = 0; j < path->handlers.size; ++j) {
+            h2o_handler_t *handler = path->handlers.entries[j];
+            if (handler->on_context_init != context_init) continue;
+            php_context_t *p = h2o_context_get_handler_context(ctx, handler);
+            pending += atomic_load_explicit(&p->pending_messages, memory_order_acquire);
+        }
+    }
+    return pending;
 }

@@ -269,7 +269,7 @@ index 1add643..1023142 100644
          .get_peername = get_peername,
          .get_ptls = get_ptls,
 diff --git a/src/main.c b/src/main.c
-index 826599c..e73cddc 100644
+index 826599c..f5303dd 100644
 --- a/src/main.c
 +++ b/src/main.c
 @@ -99,6 +99,7 @@
@@ -280,7 +280,7 @@ index 826599c..e73cddc 100644
  #include "../lib/probes_.h"
  
  #if defined(__linux__)
-@@ -4863,7 +4864,9 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+@@ -4863,18 +4864,43 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
              listeners[i].http3.ctx.super.acceptor = NULL;
          }
      }
@@ -288,19 +288,47 @@ index 826599c..e73cddc 100644
      h2o_context_request_shutdown(&conf.threads[thread_index].ctx);
 +    h2o_php_context_shutdown(&conf.threads[thread_index].ctx);
  
-     /* Wait until all the connections get closed. At least one worker thread that closed the last connection, turning
-      * `num_connections(0)` to zero, will exit from this loop. Other worker threads might get stuck, as `h2o_evloop_run` does not
-@@ -4875,6 +4878,9 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+-    /* Wait until all the connections get closed. At least one worker thread that closed the last connection, turning
+-     * `num_connections(0)` to zero, will exit from this loop. Other worker threads might get stuck, as `h2o_evloop_run` does not
+-     * return when a different worker thread closes a connection. */
++    /* Keep every owning loop running while connections and PHP producers drain.
++     * A bounded wait also observes the final connection closed by another loop. */
+     while (num_connections(0) != 0)
+-        h2o_evloop_run(conf.threads[thread_index].ctx.loop, INT32_MAX);
++        h2o_evloop_run(conf.threads[thread_index].ctx.loop, 10);
++
++    hp_runtime_request_stop();
++    while (!hp_runtime_stopped())
++        h2o_evloop_run(conf.threads[thread_index].ctx.loop, 10);
++
++    /* Every loop must finish publishing synchronous shutdown rejections before
++     * any receiver can stop. The controller's flag covers all PHP producers. */
++    static atomic_size_t stopped_network_loops;
++    atomic_fetch_add_explicit(&stopped_network_loops, 1, memory_order_acq_rel);
++    while (atomic_load_explicit(&stopped_network_loops, memory_order_acquire) != conf.thread_map.size)
++        h2o_evloop_run(conf.threads[thread_index].ctx.loop, 10);
++
++    /* One poll is insufficient after EINTR or a full epoll batch. Drain against
++     * the actual retained-message count on each receiver's owning loop. */
++    while (h2o_php_context_pending(&conf.threads[thread_index].ctx) != 0)
++        h2o_evloop_run(conf.threads[thread_index].ctx.loop, 10);
++    static atomic_size_t drained_network_loops;
++    atomic_fetch_add_explicit(&drained_network_loops, 1, memory_order_acq_rel);
++    while (atomic_load_explicit(&drained_network_loops, memory_order_acquire) != conf.thread_map.size)
++        h2o_evloop_run(conf.threads[thread_index].ctx.loop, 10);
+ 
+     /* More than one thread might reach here; take a lock so that the first thread does the cleanup. */
      static pthread_mutex_t cleanup_lock = PTHREAD_MUTEX_INITIALIZER;
      pthread_mutex_lock(&cleanup_lock);
  
 +    /* Connections have drained; execution threads must stop before PHP module shutdown. */
 +    hp_runtime_stop();
++    fprintf(stderr, "php.runtime: shutdown complete; %zu network loops drained, 0 pending completions\n", conf.thread_map.size);
 +
      /* remove the pid file */
      if (conf.pid_file != NULL)
          unlink(conf.pid_file);
-@@ -5193,6 +5199,7 @@ static void setup_configurators(void)
+@@ -5193,6 +5219,7 @@ static void setup_configurators(void)
      h2o_errordoc_register_configurator(&conf.globalconf);
      h2o_fastcgi_register_configurator(&conf.globalconf);
      h2o_file_register_configurator(&conf.globalconf);
@@ -308,7 +336,7 @@ index 826599c..e73cddc 100644
      h2o_throttle_resp_register_configurator(&conf.globalconf);
      h2o_headers_register_configurator(&conf.globalconf);
      h2o_proxy_register_configurator(&conf.globalconf);
-@@ -5342,6 +5349,8 @@ int main(int argc, char **argv)
+@@ -5342,6 +5369,8 @@ int main(int argc, char **argv)
                  break;
              case 'v':
                  printf("h2o version " H2O_VERSION "\n");
@@ -317,7 +345,7 @@ index 826599c..e73cddc 100644
                  printf("OpenSSL: %s\n", OpenSSL_version(OPENSSL_VERSION));
  #if H2O_USE_MRUBY
                  printf(
-@@ -5719,6 +5728,12 @@ int main(int argc, char **argv)
+@@ -5719,6 +5748,12 @@ int main(int argc, char **argv)
          error_log_fd = -1;
      }
  

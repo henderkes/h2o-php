@@ -247,18 +247,37 @@ static void register_variables(zval *target)
         regvar(target, "PHP_AUTH_PW", SG(request_info).auth_password);
         regvar(target, "REMOTE_USER", SG(request_info).auth_user);
     }
+    /* Join duplicates by their original case-insensitive field name before
+     * PHP normalizes names. Distinct fields such as X-A and X_A must not be
+     * concatenated merely because both map to HTTP_X_A. */
+    HashTable header_values;
+    zend_hash_init(&header_values, 8, NULL, ZVAL_PTR_DTOR, 0);
     for (hp_header_t *h = r->headers; h; h = h->next) {
-        size_t len = strlen(h->name);
+        zend_string *original = zend_string_init(h->name, strlen(h->name), 0);
+        zend_string *key = zend_string_tolower(original);
+        zend_string_release(original);
+        zval joined;
+        zval *existing = zend_hash_find(&header_values, key);
+        if (existing) ZVAL_STR(&joined, strpprintf(0, "%s, %s", Z_STRVAL_P(existing), h->value));
+        else ZVAL_STRING(&joined, h->value);
+        zend_hash_update(&header_values, key, &joined);
+        zend_string_release(key);
+    }
+    zend_string *field;
+    zval *value;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(&header_values, field, value) {
+        size_t len = ZSTR_LEN(field);
         char *name = emalloc(len + 6);
         memcpy(name, "HTTP_", 5);
         for (size_t i = 0; i < len; ++i) {
-            unsigned char c = (unsigned char)h->name[i];
+            unsigned char c = (unsigned char)ZSTR_VAL(field)[i];
             name[i + 5] = c == '-' ? '_' : (c >= 'a' && c <= 'z' ? c - 32 : c);
         }
         name[len + 5] = 0;
-        regvar(target, name, h->value);
+        regvar(target, name, Z_STRVAL_P(value));
         efree(name);
-    }
+    } ZEND_HASH_FOREACH_END();
+    zend_hash_destroy(&header_values);
     /* Explicit request env entries override generated server variables. */
     for (hp_header_t *h = r->env; h; h = h->next) regvar(target, h->name, h->value);
 }

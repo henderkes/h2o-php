@@ -30,6 +30,7 @@ static pthread_t controller, *classic_threads;
 static unsigned nclassic, queued, alive, classic_queued;
 static int start_state; /* 0 not started, 1 starting, 2 ready, -1 failed */
 static bool draining, stop_requested, controller_created;
+static atomic_bool controller_stopped;
 static uint64_t drain_started_ns;
 static _Thread_local hp_worker_group_t *local_group;
 static _Thread_local unsigned local_generation, local_requests;
@@ -368,8 +369,11 @@ static void *control_main(void *unused) {
     for (unsigned i = 0; i < nclassic; ++i) pthread_join(classic_threads[i], NULL);
     for (hp_worker_group_t *g = groups; g; g = g->next)
         for (unsigned i = 0; i < g->started; ++i) pthread_join(g->threads[i], NULL);
-    hp_sapi_shutdown(); return NULL;
+    hp_sapi_shutdown();
+    atomic_store_explicit(&controller_stopped, true, memory_order_release);
+    return NULL;
 failed_start:
+    atomic_store_explicit(&controller_stopped, true, memory_order_release);
     pthread_mutex_lock(&lock); start_state = -1; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock); return NULL;
 }
 int hp_runtime_start(void) {
@@ -377,17 +381,28 @@ int hp_runtime_start(void) {
     pthread_mutex_lock(&lock);
     if (start_state == 2) { pthread_mutex_unlock(&lock); return 0; }
     start_state = 1;
+    atomic_store_explicit(&controller_stopped, false, memory_order_relaxed);
     if (pthread_create(&controller, NULL, control_main, NULL)) { start_state = -1; pthread_mutex_unlock(&lock); return -1; }
     controller_created = true;
     while (start_state == 1) pthread_cond_wait(&cond, &lock);
     int rc = start_state == 2 ? 0 : -1; pthread_mutex_unlock(&lock); return rc;
 }
+void hp_runtime_request_stop(void) {
+    pthread_mutex_lock(&lock);
+    if (!draining) drain_started_ns = hp_now_ns();
+    draining = stop_requested = true;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&lock);
+}
+bool hp_runtime_stopped(void) {
+    return atomic_load_explicit(&controller_stopped, memory_order_acquire);
+}
 void hp_runtime_stop(void) {
+    hp_runtime_request_stop();
     pthread_mutex_lock(&lock);
     if (!controller_created) { pthread_mutex_unlock(&lock); return; }
     controller_created = false;
-    if (!draining) drain_started_ns = hp_now_ns();
-    draining = stop_requested = true; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+    pthread_mutex_unlock(&lock);
     pthread_join(controller, NULL);
 }
 static bool resident_bytes(uint64_t *bytes) {
