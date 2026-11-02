@@ -69,3 +69,16 @@ set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/upstream/h2o/src/main.c"
   H2O_PHP_REVISION="${H2O_PHP_REVISION}"
   H2O_PHP_PHP_VERSION="${PHPZTS_VERSION}"
   H2O_PHP_PHP_ABI=${PHPZTS_API})
+
+install(FILES upstream/h2o/LICENSE DESTINATION share/licenses/h2o-php RENAME H2O-MIT.txt)
+install(FILES src/php/LICENSE.frankenphp DESTINATION share/licenses/h2o-php RENAME FrankenPHP-MIT.txt)
+install(FILES cmake/compat/LICENSE.OpenSSL DESTINATION share/licenses/h2o-php RENAME OpenSSL-Apache-2.0.txt)
+install(FILES upstream/php-src/LICENSE DESTINATION share/licenses/h2o-php RENAME PHP-3.01.txt)
+file(GLOB_RECURSE H2O_DEPENDENCY_NOTICES
+  "${CMAKE_CURRENT_SOURCE_DIR}/upstream/h2o/deps/*LICENSE*"
+  "${CMAKE_CURRENT_SOURCE_DIR}/upstream/h2o/deps/*COPYING*")
+foreach(notice IN LISTS H2O_DEPENDENCY_NOTICES)
+  get_filename_component(notice_directory "${notice}" DIRECTORY)
+  file(RELATIVE_PATH notice_directory "${CMAKE_CURRENT_SOURCE_DIR}/upstream/h2o/deps" "${notice_directory}")
+  install(FILES "${notice}" DESTINATION "share/licenses/h2o-php/H2O-dependencies/${notice_directory}")
+endforeach()

@@ -390,17 +390,37 @@ void hp_runtime_stop(void) {
     draining = stop_requested = true; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
     pthread_join(controller, NULL);
 }
+static bool resident_bytes(uint64_t *bytes) {
+#if defined(__linux__)
+    FILE *file = fopen("/proc/self/statm", "re");
+    if (!file) return false;
+    unsigned long long virtual_pages, resident_pages;
+    int fields = fscanf(file, "%llu %llu", &virtual_pages, &resident_pages);
+    fclose(file);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (fields != 2 || page_size <= 0 || resident_pages > UINT64_MAX / (uint64_t)page_size) return false;
+    *bytes = (uint64_t)resident_pages * (uint64_t)page_size;
+    return true;
+#else
+    (void)bytes;
+    return false;
+#endif
+}
 void hp_metrics_json(char *out, size_t cap) {
     pthread_mutex_lock(&lock); unsigned q = queued, t = alive; pthread_mutex_unlock(&lock);
+    unsigned executing = atomic_load(&active_count);
+    uint64_t rss;
+    char rss_json[32] = "null";
+    if (resident_bytes(&rss)) snprintf(rss_json, sizeof(rss_json), "%llu", (unsigned long long)rss);
     unsigned scripts = 0, busy_workers = 0, bootstrapping = 0, failed_workers = 0;
     for (hp_worker_group_t *g = groups; g; g = g->next) {
         unsigned l = atomic_load(&g->live), rd = atomic_load(&g->ready), b = atomic_load(&g->busy), f = atomic_load(&g->failed_threads);
         failed_workers += f; if (l >= f) l -= f;
         scripts += l; busy_workers += b; if (l > rd + b) bootstrapping += l - rd - b;
     }
-    snprintf(out, cap, "{\"active_php_threads\":%u,\"idle_php_threads\":%u,\"threads\":%u,\"active_worker_scripts\":%u,\"busy_workers\":%u,\"bootstrapping_workers\":%u,\"failed_workers\":%u,\"ready_workers\":%u,\"queued_requests\":%u,\"completed\":%llu,\"failed\":%llu,\"timed_out\":%llu,\"worker_restarts\":%llu,\"worker_startup_failures\":%llu,\"queue_wait_ns_total\":%llu,\"execution_ns_total\":%llu,\"buffered_bytes\":%zu}\n",
-        atomic_load(&active_count), t >= atomic_load(&active_count) ? t - atomic_load(&active_count) : 0, t, scripts, busy_workers, bootstrapping, failed_workers, atomic_load(&ready_workers), q,
+    snprintf(out, cap, "{\"active_php_threads\":%u,\"idle_php_threads\":%u,\"threads\":%u,\"active_worker_scripts\":%u,\"busy_workers\":%u,\"bootstrapping_workers\":%u,\"failed_workers\":%u,\"ready_workers\":%u,\"queued_requests\":%u,\"completed\":%llu,\"failed\":%llu,\"timed_out\":%llu,\"worker_restarts\":%llu,\"worker_startup_failures\":%llu,\"queue_wait_ns_total\":%llu,\"execution_ns_total\":%llu,\"buffered_bytes\":%zu,\"rss_bytes\":%s}\n",
+        executing, t >= executing ? t - executing : 0, t, scripts, busy_workers, bootstrapping, failed_workers, atomic_load(&ready_workers), q,
         (unsigned long long)atomic_load(&completed), (unsigned long long)atomic_load(&failed), (unsigned long long)atomic_load(&timed_out),
         (unsigned long long)atomic_load(&restarts), (unsigned long long)atomic_load(&startup_failures),
-        (unsigned long long)atomic_load(&queue_ns), (unsigned long long)atomic_load(&execution_ns), hp_bridge_buffered_bytes());
+        (unsigned long long)atomic_load(&queue_ns), (unsigned long long)atomic_load(&execution_ns), hp_bridge_buffered_bytes(), rss_json);
 }
