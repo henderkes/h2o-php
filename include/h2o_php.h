@@ -92,4 +92,5 @@ void hp_sapi_thread_shutdown(void);
 int hp_sapi_execute(hp_request_t *);
 int hp_sapi_worker(hp_worker_group_t *, const char *);
 void h2o_php_register_configurator(void *globalconf);
+void h2o_php_context_shutdown(void *context);
 #endif

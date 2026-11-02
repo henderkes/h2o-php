@@ -17,7 +17,10 @@ typedef struct {
     h2o_handler_t super;
     hp_route_config_t config;
 } php_handler_t;
-typedef struct { h2o_multithread_receiver_t receiver; } php_context_t;
+typedef struct {
+    h2o_multithread_receiver_t receiver;
+    h2o_linklist_t generators;
+} php_context_t;
 typedef struct {
     h2o_multithread_message_t super;
     hp_request_t *request;
@@ -28,8 +31,9 @@ typedef struct {
     hp_request_t *native;
     hp_chunk_t *sending;
     h2o_timer_t timeout;
+    h2o_linklist_t context_link;
     size_t input_offset;
-    unsigned started : 1, in_flight : 1, finalized : 1, input_waiting : 1, input_eof : 1;
+    unsigned started : 1, in_flight : 1, finalized : 1, input_waiting : 1, input_eof : 1, aborted : 1;
 } php_generator_t;
 
 static void pump_output(php_generator_t *g);
@@ -69,6 +73,7 @@ static void context_init(h2o_handler_t *handler, h2o_context_t *ctx)
 {
     php_context_t *p = calloc(1, sizeof(*p));
     if (!p) abort();
+    h2o_linklist_init_anchor(&p->generators);
     h2o_multithread_register_receiver(ctx->queue, &p->receiver, receive_messages);
     h2o_context_set_handler_context(ctx, handler, p);
 }
@@ -81,6 +86,7 @@ static void context_dispose(h2o_handler_t *handler, h2o_context_t *ctx)
 static void close_generator(void *data)
 {
     php_generator_t *g = data;
+    if (h2o_linklist_is_linked(&g->context_link)) h2o_linklist_unlink(&g->context_link);
     if (h2o_timer_is_linked(&g->timeout)) h2o_timer_unlink(&g->timeout);
     if (g->sending) { hp_chunk_free(g->sending); g->sending = NULL; }
     if (g->native) {
@@ -144,10 +150,35 @@ static void apply_headers(h2o_req_t *req, int status, hp_header_t *headers)
         h2o_add_header_by_str(&req->pool, &req->res.headers, name, n, 1, NULL, value.base, value.len);
     }
 }
+static void abort_response(php_generator_t *g, int status)
+{
+    if (!g->native || !g->req || g->aborted) return;
+    g->aborted = 1;
+    if (h2o_timer_is_linked(&g->timeout)) h2o_timer_unlink(&g->timeout);
+    h2o_req_t *req = g->req;
+    if (!g->started && !g->finalized && !req->conn->ctx->shutdown_requested) {
+        g->finalized = 1;
+        h2o_send_error_generic(req, status, reason_phrase(status), "PHP request cancelled or timed out\n",
+                               H2O_SEND_ERROR_HTTP1_CLOSE_CONNECTION);
+    } else if (req->conn->callbacks->abort_request) {
+        /* Protocol code owns pending sends and can cancel them without waiting
+         * for a slow peer. This call can synchronously destroy g and req. */
+        req->conn->callbacks->abort_request(req);
+    } else if (!g->in_flight && !g->finalized) {
+        g->finalized = 1;
+        h2o_send(req, NULL, 0, H2O_SEND_STATE_ERROR);
+    }
+}
 static void pump_output(php_generator_t *g)
 {
-    if (!g->native || g->finalized || g->in_flight) return;
+    if (!g->native || g->aborted) return;
     hp_request_t *r = g->native;
+    pthread_mutex_lock(&r->mutex);
+    bool cancelled = r->cancelled;
+    int cancellation_status = r->status >= 500 ? r->status : 504;
+    pthread_mutex_unlock(&r->mutex);
+    if (cancelled) { abort_response(g, cancellation_status); return; }
+    if (g->finalized || g->in_flight) return;
     for (;;) {
         pthread_mutex_lock(&r->mutex);
         hp_info_t *info = r->info_head;
@@ -191,8 +222,9 @@ static void pump_output(php_generator_t *g)
         if (!finished) return;
     }
     if (finished) {
+        /* Keep the deadline armed until the network request is disposed: a
+         * final send can itself remain blocked by a non-reading peer. */
         g->finalized = 1;
-        if (h2o_timer_is_linked(&g->timeout)) h2o_timer_unlink(&g->timeout);
     }
     h2o_iovec_t vec;
     size_t count = 0;
@@ -220,13 +252,7 @@ static void pump_input(php_generator_t *g)
     if (n || eof) {
         if (hp_request_body_push(r, g->req->entity.base ? g->req->entity.base + g->input_offset : "", n, eof) != 0) {
             hp_request_cancel(r);
-            if (!g->started) {
-                g->finalized = 1;
-                h2o_send_error_503(g->req, "Service Unavailable", "PHP global input buffer budget exhausted\n", H2O_SEND_ERROR_HTTP1_CLOSE_CONNECTION);
-            } else if (!g->in_flight) {
-                g->finalized = 1;
-                h2o_send(g->req, NULL, 0, H2O_SEND_STATE_ERROR);
-            }
+            abort_response(g, 503);
             return;
         }
         g->input_offset += n;
@@ -240,7 +266,7 @@ static void pump_input(php_generator_t *g)
 static int write_request(void *data, int is_end_stream)
 {
     php_generator_t *g = data;
-    if (!g->native) return -1;
+    if (!g->native || g->aborted) return -1;
     g->input_waiting = 1;
     g->input_offset = 0;
     g->input_eof = is_end_stream;
@@ -251,15 +277,12 @@ static int write_request(void *data, int is_end_stream)
 static void on_timeout(h2o_timer_t *timer)
 {
     php_generator_t *g = H2O_STRUCT_FROM_MEMBER(php_generator_t, timeout, timer);
-    if (!g->native || g->finalized) return;
+    if (!g->native || !g->req || g->aborted) return;
+    pthread_mutex_lock(&g->native->mutex);
+    g->native->state = HP_TIMED_OUT;
+    pthread_mutex_unlock(&g->native->mutex);
     hp_request_cancel(g->native);
-    if (!g->started) {
-        g->finalized = 1;
-        h2o_send_error_generic(g->req, 504, "Gateway Timeout", "PHP request deadline exceeded\n", H2O_SEND_ERROR_HTTP1_CLOSE_CONNECTION);
-    } else if (!g->in_flight) {
-        g->finalized = 1;
-        h2o_send(g->req, NULL, 0, H2O_SEND_STATE_ERROR);
-    }
+    abort_response(g, 504);
 }
 static void set_address(h2o_req_t *req, hp_request_t *r, int peer)
 {
@@ -395,6 +418,7 @@ static int handle_request(h2o_handler_t *self, h2o_req_t *req)
     memset(g, 0, sizeof(*g));
     g->super.proceed = proceed_generator; g->super.stop = stop_generator;
     g->req = req; g->native = r; g->timeout.cb = on_timeout;
+    h2o_linklist_insert(&ctx->generators, &g->context_link);
     r->notify = notify_request; r->notify_data = &ctx->receiver; r->network_data = g;
     uint64_t timeout = handler->config.timeout_ms ? handler->config.timeout_ms : hp_config.request_timeout_ms;
     if (timeout) { r->deadline_ns = hp_now_ns() + timeout * 1000000; h2o_timer_link(req->conn->ctx->loop, timeout, &g->timeout); }
@@ -423,4 +447,32 @@ void hp_h2o_register(h2o_pathconf_t *path, const hp_route_config_t *config)
     handler->config.root = config->root ? strdup(config->root) : NULL;
     handler->config.front_controller = config->front_controller ? strdup(config->front_controller) : NULL;
     handler->config.env = hp_headers_clone(config->env);
+}
+
+void h2o_php_context_shutdown(void *context)
+{
+    h2o_context_t *ctx = context;
+    /* Called by the owning loop after listener shutdown. PHP execution can
+     * already have completed while its final response still waits on TCP or
+     * HTTP/2 flow control, so the scheduler's active list alone is insufficient. */
+    for (size_t i = 0; i < ctx->_pathconfs_inited.size; ++i) {
+        h2o_pathconf_t *path = ctx->_pathconfs_inited.entries[i];
+        if (!path) continue;
+        for (size_t j = 0; j < path->handlers.size; ++j) {
+            h2o_handler_t *handler = path->handlers.entries[j];
+            if (handler->on_context_init != context_init) continue;
+            php_context_t *p = h2o_context_get_handler_context(ctx, handler);
+            for (h2o_linklist_t *link = p->generators.next; link != &p->generators; link = link->next) {
+                php_generator_t *g = H2O_STRUCT_FROM_MEMBER(php_generator_t, context_link, link);
+                if (g->aborted) continue;
+                if (h2o_timer_is_linked(&g->timeout)) h2o_timer_unlink(&g->timeout);
+                uint64_t now = hp_now_ns();
+                uint64_t request_remaining = g->native->deadline_ns > now
+                    ? (g->native->deadline_ns - now + 999999) / 1000000 : 0;
+                uint64_t timeout = request_remaining < hp_config.shutdown_timeout_ms
+                    ? request_remaining : hp_config.shutdown_timeout_ms;
+                h2o_timer_link(ctx->loop, timeout, &g->timeout);
+            }
+        }
+    }
 }

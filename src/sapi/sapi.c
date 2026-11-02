@@ -203,7 +203,26 @@ static void register_variables(zval *target)
     regvar(target, "SCRIPT_FILENAME", r->script);
     regvar(target, "SCRIPT_NAME", r->script_name);
     regvar(target, "PATH_INFO", r->path_info);
-    regvar(target, "PHP_SELF", r->script_name ? r->script_name : r->uri);
+    const char *script_name = r->script_name ? r->script_name : r->uri;
+    if (r->path_info && *r->path_info) {
+        /* Pinned upstream CGI metadata uses SCRIPT_NAME + PATH_INFO.
+         * PATH_INFO comes from H2O's normalized path, and PATH_TRANSLATED
+         * is lexical metadata: it need not refer to an existing file. */
+        zend_string *self = strpprintf(0, "%s%s", script_name ? script_name : "", r->path_info);
+        regvar(target, "PHP_SELF", ZSTR_VAL(self));
+        zend_string_release(self);
+        const char *root = r->document_root ? r->document_root : "";
+        size_t root_len = strlen(root);
+        while (root_len > 1 && root[root_len - 1] == '/') --root_len;
+        const char *tail = r->path_info;
+        while (*tail == '/') ++tail;
+        if (*tail) {
+            const char *separator = root_len && root[root_len - 1] == '/' ? "" : "/";
+            zend_string *translated = strpprintf(0, "%.*s%s%s", (int)root_len, root, separator, tail);
+            regvar(target, "PATH_TRANSLATED", ZSTR_VAL(translated));
+            zend_string_release(translated);
+        } else regvar(target, "PATH_TRANSLATED", root);
+    } else regvar(target, "PHP_SELF", script_name);
     regvar(target, "REQUEST_URI", r->uri);
     regvar(target, "DOCUMENT_URI", r->script_name);
     regvar(target, "REQUEST_METHOD", r->method);

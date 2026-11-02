@@ -14,6 +14,7 @@ struct hp_worker_group {
     hp_worker_config_t config;
     hp_worker_group_t *next;
     hp_request_t *head, *tail;
+    pthread_cond_t available;
     pthread_t *threads;
     atomic_uint generation;
     uint64_t watch_hash;
@@ -22,6 +23,7 @@ struct hp_worker_group {
 };
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t classic_available = PTHREAD_COND_INITIALIZER;
 static hp_worker_group_t *groups;
 static hp_request_t *classic_head, *classic_tail, *active;
 static pthread_t controller, *classic_threads;
@@ -50,6 +52,7 @@ hp_worker_group_t *hp_worker_group_create(const hp_worker_config_t *c) {
     g->config.max_consecutive_failures = c->max_consecutive_failures ? c->max_consecutive_failures : 10;
     g->config.watch = calloc(c->num_watch, sizeof(char *));
     for (size_t i = 0; i < c->num_watch; ++i) g->config.watch[i] = strdup(c->watch[i]);
+    pthread_cond_init(&g->available, NULL);
     atomic_init(&g->generation, 1); atomic_init(&g->live, 0); atomic_init(&g->ready, 0); atomic_init(&g->busy, 0); atomic_init(&g->failed_threads, 0);
     g->next = groups; groups = g; return g;
 }
@@ -73,7 +76,7 @@ Retry:
     pthread_mutex_lock(&lock);
     hp_request_t **head = g ? &g->head : &classic_head;
     hp_request_t **tail = g ? &g->tail : &classic_tail;
-    while (!*head && !draining && !(g && hp_worker_should_restart(g))) pthread_cond_wait(&cond, &lock);
+    while (!*head && !draining && !(g && hp_worker_should_restart(g))) pthread_cond_wait(g ? &g->available : &classic_available, &lock);
     if ((g && hp_worker_should_restart(g)) || !*head) { pthread_mutex_unlock(&lock); return NULL; }
     hp_request_t *r = *head; *head = r->queue_next; if (!*head) *tail = NULL;
     r->queue_next = NULL; --queued;
@@ -115,7 +118,7 @@ void hp_runtime_request_done(hp_request_t *r) {
     pthread_mutex_lock(&lock);
     hp_request_t **p = &active; while (*p && *p != r) p = &(*p)->active_next;
     if (*p) { *p = r->active_next; atomic_fetch_sub(&active_count, 1); }
-    pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+    pthread_mutex_unlock(&lock);
     if (local_group && r->group == local_group) { ++local_requests; if (local_busy) { local_busy = false; atomic_fetch_sub(&local_group->busy, 1); } }
     hp_request_release(r);
 }
@@ -187,7 +190,8 @@ int hp_runtime_submit(hp_request_t *r) {
     hp_request_t **tail = r->group ? &r->group->tail : &classic_tail;
     if (*tail) (*tail)->queue_next = r; else *head = r; *tail = r; ++queued;
     if (r->group) ++r->group->queued_count; else ++classic_queued;
-    pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock); return 0;
+    pthread_cond_signal(r->group ? &r->group->available : &classic_available);
+    pthread_mutex_unlock(&lock); return 0;
 }
 static void reject_queued(hp_request_t *r, int status, bool timeout) {
     pthread_mutex_lock(&r->mutex);
@@ -208,12 +212,17 @@ void hp_runtime_begin_shutdown(void) {
         if (g->tail) { g->tail->queue_next = pending; pending = g->head; }
         g->head = g->tail = NULL; g->queued_count = 0;
     }
-    queued = 0; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+    queued = 0;
+    pthread_cond_broadcast(&classic_available);
+    for (hp_worker_group_t *g = groups; g; g = g->next) pthread_cond_broadcast(&g->available);
+    pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
     while (pending) { hp_request_t *next = pending->queue_next; reject_queued(pending, 503, false); pending = next; }
 }
 void hp_runtime_restart_workers(void) {
     pthread_mutex_lock(&lock);
-    for (hp_worker_group_t *g = groups; g; g = g->next) atomic_fetch_add(&g->generation, 1);
+    for (hp_worker_group_t *g = groups; g; g = g->next) {
+        atomic_fetch_add(&g->generation, 1); pthread_cond_broadcast(&g->available);
+    }
     pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
 }
 static uint64_t path_hash(const char *path, unsigned depth) {
@@ -272,7 +281,7 @@ static void monitor(void) {
         for (size_t j = 0; j < g->config.num_watch; ++j) h ^= path_hash(g->config.watch[j], 0);
         if (g->watch_hash && h != g->watch_hash) {
             atomic_fetch_add(&g->generation, 1);
-            pthread_mutex_lock(&lock); pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+            pthread_mutex_lock(&lock); pthread_cond_broadcast(&g->available); pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
         }
         g->watch_hash = h;
     }

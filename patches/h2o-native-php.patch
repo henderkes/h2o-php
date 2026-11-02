@@ -25,7 +25,7 @@ index 8a25b1b..e6814f6 100644
           ${CMAKE_CURRENT_BINARY_DIR}/picotls-probes.h
           ${CMAKE_CURRENT_BINARY_DIR}/quicly-probes.h
 diff --git a/include/h2o.h b/include/h2o.h
-index 48333ec..1d26cb2 100644
+index 48333ec..8089997 100644
 --- a/include/h2o.h
 +++ b/include/h2o.h
 @@ -120,6 +120,11 @@ typedef struct st_h2o_handler_t {
@@ -40,6 +40,18 @@ index 48333ec..1d26cb2 100644
      int (*on_req)(struct st_h2o_handler_t *self, h2o_req_t *req);
      /**
       * If the flag is set, protocol handler may invoke the request handler before receiving the end of the request body. The request
+@@ -1063,6 +1068,11 @@ typedef struct st_h2o_conn_callbacks_t {
+         };
+         h2o_iovec_t (*callbacks[1])(h2o_req_t *req);
+     } log_;
++    /**
++     * Optional immediate cancellation of a request on its owning event loop.
++     * Unlike graceful shutdown, this may discard queued response output.
++     */
++    void (*abort_request)(h2o_req_t *req);
+ } h2o_conn_callbacks_t;
+ 
+ /**
 diff --git a/lib/core/request.c b/lib/core/request.c
 index 773e117..af2667f 100644
 --- a/lib/core/request.c
@@ -118,8 +130,96 @@ index 0c2aec2..651e675 100644
  
      self->real_path = h2o_strdup(NULL, real_path, SIZE_MAX);
      h2o_mem_addref_shared(mime_type);
+diff --git a/lib/http1.c b/lib/http1.c
+index d277d55..f872555 100644
+--- a/lib/http1.c
++++ b/lib/http1.c
+@@ -1270,7 +1270,19 @@ static void initiate_graceful_shutdown(h2o_conn_t *_conn)
+     /* note: nothing special needs to be done for handling graceful shutdown */
+ }
+ 
++#ifdef H2O_WITH_PHP
++static void abort_request(h2o_req_t *req)
++{
++    /* The regular close path stops pending socket writes and disposes the
++     * generator, including when a slow peer has an in-flight write. */
++    close_connection((struct st_h2o_http1_conn_t *)req->conn, 1);
++}
++#endif
++
+ static const h2o_conn_callbacks_t h1_callbacks = {
++#ifdef H2O_WITH_PHP
++    .abort_request = abort_request,
++#endif
+     .get_sockname = get_sockname,
+     .get_peername = get_peername,
+     .get_ptls = get_ptls,
+diff --git a/lib/http2/connection.c b/lib/http2/connection.c
+index 33126a0..78cc860 100644
+--- a/lib/http2/connection.c
++++ b/lib/http2/connection.c
+@@ -1814,9 +1814,31 @@ static void on_dos_process_delay(h2o_timer_t *timer)
+     run_pending_requests(conn);
+ }
+ 
++#ifdef H2O_WITH_PHP
++static void abort_request(h2o_req_t *req)
++{
++    h2o_http2_conn_t *conn = (void *)req->conn;
++    h2o_http2_stream_t *stream = H2O_STRUCT_FROM_MEMBER(h2o_http2_stream_t, req, req);
++    stream_send_error(conn, stream->stream_id, H2O_HTTP2_ERROR_CANCEL);
++    h2o_http2_stream_reset(conn, stream);
++    /* A stalled connection write must not retain the final cancelled stream
++     * indefinitely during process drain. Ordinary deadlines preserve peers. */
++    if (conn->super.ctx->shutdown_requested && conn->num_streams.pull.open == 0 &&
++        conn->num_streams.pull.half_closed == 0 && conn->num_streams.push.open == 0 &&
++        conn->num_streams.push.half_closed == 0) {
++        if (h2o_timer_is_linked(&conn->_write.timeout_entry))
++            h2o_timer_unlink(&conn->_write.timeout_entry);
++        close_connection_now(conn);
++    }
++}
++#endif
++
+ static h2o_http2_conn_t *create_conn(h2o_context_t *ctx, h2o_hostconf_t **hosts, h2o_socket_t *sock, struct timeval connected_at)
+ {
+     static const h2o_conn_callbacks_t callbacks = {
++#ifdef H2O_WITH_PHP
++        .abort_request = abort_request,
++#endif
+         .get_sockname = get_sockname,
+         .get_peername = get_peername,
+         .get_ptls = get_ptls,
+diff --git a/lib/http3/server.c b/lib/http3/server.c
+index 1add643..1023142 100644
+--- a/lib/http3/server.c
++++ b/lib/http3/server.c
+@@ -2333,11 +2333,23 @@ void h2o_http3_server_init_context(h2o_context_t *h2o, h2o_quic_ctx_t *ctx, h2o_
+                                  &h2o->quic_stats);
+ }
+ 
++#ifdef H2O_WITH_PHP
++static void abort_request(h2o_req_t *req)
++{
++    struct st_h2o_http3_server_stream_t *stream = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http3_server_stream_t, req, req);
++    if (stream->state < H2O_HTTP3_SERVER_STREAM_STATE_CLOSE_WAIT)
++        shutdown_stream(stream, H2O_HTTP3_ERROR_REQUEST_CANCELLED, H2O_HTTP3_ERROR_REQUEST_CANCELLED, 0, 0);
++}
++#endif
++
+ h2o_http3_conn_t *h2o_http3_server_accept(h2o_http3_server_ctx_t *ctx, quicly_address_t *destaddr, quicly_address_t *srcaddr,
+                                           quicly_decoded_packet_t *packet, quicly_address_token_plaintext_t *address_token,
+                                           const h2o_http3_conn_callbacks_t *h3_callbacks)
+ {
+     static const h2o_conn_callbacks_t conn_callbacks = {
++#ifdef H2O_WITH_PHP
++        .abort_request = abort_request,
++#endif
+         .get_sockname = get_sockname,
+         .get_peername = get_peername,
+         .get_ptls = get_ptls,
 diff --git a/src/main.c b/src/main.c
-index 826599c..f541176 100644
+index 826599c..e73cddc 100644
 --- a/src/main.c
 +++ b/src/main.c
 @@ -99,6 +99,7 @@
@@ -130,15 +230,17 @@ index 826599c..f541176 100644
  #include "../lib/probes_.h"
  
  #if defined(__linux__)
-@@ -4863,6 +4864,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+@@ -4863,7 +4864,9 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
              listeners[i].http3.ctx.super.acceptor = NULL;
          }
      }
 +    hp_runtime_begin_shutdown();
      h2o_context_request_shutdown(&conf.threads[thread_index].ctx);
++    h2o_php_context_shutdown(&conf.threads[thread_index].ctx);
  
      /* Wait until all the connections get closed. At least one worker thread that closed the last connection, turning
-@@ -4875,6 +4877,9 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+      * `num_connections(0)` to zero, will exit from this loop. Other worker threads might get stuck, as `h2o_evloop_run` does not
+@@ -4875,6 +4878,9 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
      static pthread_mutex_t cleanup_lock = PTHREAD_MUTEX_INITIALIZER;
      pthread_mutex_lock(&cleanup_lock);
  
@@ -148,7 +250,7 @@ index 826599c..f541176 100644
      /* remove the pid file */
      if (conf.pid_file != NULL)
          unlink(conf.pid_file);
-@@ -5193,6 +5198,7 @@ static void setup_configurators(void)
+@@ -5193,6 +5199,7 @@ static void setup_configurators(void)
      h2o_errordoc_register_configurator(&conf.globalconf);
      h2o_fastcgi_register_configurator(&conf.globalconf);
      h2o_file_register_configurator(&conf.globalconf);
@@ -156,7 +258,7 @@ index 826599c..f541176 100644
      h2o_throttle_resp_register_configurator(&conf.globalconf);
      h2o_headers_register_configurator(&conf.globalconf);
      h2o_proxy_register_configurator(&conf.globalconf);
-@@ -5342,6 +5348,8 @@ int main(int argc, char **argv)
+@@ -5342,6 +5349,8 @@ int main(int argc, char **argv)
                  break;
              case 'v':
                  printf("h2o version " H2O_VERSION "\n");
@@ -165,7 +267,7 @@ index 826599c..f541176 100644
                  printf("OpenSSL: %s\n", OpenSSL_version(OPENSSL_VERSION));
  #if H2O_USE_MRUBY
                  printf(
-@@ -5719,6 +5727,12 @@ int main(int argc, char **argv)
+@@ -5719,6 +5728,12 @@ int main(int argc, char **argv)
          error_log_fd = -1;
      }
  
