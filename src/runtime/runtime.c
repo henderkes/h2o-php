@@ -28,6 +28,7 @@ static pthread_t controller, *classic_threads;
 static unsigned nclassic, queued, alive, classic_queued;
 static int start_state; /* 0 not started, 1 starting, 2 ready, -1 failed */
 static bool draining, stop_requested, controller_created;
+static uint64_t drain_started_ns;
 static _Thread_local hp_worker_group_t *local_group;
 static _Thread_local unsigned local_generation, local_requests;
 static _Thread_local bool local_ready, local_busy;
@@ -189,7 +190,9 @@ static void reject_queued(hp_request_t *r, int status, bool timeout) {
     hp_request_notify(r); hp_request_release(r);
 }
 void hp_runtime_begin_shutdown(void) {
-    pthread_mutex_lock(&lock); draining = true;
+    pthread_mutex_lock(&lock);
+    if (!draining) drain_started_ns = hp_now_ns();
+    draining = true;
     hp_request_t *pending = classic_head; classic_head = classic_tail = NULL; classic_queued = 0;
     for (hp_worker_group_t *g = groups; g; g = g->next) {
         if (g->tail) { g->tail->queue_next = pending; pending = g->head; }
@@ -239,19 +242,21 @@ static void monitor(void) {
     while (expired) { hp_request_t *r = expired; expired = r->queue_next; reject_queued(r, 504, true); }
     hp_request_t **list = NULL; size_t n = 0;
     pthread_mutex_lock(&lock);
+    bool drain_overdue = draining && hp_now_ns() - drain_started_ns >= hp_config.shutdown_timeout_ms * 1000000ULL;
     for (hp_request_t *r = active; r; r = r->active_next) ++n;
     list = calloc(n, sizeof(*list)); size_t i = 0;
     if (list) for (hp_request_t *r = active; r; r = r->active_next) { list[i++] = r; hp_request_retain(r); }
     pthread_mutex_unlock(&lock);
     for (size_t j = 0; j < i; ++j) {
         hp_request_t *r = list[j];
-        if (hp_now_ns() >= r->deadline_ns) {
+        if (drain_overdue || hp_now_ns() >= r->deadline_ns) {
             pthread_mutex_lock(&r->mutex); r->state = HP_TIMED_OUT; pthread_mutex_unlock(&r->mutex);
             hp_request_cancel(r); hp_sapi_interrupt_request(r); hp_request_notify(r);
         }
         hp_request_release(r);
     }
     free(list);
+    if (drain_overdue) hp_sapi_interrupt_request(NULL);
     for (hp_worker_group_t *g = groups; g; g = g->next) {
         uint64_t h = 0;
         for (size_t j = 0; j < g->config.num_watch; ++j) h ^= path_hash(g->config.watch[j], 0);
@@ -324,7 +329,7 @@ static void *control_main(void *unused) {
     /* PHP producers must finish before the module and TSRM are shut down. */
     hp_runtime_begin_shutdown();
     pthread_mutex_lock(&lock);
-    uint64_t drain_started = hp_now_ns();
+    uint64_t drain_started = drain_started_ns;
     while (alive) {
         struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec++;
         pthread_cond_timedwait(&cond, &lock, &until);
@@ -361,7 +366,9 @@ int hp_runtime_start(void) {
 void hp_runtime_stop(void) {
     pthread_mutex_lock(&lock);
     if (!controller_created) { pthread_mutex_unlock(&lock); return; }
-    controller_created = false; draining = stop_requested = true; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+    controller_created = false;
+    if (!draining) drain_started_ns = hp_now_ns();
+    draining = stop_requested = true; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
     pthread_join(controller, NULL);
 }
 void hp_metrics_json(char *out, size_t cap) {

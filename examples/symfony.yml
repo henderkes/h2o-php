@@ -21,4 +21,4 @@ hosts:
             APP_ENV: prod
             APP_DEBUG: '0'
       /metrics:
-        php.metrics: true
+        php.metrics: ON

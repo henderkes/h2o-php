@@ -825,11 +825,11 @@ void hp_sapi_thread_shutdown(void)
 static int execute_script(hp_request_t *request, const char *file)
 {
     int status = 0;
-    bool started = false;
+    volatile bool startup_attempted = false;
     install_context(request);
     zend_first_try {
+        startup_attempted = true;
         if (php_request_startup() == FAILURE) zend_bailout();
-        started = true;
         partial_active = true;
         zend_file_handle handle;
         zend_stream_init_filename(&handle, file);
@@ -846,7 +846,7 @@ static int execute_script(hp_request_t *request, const char *file)
     } zend_catch {
         status = 255;
     } zend_end_try();
-    if (started) {
+    if (startup_attempted) {
         /* If a callback exited/fataled, full shutdown cleans its active partial
          * request as well as the persistent script. PHP catches normal exit. */
         zend_try { hp_env_script_reset(); php_request_shutdown(NULL); }
