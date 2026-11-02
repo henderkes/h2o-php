@@ -22,6 +22,8 @@
 #include <ext/session/php_session.h>
 #include <ext/json/php_json.h>
 #include <dlfcn.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -822,6 +824,61 @@ void hp_sapi_thread_shutdown(void)
     ts_free_thread();
 }
 
+/* OPcache timestamps have second resolution. Filesystem watch uses
+ * nanoseconds, so a normal generation reboot alone can execute stale same-
+ * second bytecode. Invalidate watched files through the installed extension's
+ * public native function before compiling the new worker. */
+static bool invalidate_cached_file(zend_function *function, const char *path)
+{
+    bool bailed = false;
+    zend_try {
+        zval args[2], result;
+        ZVAL_STRING(&args[0], path);
+        ZVAL_TRUE(&args[1]);
+        ZVAL_UNDEF(&result);
+        zend_call_known_function(function, NULL, NULL, &result, 2, args, NULL);
+        zval_ptr_dtor(&args[0]);
+        if (!Z_ISUNDEF(result)) zval_ptr_dtor(&result);
+    } zend_catch { bailed = true; } zend_end_try();
+    return !bailed;
+}
+
+static bool invalidate_watch_tree(zend_function *function, const char *path, unsigned depth)
+{
+    if (depth > 32) return true;
+    struct stat st;
+    if (lstat(path, &st)) return true;
+    if (S_ISREG(st.st_mode)) return invalidate_cached_file(function, path);
+    if (!S_ISDIR(st.st_mode)) return true; /* never recurse through symlinks */
+    DIR *directory = opendir(path);
+    if (!directory) return true;
+    bool ok = true;
+    struct dirent *entry;
+    while ((entry = readdir(directory))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        char *child;
+        if (asprintf(&child, "%s/%s", path, entry->d_name) < 0) { ok = false; break; }
+        ok = invalidate_watch_tree(function, child, depth + 1);
+        free(child);
+        if (!ok) break;
+    }
+    closedir(directory);
+    return ok;
+}
+
+static void invalidate_watched_code(void)
+{
+    if (!current_group) return;
+    const hp_worker_config_t *config = hp_worker_group_config(current_group);
+    if (!config->num_watch) return;
+    zend_function *function = zend_hash_str_find_ptr(EG(function_table), "opcache_invalidate", sizeof("opcache_invalidate") - 1);
+    if (!function || function->type != ZEND_INTERNAL_FUNCTION) return;
+    bool ok = invalidate_cached_file(function, config->file);
+    for (size_t i = 0; i < config->num_watch && ok; ++i)
+        ok = invalidate_watch_tree(function, config->watch[i], 0);
+    if (!ok) zend_bailout(); /* directory handles/native path buffers are closed */
+}
+
 static int execute_script(hp_request_t *request, const char *file)
 {
     int status = 0;
@@ -831,6 +888,7 @@ static int execute_script(hp_request_t *request, const char *file)
         startup_attempted = true;
         if (php_request_startup() == FAILURE) zend_bailout();
         partial_active = true;
+        invalidate_watched_code();
         zend_file_handle handle;
         zend_stream_init_filename(&handle, file);
         handle.primary_script = true;

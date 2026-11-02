@@ -154,7 +154,7 @@ static void *worker_main(void *arg) {
         pthread_mutex_lock(&lock); stop = draining; pthread_mutex_unlock(&lock);
         if (stop) break;
         atomic_fetch_add(&restarts, 1);
-        if (local_requests == 0) {
+        if (rc != 0 && local_requests == 0) {
             atomic_fetch_add(&startup_failures, 1); ++failures;
             fprintf(stderr, "{\"component\":\"php.worker\",\"event\":\"startup_failed\",\"attempt\":%u,\"code\":%d}\n", failures, rc);
             if (failures >= g->config.max_consecutive_failures) break;
