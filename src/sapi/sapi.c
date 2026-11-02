@@ -49,6 +49,7 @@ static _Thread_local unsigned worker_requests;
 static sapi_module_struct hp_sapi_module;
 static char *configured_ini;
 static bool engine_started;
+static bool default_ignore_user_abort;
 
 #include "../php/frankenphp_arginfo.h"
 
@@ -260,7 +261,7 @@ static void install_context(hp_request_t *request)
     SG(request_info).headers_only = request->method && !strcmp(request->method, "HEAD");
     SG(request_info).no_headers = false;
     SG(global_request_time) = request->request_time;
-    PG(ignore_user_abort) = current_group != NULL;
+    PG(ignore_user_abort) = current_group ? true : default_ignore_user_abort;
     for (hp_header_t *h = request->env; h; h = h->next) hp_env_set(h->name, h->value);
     if (current_group) hp_env_set("FRANKENPHP_WORKER", "1");
     const char *authorization = hp_header_get(request->headers, "authorization");
@@ -780,6 +781,7 @@ int hp_sapi_init(const char *ini, unsigned max_threads)
         return -1;
     }
     override_opcache();
+    default_ignore_user_abort = PG(ignore_user_abort);
     capture_opcache_scalars();
     sapi_register_default_post_reader(lazy_default_post_reader);
     engine_started = true;
