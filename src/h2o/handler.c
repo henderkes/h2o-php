@@ -257,6 +257,8 @@ static void pump_input(php_generator_t *g)
     bool cancelled = r->cancelled;
     pthread_mutex_unlock(&r->mutex);
     if (cancelled) return;
+    /* The pinned H2O fork refreshes this view when its HTTP/2 body buffer
+     * grows. Only this owning event loop reads it; PHP sees copied chunks. */
     size_t left = g->req->entity.len - g->input_offset;
     size_t n = left < room ? left : room;
     bool eof = g->input_eof && n == left;
