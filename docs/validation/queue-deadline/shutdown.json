@@ -1,0 +1,8 @@
+{
+  "requests": 1,
+  "binary_sha256": "5f3dbf11e970b26f80cb544f9119de6b9edd514c1fc8e4580a38de87f2d36b01",
+  "shutdown_budget_ms": 200,
+  "shutdown_elapsed_ms": 272.38,
+  "exit": 0,
+  "all_loops_drained": true
+}

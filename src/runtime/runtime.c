@@ -24,6 +24,8 @@ struct hp_worker_group {
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t classic_available = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t monitor_cond;
+static bool monitor_cond_initialized;
 static hp_worker_group_t *groups;
 static hp_request_t *classic_head, *classic_tail, *active;
 static pthread_t controller, *classic_threads;
@@ -32,11 +34,30 @@ static int start_state; /* 0 not started, 1 starting, 2 ready, -1 failed */
 static bool draining, stop_requested, controller_created;
 static atomic_bool controller_stopped;
 static uint64_t drain_started_ns;
+static uint64_t next_queue_deadline_ns = UINT64_MAX;
 static _Thread_local hp_worker_group_t *local_group;
 static _Thread_local unsigned local_generation, local_requests;
 static _Thread_local bool local_ready, local_busy;
 static atomic_uint_fast64_t completed, failed, timed_out, restarts, startup_failures, queue_ns, execution_ns;
 static atomic_uint active_count, ready_workers;
+
+/* The scheduler lock protects this condition's initialization and predicates. */
+static void wake_monitor(void) {
+    if (monitor_cond_initialized) pthread_cond_signal(&monitor_cond);
+}
+static uint64_t deadline_after_ms(uint64_t started, uint64_t ms) {
+    if (ms > (UINT64_MAX - started) / 1000000ULL) return UINT64_MAX;
+    return started + ms * 1000000ULL;
+}
+static uint64_t queue_deadline(hp_request_t *r) {
+    uint64_t wait_deadline = deadline_after_ms(r->queued_ns, hp_config.max_wait_ms);
+    return wait_deadline < r->deadline_ns ? wait_deadline : r->deadline_ns;
+}
+static void wait_for_monitor(uint64_t deadline) {
+    struct timespec until = { .tv_sec = (time_t)(deadline / 1000000000ULL),
+                             .tv_nsec = (long)(deadline % 1000000000ULL) };
+    pthread_cond_timedwait(&monitor_cond, &lock, &until);
+}
 
 void hp_runtime_config_defaults(void) {
     if (hp_config.threads) return;
@@ -86,7 +107,7 @@ Retry:
     pthread_mutex_unlock(&lock);
     pthread_mutex_lock(&r->mutex);
     r->started_ns = hp_now_ns(); if (!r->cancelled) r->state = HP_RUNNING;
-    if (r->started_ns - r->queued_ns > hp_config.max_wait_ms * 1000000ULL || r->started_ns >= r->deadline_ns) {
+    if (r->started_ns >= queue_deadline(r)) {
         r->state = HP_TIMED_OUT; r->cancelled = true;
         r->status = 504; r->headers_ready = r->response_finished = true;
     }
@@ -124,7 +145,7 @@ void hp_runtime_request_done(hp_request_t *r) {
     hp_request_release(r);
 }
 static void thread_ended(void) {
-    pthread_mutex_lock(&lock); --alive; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+    pthread_mutex_lock(&lock); --alive; wake_monitor(); pthread_mutex_unlock(&lock);
 }
 static void *classic_main(void *unused) {
     (void)unused; hp_sapi_thread_init();
@@ -191,6 +212,11 @@ int hp_runtime_submit(hp_request_t *r) {
     hp_request_t **tail = r->group ? &r->group->tail : &classic_tail;
     if (*tail) (*tail)->queue_next = r; else *head = r; *tail = r; ++queued;
     if (r->group) ++r->group->queued_count; else ++classic_queued;
+    uint64_t deadline = queue_deadline(r);
+    if (deadline < next_queue_deadline_ns) {
+        next_queue_deadline_ns = deadline;
+        wake_monitor();
+    }
     pthread_cond_signal(r->group ? &r->group->available : &classic_available);
     pthread_mutex_unlock(&lock); return 0;
 }
@@ -213,10 +239,10 @@ void hp_runtime_begin_shutdown(void) {
         if (g->tail) { g->tail->queue_next = pending; pending = g->head; }
         g->head = g->tail = NULL; g->queued_count = 0;
     }
-    queued = 0;
+    queued = 0; next_queue_deadline_ns = UINT64_MAX;
     pthread_cond_broadcast(&classic_available);
     for (hp_worker_group_t *g = groups; g; g = g->next) pthread_cond_broadcast(&g->available);
-    pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+    pthread_cond_broadcast(&cond); wake_monitor(); pthread_mutex_unlock(&lock);
     while (pending) { hp_request_t *next = pending->queue_next; reject_queued(pending, 503, false); pending = next; }
 }
 void hp_runtime_restart_workers(void) {
@@ -240,29 +266,36 @@ static uint64_t path_hash(const char *path, unsigned depth) {
     }
     closedir(d); return h;
 }
-static void expire_queue(hp_request_t **head, hp_request_t **tail, unsigned *count, hp_request_t **expired) {
+static void expire_queue(hp_request_t **head, hp_request_t **tail, unsigned *count, hp_request_t **expired, uint64_t now) {
     hp_request_t **p = head; hp_request_t *previous = NULL;
-    uint64_t now = hp_now_ns();
     while (*p) {
         hp_request_t *r = *p;
-        if (now >= r->deadline_ns || now - r->queued_ns >= hp_config.max_wait_ms * 1000000ULL) {
+        uint64_t deadline = queue_deadline(r);
+        if (now >= deadline) {
             *p = r->queue_next;
             if (*tail == r) *tail = previous;
             --*count; --queued; r->queue_next = *expired; *expired = r;
-        } else { previous = r; p = &r->queue_next; }
+        } else {
+            if (deadline < next_queue_deadline_ns) next_queue_deadline_ns = deadline;
+            previous = r; p = &r->queue_next;
+        }
     }
 }
-static void monitor(void) {
+static void expire_queued(void) {
     hp_request_t *expired = NULL;
     pthread_mutex_lock(&lock);
-    expire_queue(&classic_head, &classic_tail, &classic_queued, &expired);
+    uint64_t now = hp_now_ns();
+    next_queue_deadline_ns = UINT64_MAX;
+    expire_queue(&classic_head, &classic_tail, &classic_queued, &expired, now);
     for (hp_worker_group_t *g = groups; g; g = g->next)
-        expire_queue(&g->head, &g->tail, &g->queued_count, &expired);
+        expire_queue(&g->head, &g->tail, &g->queued_count, &expired, now);
     pthread_mutex_unlock(&lock);
     while (expired) { hp_request_t *r = expired; expired = r->queue_next; reject_queued(r, 504, true); }
+}
+static void monitor(bool scan_watch) {
     hp_request_t **list = NULL; size_t n = 0;
     pthread_mutex_lock(&lock);
-    bool drain_overdue = draining && hp_now_ns() - drain_started_ns >= hp_config.shutdown_timeout_ms * 1000000ULL;
+    bool drain_overdue = draining && hp_now_ns() >= deadline_after_ms(drain_started_ns, hp_config.shutdown_timeout_ms);
     for (hp_request_t *r = active; r; r = r->active_next) ++n;
     list = calloc(n, sizeof(*list)); size_t i = 0;
     if (list) for (hp_request_t *r = active; r; r = r->active_next) { list[i++] = r; hp_request_retain(r); }
@@ -277,6 +310,7 @@ static void monitor(void) {
     }
     free(list);
     if (drain_overdue) hp_sapi_interrupt_request(NULL);
+    if (!scan_watch) return;
     for (hp_worker_group_t *g = groups; g; g = g->next) {
         uint64_t h = 0;
         for (size_t j = 0; j < g->config.num_watch; ++j) h ^= path_hash(g->config.watch[j], 0);
@@ -333,37 +367,47 @@ static void *control_main(void *unused) {
             for (unsigned i = 0; i < g->started; ++i) pthread_join(g->threads[i], NULL);
         hp_sapi_shutdown(); goto failed_start;
     }
-    pthread_mutex_lock(&lock); start_state = 2; pthread_cond_broadcast(&cond); pthread_mutex_unlock(&lock);
+    uint64_t next_housekeeping_ns = hp_now_ns() + 1000000000ULL;
+    pthread_mutex_lock(&lock); start_state = 2; pthread_cond_broadcast(&cond);
     for (;;) {
-        pthread_mutex_lock(&lock);
-        bool stop = stop_requested;
-        struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec++;
-        while (!stop_requested && !stop) {
-            int rc = pthread_cond_timedwait(&cond, &lock, &until);
-            if (rc == ETIMEDOUT) break;
+        if (stop_requested) break;
+        uint64_t now = hp_now_ns();
+        bool expire = now >= next_queue_deadline_ns;
+        bool housekeeping = now >= next_housekeeping_ns;
+        if (expire || housekeeping) {
+            pthread_mutex_unlock(&lock);
+            if (expire) expire_queued();
+            if (housekeeping) {
+                monitor(true);
+                next_housekeeping_ns = hp_now_ns() + 1000000000ULL;
+            }
+            pthread_mutex_lock(&lock);
+            continue;
         }
-        stop = stop_requested;
-        pthread_mutex_unlock(&lock);
-        monitor(); if (stop) break;
+        uint64_t deadline = next_queue_deadline_ns < next_housekeeping_ns ? next_queue_deadline_ns : next_housekeeping_ns;
+        wait_for_monitor(deadline);
     }
+    pthread_mutex_unlock(&lock);
     /* PHP producers must finish before the module and TSRM are shut down. */
     hp_runtime_begin_shutdown();
+    monitor(false);
     pthread_mutex_lock(&lock);
-    uint64_t drain_started = drain_started_ns;
+    uint64_t next_drain_check_ns = deadline_after_ms(drain_started_ns, hp_config.shutdown_timeout_ms);
     while (alive) {
-        struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec++;
-        pthread_cond_timedwait(&cond, &lock, &until);
-        bool overdue = hp_now_ns() - drain_started >= hp_config.shutdown_timeout_ms * 1000000ULL;
-        pthread_mutex_unlock(&lock);
-        if (overdue) {
-            pthread_mutex_lock(&lock);
-            size_t n = atomic_load(&active_count), i = 0; hp_request_t **rs = calloc(n, sizeof(*rs));
-            if (rs) for (hp_request_t *r = active; r && i < n; r = r->active_next) { hp_request_retain(r); rs[i++] = r; }
+        uint64_t now = hp_now_ns();
+        bool housekeeping = now >= next_housekeeping_ns;
+        bool drain_due = now >= next_drain_check_ns;
+        if (housekeeping || drain_due) {
             pthread_mutex_unlock(&lock);
-            for (size_t j = 0; j < i; ++j) { hp_request_cancel(rs[j]); hp_sapi_interrupt_request(rs[j]); hp_request_release(rs[j]); }
-            free(rs); hp_sapi_interrupt_request(NULL);
+            monitor(housekeeping);
+            if (housekeeping) next_housekeeping_ns = hp_now_ns() + 1000000000ULL;
+            /* The periodic monitor retries cancellation after this first check. */
+            if (drain_due) next_drain_check_ns = UINT64_MAX;
+            pthread_mutex_lock(&lock);
+        } else {
+            uint64_t deadline = next_drain_check_ns < next_housekeeping_ns ? next_drain_check_ns : next_housekeeping_ns;
+            wait_for_monitor(deadline);
         }
-        monitor(); pthread_mutex_lock(&lock);
     }
     pthread_mutex_unlock(&lock);
     for (unsigned i = 0; i < nclassic; ++i) pthread_join(classic_threads[i], NULL);
@@ -380,6 +424,20 @@ int hp_runtime_start(void) {
     hp_runtime_config_defaults();
     pthread_mutex_lock(&lock);
     if (start_state == 2) { pthread_mutex_unlock(&lock); return 0; }
+    if (!monitor_cond_initialized) {
+        pthread_condattr_t attr;
+        int rc = pthread_condattr_init(&attr);
+        if (rc == 0) {
+            rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+            if (rc == 0) rc = pthread_cond_init(&monitor_cond, &attr);
+            pthread_condattr_destroy(&attr);
+        }
+        if (rc != 0) {
+            fprintf(stderr, "php.runtime: cannot initialize monotonic monitor condition: %s\n", strerror(rc));
+            start_state = -1; pthread_mutex_unlock(&lock); return -1;
+        }
+        monitor_cond_initialized = true;
+    }
     start_state = 1;
     atomic_store_explicit(&controller_stopped, false, memory_order_relaxed);
     if (pthread_create(&controller, NULL, control_main, NULL)) { start_state = -1; pthread_mutex_unlock(&lock); return -1; }
@@ -391,7 +449,7 @@ void hp_runtime_request_stop(void) {
     pthread_mutex_lock(&lock);
     if (!draining) drain_started_ns = hp_now_ns();
     draining = stop_requested = true;
-    pthread_cond_broadcast(&cond);
+    pthread_cond_broadcast(&cond); wake_monitor();
     pthread_mutex_unlock(&lock);
 }
 bool hp_runtime_stopped(void) {

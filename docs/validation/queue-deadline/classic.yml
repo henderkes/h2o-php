@@ -1,0 +1,17 @@
+listen:
+  host: 127.0.0.1
+  port: 18130
+num-threads: 2
+php.runtime:
+  threads: 1
+  max-threads: 2
+  queue-limit: 4
+  max-wait-time: 100ms
+  request-timeout: 2s
+  shutdown-timeout: 1s
+php.root: /tmp/hp-queue-deadline
+hosts:
+  "localhost":
+    paths:
+      "/":
+        php.classic: ON

@@ -1,0 +1,6 @@
+Warning: failed to load the default certificates file at /usr/local/share/h2o/ca-bundle.crt. Proxying to HTTPS servers may fail.
+[INFO] raised RLIMIT_NOFILE to 1048576
+h2o server (pid:90929) is ready to serve requests with 2 threads
+received SIGTERM, gracefully shutting down
+{"component":"php.engine","message":"PHP Fatal error:  Maximum execution time of 0 seconds exceeded in /tmp/hp-queue-deadline/loop.php on line 1\nStack trace:\n#0 [internal function]: {closure:/tmp/hp-queue-deadline/loop.php:1}()\n#1 /tmp/hp-queue-deadline/loop.php(1): frankenphp_handle_request()\n#2 {main}","severity":3,"request_id":1}
+php.runtime: shutdown complete; 2 network loops drained, 0 pending completions

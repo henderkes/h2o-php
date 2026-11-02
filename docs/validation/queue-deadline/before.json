@@ -1,0 +1,19 @@
+{
+  "label": "before",
+  "binary_sha256": "c485bca4ef42c3a0bbfdda49702164d10382b1ae2bec7d78d56a6e705e64a2d2",
+  "requests": 2,
+  "max_wait_ms": 100,
+  "active": {
+    "id": "busy",
+    "status": 200,
+    "elapsed_ms": 606.86,
+    "body": "{\"id\":\"busy\"}"
+  },
+  "waiting": {
+    "id": "waiting",
+    "status": 504,
+    "elapsed_ms": 556.74,
+    "body": "PHP request cancelled or timed out\n"
+  },
+  "server_exit": 0
+}
