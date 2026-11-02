@@ -277,7 +277,14 @@ static int write_request(void *data, int is_end_stream)
 static void on_timeout(h2o_timer_t *timer)
 {
     php_generator_t *g = H2O_STRUCT_FROM_MEMBER(php_generator_t, timeout, timer);
-    if (!g->native || !g->req || g->aborted) return;
+    if (!g->native || !g->req) return;
+    if (g->aborted) {
+        /* An earlier HTTP/2 reset can still await a blocked connection write.
+         * Revisit it at process drain so the last stream can close transport. */
+        if (g->req->conn->ctx->shutdown_requested && g->req->conn->callbacks->abort_request)
+            g->req->conn->callbacks->abort_request(g->req);
+        return;
+    }
     pthread_mutex_lock(&g->native->mutex);
     g->native->state = HP_TIMED_OUT;
     pthread_mutex_unlock(&g->native->mutex);
@@ -464,7 +471,6 @@ void h2o_php_context_shutdown(void *context)
             php_context_t *p = h2o_context_get_handler_context(ctx, handler);
             for (h2o_linklist_t *link = p->generators.next; link != &p->generators; link = link->next) {
                 php_generator_t *g = H2O_STRUCT_FROM_MEMBER(php_generator_t, context_link, link);
-                if (g->aborted) continue;
                 if (h2o_timer_is_linked(&g->timeout)) h2o_timer_unlink(&g->timeout);
                 uint64_t now = hp_now_ns();
                 uint64_t request_remaining = g->native->deadline_ns > now
