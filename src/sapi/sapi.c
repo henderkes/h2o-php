@@ -138,6 +138,12 @@ static int send_headers(sapi_headers_struct *headers)
         free(name); free(copy);
     }
     int status = headers->http_response_code ? headers->http_response_code : 200;
+    if (status == 101) {
+        /* A PHP request has no native socket-upgrade bridge. In particular,
+         * H2O's informational API excludes 101 and asserts if given it. */
+        log_message("PHP protocol upgrades are not supported; sending HTTP 500", 4);
+        status = headers->http_response_code = 500;
+    }
     if (status < 100 || status > 999) {
         log_message("Invalid response status code; sending HTTP 500", 4);
         status = 500;
@@ -561,6 +567,10 @@ PHP_FUNCTION(headers_send)
         Z_PARAM_OPTIONAL
         Z_PARAM_LONG(status)
     ZEND_PARSE_PARAMETERS_END();
+    if (status == 101) {
+        zend_argument_value_error(1, "must not be 101 because PHP protocol upgrades are not supported");
+        RETURN_THROWS();
+    }
     int previous = SG(sapi_headers).http_response_code;
     SG(sapi_headers).http_response_code = (int)status;
     if (status >= 100 && status < 200) {

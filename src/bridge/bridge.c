@@ -170,6 +170,8 @@ ssize_t hp_response_write(hp_request_t *r, const void *data, size_t len) {
     return (ssize_t)sent;
 }
 int hp_response_headers(hp_request_t *r, int status, const hp_header_t *headers, bool info) {
+    /* HTTP 101 requires a protocol upgrade, not an informational response. */
+    if (info && (status < 100 || status >= 200 || status == 101)) return -1;
     hp_header_t *copy = hp_headers_clone(headers);
     if (headers && !copy) return -1;
     pthread_mutex_lock(&r->mutex);
