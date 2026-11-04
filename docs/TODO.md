@@ -1,0 +1,28 @@
+# Remaining work
+
+The complete compatibility/performance goal is **not met**. Resume from the actual on-disk identities in [CURRENT.md](CURRENT.md); preserve existing files and the intentional io_uring build. Do not recreate the deleted historical report tree.
+
+## Next action
+
+- [ ] Finish qualifying the unchanged `cea556f…` release for one selected comparison. Resolve effective JIT configuration explicitly, inspect the current versions of the changed tests/examples, and distinguish stale assertions from real defects. Preserve the original failing outputs. No performance traffic while a relevant correctness failure remains unresolved.
+- [ ] Perform **one selected paired instruction/work measurement** against the installed `a83acfc…` FrankenPHP, preferably the existing exact eight-upload/1 MiB case. The latest segment completed byte checks, not this measurement. Suspend worker/build CPU activity; only the orchestrator launches servers and traffic.
+- [ ] Verify the measurement tool before trusting counts. The retained DynamoRIO counter binary `/tmp/h2o-dr-control-20261104/libcount.so` has SHA256 `6890fe6f6064e2ea4c6e957581115d5929fcab1731defa4dfba659b5d49c6f52`, but its source was deleted with the reports. Its presence or old self-check is not fresh validation. Hardware instructions/cycles were previously unavailable in WSL; Callgrind failed before valid measurement. Do not relabel software counts as hardware-retired instructions or infer kernel CPU from userspace stacks.
+
+## One optimization, only after evidence selects it
+
+- [ ] Identify one measured bottleneck. Declare one change, unchanged controls, finite functional checks, measurement budget and acceptance thresholds **before** implementation/results. Do not apply the existing free-outside-lock patch or speculative scheduler/allocator/input/output bundles.
+- [ ] Assign one implementation owner through **Vibe CLI**, pinned API model `mistral-large-4-0`, `thinking="high"`. Other workers review/investigate only. Maximum four total slots including the orchestrator; disable nested delegation. Retain effective exports and real process/session handles; an observation timeout does not mean a worker stopped.
+- [ ] Build into a separate directory from the **current source state**, not a clean HEAD checkout or the old release source. Preserve `build/release/h2o-php` and io_uring ON. Record source fingerprint, patch/before-after hashes, actual compiler flags, linked PHP/ABI/extensions and all relevant build options. Review the existing worker-exit correctness fix separately from any performance candidate; a rebuild of accumulated source is not a single-change optimization comparison.
+- [ ] Verify affected bytes, boundaries, cancellation, shutdown and ownership before benchmarking. Then measure instructions/work, user/system CPU, throughput, latency, memory and synchronization at the affected points, especially one/eight connections. Count correctly completed requests/useful bytes; keep unfavorable observations. Retain or revert the one patch on evidence.
+
+Use about 1 s warmup, 2 s unprofiled bursts, at most three observations for the selected result, and about 4 s targeted profiles. Predeclare meaningful primary improvement (previous working threshold 5%) and adverse guards (5% throughput/CPU/instruction; 10% latency/memory/synchronization). Overlapping noisy results remain unresolved. WRK's stats_correct-adjusted percentiles are not raw response quantiles. Instrumented speed is not unprofiled capacity. Lower userspace instructions alone do not establish fewer copied bytes or less kernel work.
+
+## Required acceptance still outstanding
+
+- [ ] Qualify the finite required cases on the **same final executable/configuration**: classic, genuine persistent worker, small/JSON, upload, streaming, static, mixed and relevant real Symfony/Laravel Octane workers. Old or selected favorable results do not satisfy this. Resolve upload/static tail regressions; the full set has never passed.
+- [ ] For each declared case require correctness and equivalent actual PHP library/ABI, extensions/INI/OPcache/JIT, payload/application, regular/worker budgets, affinity, protocol/TLS, compression, logging/metrics and connection reuse; reproducible primary improvement; and no hidden material efficiency, tail, memory or synchronization regression.
+- [ ] Complete affected protocol/bridge checks: exact digests and partial reads/EOF; chunked/forms/multipart; H1/H2/H3; slow peers/disconnects/early finish; blocked shutdown and owning-loop release. Preserve persistence, request reset/recycling and relevant PCNTL/parallel behavior. The fresh transfer checks cover reused plain H1 only.
+- [ ] Finish observable compatibility and configuration gaps: PHP public API/reflection/lifecycle/state/environment/sessions/headers/bodies/streaming/cancellation; worker scheduling; OPcache/preload; logging/metrics; CLI; PCNTL/parallel; packaging; actual framework workers. Distinguish implemented-and-verified, implemented-but-unverified, missing, excluded and evidenced platform/ABI limits. Do not transfer older framework/install checks to another binary.
+- [ ] Verify native YAML defaults, units/sentinels, aliases/validation/inheritance, roots/environment and independent applications using examples that actually load. Preserve explicit settings. Keep any residual limitations visible in these two documents without restarting a documentation project or imitating upstream internals unnecessarily.
+
+Before the next shutdown, stop owned workloads, retain concise raw results and exact identities, and update these two files. Keep the persistent goal incomplete while required gates remain unmet.
