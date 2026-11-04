@@ -1,8 +1,13 @@
-.idea
-build/
-install/
-upstream/
+/.idea/
+/build/
+/cmake-build-*/
+/bench/*/
+/bench/environment.json
+/install/
+/upstream/
+/symfony-local*.yml
 __pycache__/
+*.py[cod]
 .tmp.dprobes.h
 
 vendor/

@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import threading
 import time
@@ -55,7 +57,7 @@ def sample(pids, stop, dest):
 
 def invoke(args, target, connections, duration, dest, post_size=0):
     script = 'post.lua' if post_size else ('mixed.lua' if target == '/__mixed__' else 'latency.lua')
-    cmd = ['wrk', '-t', str(min(connections, args.threads)), '-c', str(connections),
+    cmd = [args.wrk, '-t', str(min(connections, args.threads)), '-c', str(connections),
            '-d', f'{duration}s', '--timeout', '10s', '--latency', '-s',
            str(ROOT / 'bench' / script)]
     for header in args.header:
@@ -95,11 +97,13 @@ def invoke(args, target, connections, duration, dest, post_size=0):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base-url', default='http://127.0.0.1:8080')
+    p.add_argument('--wrk', default='wrk', help='Load-generator executable (default: supplied wrk)')
     p.add_argument('--pid', type=int, help='Actual server worker process PID, used for CPU/RSS samples')
     p.add_argument('--extra-pid', type=int, action='append', default=[], help='Additional server process tree, e.g. PHP-FPM master')
     p.add_argument('--binary', help='Measured server executable; record SHA256 and dynamic dependencies')
     p.add_argument('--config', help='Measured server configuration; retain exact contents and SHA256')
     p.add_argument('--metrics-path', help='Optional local native runtime metrics endpoint')
+    p.add_argument('--runtime-info-path', help='Optional PHP runtime-info fixture, retained with measurements')
     p.add_argument('--header', action='append', default=[], help='Additional HTTP header, e.g. Host: laravel.local')
     p.add_argument('--label', required=True)
     p.add_argument('--duration', type=int, default=10)
@@ -114,6 +118,9 @@ def main():
     out = ROOT / 'bench/raw' / f'{stamp}-{args.label}'
     out.mkdir(parents=True)
     metadata = vars(args) | {'utc': stamp}
+    generator = Path(shutil.which(args.wrk) or args.wrk).resolve()
+    metadata['load_generator'] = {'path': str(generator), 'sha256': hashlib.sha256(generator.read_bytes()).hexdigest(),
+                                'version': subprocess.run([str(generator),'--version'],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT).stdout}
     for name, cmd in {'git_commit': ['git','rev-parse','HEAD'], 'git_status': ['git','status','--short'], 'machine': ['uname','-a'],
                       'compiler': ['/usr/bin/gcc','--version'], 'php': ['php-config-zts','--version'],
                       'h2o': ['git','-C','upstream/h2o','rev-parse','HEAD']}.items():
@@ -127,11 +134,27 @@ def main():
                 (out/'server-config.txt').write_bytes(path.read_bytes())
             else:
                 metadata['ldd'] = subprocess.run(['ldd', str(path)],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT).stdout
-    flags = ROOT/'build/release/h2o/CMakeFiles/h2o.dir/flags.make'
-    if flags.exists():
-        metadata['native_build_flags'] = flags.read_text()
+                version_argument = 'version' if path.name == 'frankenphp' else '--version'
+                metadata['binary_version'] = subprocess.run([str(path), version_argument],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT).stdout
+                version_match = re.search(r'h2o-php runtime revision: ([0-9a-f]+)', metadata['binary_version'])
+                if version_match:
+                    metadata['tested_revision'] = version_match.group(1)
+    if args.binary:
+        binary_folder = Path(args.binary).resolve().parent
+        for flags in [binary_folder/'CMakeFiles/h2o.dir/flags.make', binary_folder/'h2o/CMakeFiles/h2o.dir/flags.make']:
+            if flags.exists():
+                metadata['measured_build_flags'] = flags.read_text()
+                break
     metadata['source_sha256'] = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                                  for path in sorted((ROOT/'src').rglob('*')) if path.is_file()}
+    metadata['fixture_sha256'] = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                                 for path in sorted((ROOT/'examples/bench').rglob('*')) if path.is_file()}
+    if args.runtime_info_path:
+        try:
+            with urllib.request.urlopen(args.base_url.rstrip('/') + args.runtime_info_path, timeout=5) as response:
+                metadata['http_runtime_info'] = json.loads(response.read())
+        except Exception as error:
+            metadata['http_runtime_info_error'] = str(error)
     (out / 'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
     workloads = {'minimal':('/minimal.php',0), 'json':('/json.php',0), 'worker':('/worker',0),
                  'post-small':('/body.php',1024), 'post-large':('/body.php',1024*1024),

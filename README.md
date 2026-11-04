@@ -1,8 +1,10 @@
 # h2o-php
 
-Native PHP 8.5 ZTS execution inside the real H2O standalone server, with classic request threads and persistent FrankenPHP-compatible worker scripts. Implemented in C11 with pthreads, H2O event-loop completion messages and bounded streaming queues. No PHP-FPM is used for embedded execution. Mercure is intentionally excluded.
+Native PHP ZTS inside H2O's real standalone server, implemented in C11 with dedicated PHP pthreads, streaming request/response bridges and persistent FrankenPHP-compatible workers. H2O retains its TLS, HTTP protocols, file serving, proxies, filters and virtual hosts. Mercure and Vulcain are intentionally excluded.
 
-This is a newly implemented runtime. Consult the validation and benchmark records before deployment; it has not undergone an independent production security audit.
+The current PHP profile is **8.6.0RC4 ZTS**, Zend module API **20260924**. The normal build links the installed `libphp-zts.so`.
+
+Building requires CMake 3.20+, a C/C++ compiler, pkg-config, OpenSSL and zlib development files, and an embed-capable ZTS PHP 8.5 or 8.6 installation. The native PHP CLI requires PHP 8.6 with its CLI headers and exported entry point. Set `PHPZTS_CONFIG` and `PHPZTS_LIBRARY` as CMake options if automatic discovery does not find your installation.
 
 ```sh
 ./scripts/fetch-upstream.sh
@@ -13,29 +15,42 @@ cmake --build --preset release
 ./build/release/h2o-php -m worker -c examples/worker.yml
 ```
 
-The checked YAML files use paths for this workspace; replace `/home/m/h2o-php` with the checkout path when installing elsewhere. `php-config-zts`, installed matching PHP headers and the existing shared ZTS PHP library are required. The build checks the actual ABI and library version. H2O itself still handles TLS, HTTP protocols, static assets, filters, proxies and virtual hosts.
+Run the commands above from the checkout root. `examples/classic.yml` and `examples/worker.yml` use paths relative to that root; adapt application paths in the framework examples. Build discovery uses matching `php-config-zts`, headers and the actual PHP library.
 
-Persistent scripts use the original native API:
+A PHP site with static assets uses one handler:
+
+```yaml
+listen: 8080
+php.runtime:
+  num_threads: 2
+  max_threads: 8
+hosts:
+  "localhost:8080":
+    php.root: /srv/app/public
+    paths:
+      "/":
+        php_server: ON
+```
+
+For a Symfony/Octane front controller that supports worker mode, use `php_server: {worker: {file: index.php, num: 1}}` on that path. Existing assets, favicons and robots.txt remain served by H2O. Direct `php` and `php.worker` handlers are available for routes that should always enter PHP.
+
+Persistent scripts use the native API and keep their application objects between callbacks:
 
 ```php
 <?php
-$boot = new Application();
-while (frankenphp_handle_request(static function () use ($boot): void {
-    $boot->handle();
+$app = new Application();
+while (frankenphp_handle_request(static function () use ($app): void {
+    $app->handle();
 })) {}
 ```
 
-The script boots once per worker generation; specialized partial PHP request cleanup preserves its objects and execution stack between callbacks. `$_ENV` persists as in FrankenPHP. The native `frankenphp` extension registers the required API aliases, reflection metadata, structured logging and log constants. `php_sapi_name()` returns `frankenphp`.
+The HTTP SAPI identifies as `frankenphp`; the real CLI identifies as `cli` and loads `frankenphp-cli`:
 
-Documentation:
+```sh
+./build/release/h2o-php php-cli -r 'echo PHP_SAPI, "\n";'
+./build/release/h2o-php php-cli /srv/app/bin/console --help
+```
 
-- [Build, installation and service](docs/INSTALL.md)
-- [Configuration reference](docs/CONFIGURATION.md)
-- [Architecture and ownership](docs/ARCHITECTURE.md)
-- [Pinned dependencies and compatibility](docs/UPSTREAM_COMPATIBILITY.md)
-- [Runtime verification](docs/VALIDATION.md)
-- [Measured benchmarks](docs/BENCHMARKS.md)
-- [Security and reliability](docs/SECURITY.md)
-- [Engineering progress](docs/PROGRESS.md)
+Build the shared `parallel` extension with `scripts/build-parallel.sh` and enable its resulting module in PHP INI.
 
-Real Symfony and Laravel Octane worker examples are described in [framework validation](examples/frameworks/README.md). Standalone classic, front-controller, worker, multiple-application, mixed static/worker and virtual-host configurations are under `examples/`.
+More examples are in [examples/frameworks](examples/frameworks/README.md).

@@ -11,9 +11,7 @@ php.ini:
 hosts:
   "localhost:18108":
     paths:
-      "/":
-        php.front-controller: index.php
-        php.classic: ON
+      "/": {}
   "second:18108":
     paths:
       "/":

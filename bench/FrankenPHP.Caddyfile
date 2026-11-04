@@ -1,5 +1,6 @@
 {
 	admin off
+	persist_config off
 	auto_https off
 	frankenphp {
 		num_threads 4

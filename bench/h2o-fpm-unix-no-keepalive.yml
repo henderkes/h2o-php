@@ -1,0 +1,14 @@
+listen: 18088
+num-threads: 4
+hosts:
+  "localhost:18088":
+    paths:
+      "/":
+        file.dir: /home/m/h2o-php/examples/bench
+        file.custom-handler:
+          extension: .php
+          # Disable backend persistence for the bounded four-process FPM comparison.
+          fastcgi.timeout.keepalive: 0
+          fastcgi.connect:
+            port: /home/m/h2o-php/build/php-fpm-bench.sock
+            type: unix

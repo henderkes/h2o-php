@@ -1,0 +1,14 @@
+listen: 18087
+num-threads: 4
+hosts:
+  "localhost:18087":
+    paths:
+      "/":
+        file.dir: /home/m/h2o-php/examples/bench
+        file.custom-handler:
+          extension: .php
+          # Pinned H2O parser uses milliseconds, so this is one second.
+          fastcgi.timeout.keepalive: 1000
+          fastcgi.connect:
+            port: /home/m/h2o-php/build/php-fpm-bench.sock
+            type: unix

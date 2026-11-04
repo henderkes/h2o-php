@@ -5,13 +5,11 @@ php.runtime:
   threads: 2
   max-threads: 8
   request-timeout: 5s
-php.root: /home/m/h2o-php/examples/smoke
 php.ini:
   output_buffering: 0
 hosts:
   "localhost:18104":
+    php.root: /home/m/h2o-php/examples/smoke
     paths:
       "/":
-        php.front-controller: index.php
-        php.classic: ON
         file.dir: /home/m/h2o-php/examples/smoke

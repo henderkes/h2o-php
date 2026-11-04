@@ -11,9 +11,14 @@ ROOT = Path(__file__).resolve().parent.parent
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('directories', nargs='+')
+    parser.add_argument('--scheduler', action='store_true', help='Show native scheduler counter deltas')
     args = parser.parse_args()
-    print('| Server / workload | Connections | Median RPS | p50 ms | p95 ms | p99 ms | Errors / timeouts | CPU % | Peak RSS MiB |')
-    print('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
+    if args.scheduler:
+        print('| Server / workload | Connections | Mean queue wait us | Mean PHP execution us | Worker restarts | Runtime failures | Runtime timeouts | End buffered bytes |')
+        print('|---|---:|---:|---:|---:|---:|---:|---:|')
+    else:
+        print('| Server / workload | Connections | Median RPS | p50 ms | p95 ms | p99 ms | Errors / timeouts | CPU % | Peak RSS MiB |')
+        print('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
     for directory in args.directories:
         folder = Path(directory)
         metadata = json.loads((folder/'metadata.json').read_text())
@@ -25,6 +30,21 @@ def main():
             def median(field):
                 numbers = [row[field] for row in values if field in row]
                 return statistics.median(numbers) if numbers else float('nan')
+            if args.scheduler:
+                queue = []; execution = []; restarts = failures = timeouts = end_buffered = 0
+                for row in values:
+                    before = row.get('metrics_before', {}); after = row.get('metrics_after', {})
+                    completed = after.get('completed',0) - before.get('completed',0)
+                    if completed > 0:
+                        queue.append((after.get('queue_wait_ns_total',0) - before.get('queue_wait_ns_total',0)) / completed / 1000)
+                        execution.append((after.get('execution_ns_total',0) - before.get('execution_ns_total',0)) / completed / 1000)
+                    restarts += after.get('worker_restarts',0) - before.get('worker_restarts',0)
+                    failures += after.get('failed',0) - before.get('failed',0)
+                    timeouts += after.get('timed_out',0) - before.get('timed_out',0)
+                    end_buffered = max(end_buffered,after.get('buffered_bytes',0))
+                if queue:
+                    print(f'| {metadata["label"]} / {workload} | {connections} | {statistics.median(queue):.2f} | {statistics.median(execution):.2f} | {restarts} | {failures} | {timeouts} | {end_buffered} |')
+                continue
             cpu_values = []
             rss_values = []
             for row in values:

@@ -26,6 +26,8 @@ fetch_revision https://github.com/php/frankenphp.git \
     4384c506d219cd2f8750edfceae57d3db8eb54f3 "$project_root/upstream/frankenphp"
 fetch_revision https://github.com/php/php-src.git \
     136e049ac10b032c83018e65b63b6df858943750 "$project_root/upstream/php-src"
+fetch_revision https://github.com/php/php-src.git \
+    f23b4c222cebe33be93ee8ecaaa14390c5507a08 "$project_root/upstream/php-src-8.6"
 patch_file="$project_root/patches/h2o-native-php.patch"
 if git -C "$project_root/upstream/h2o" apply --reverse --check "$patch_file" 2>/dev/null; then
     printf '%s\n' 'H2O native PHP patch already applied.'

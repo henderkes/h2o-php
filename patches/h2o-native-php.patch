@@ -76,6 +76,251 @@ index 48333ec..6ea96fe 100644
       */
      h2o_iovec_t entity;
      /**
+diff --git a/include/h2o/socket.h b/include/h2o/socket.h
+index 810bd09..50c65a9 100644
+--- a/include/h2o/socket.h
++++ b/include/h2o/socket.h
+@@ -109,6 +109,24 @@ void h2o_sliding_counter_stop(h2o_sliding_counter_t *counter, uint64_t now);
+ 
+ typedef struct st_h2o_socket_t h2o_socket_t;
+ 
++#ifdef H2O_WITH_PHP
++/* Optional standalone embedding: retain exact host FD ownership across fork.
++ * All descriptor creation/registration and removal/close share this gate. */
++void hp_host_fds_begin(void);
++void hp_host_fds_end(void);
++void hp_host_fd_register_locked(int fd);
++int hp_host_fd_close(int fd);
++#define H2O_HOST_FDS_BEGIN() hp_host_fds_begin()
++#define H2O_HOST_FDS_END() hp_host_fds_end()
++#define H2O_HOST_FD_REGISTER(fd) hp_host_fd_register_locked(fd)
++#define H2O_HOST_FD_CLOSE(fd) hp_host_fd_close(fd)
++#else
++#define H2O_HOST_FDS_BEGIN() ((void)0)
++#define H2O_HOST_FDS_END() ((void)0)
++#define H2O_HOST_FD_REGISTER(fd) ((void)0)
++#define H2O_HOST_FD_CLOSE(fd) close(fd)
++#endif
++
+ typedef void (*h2o_socket_cb)(h2o_socket_t *sock, const char *err);
+ 
+ /**
+diff --git a/lib/common/multithread.c b/lib/common/multithread.c
+index 4d77758..f9fe9bb 100644
+--- a/lib/common/multithread.c
++++ b/lib/common/multithread.c
+@@ -92,6 +92,7 @@ static void on_read(h2o_socket_t *sock, const char *err)
+ 
+ static void init_async(h2o_multithread_queue_t *queue, h2o_loop_t *loop)
+ {
++    H2O_HOST_FDS_BEGIN();
+ #if defined(__linux__)
+     /**
+      * The kernel overhead of an eventfd file descriptor is
+@@ -104,6 +105,7 @@ static void init_async(h2o_multithread_queue_t *queue, h2o_loop_t *loop)
+     if (fd == -1) {
+         h2o_fatal("eventfd: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
+     }
++    H2O_HOST_FD_REGISTER(fd);
+     queue->async.write = fd;
+     queue->async.read = h2o_evloop_socket_create(loop, fd, 0);
+ #else
+@@ -113,10 +115,13 @@ static void init_async(h2o_multithread_queue_t *queue, h2o_loop_t *loop)
+     if (cloexec_pipe(fds) != 0) {
+         h2o_fatal("pipe: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
+     }
++    H2O_HOST_FD_REGISTER(fds[0]);
++    H2O_HOST_FD_REGISTER(fds[1]);
+     fcntl(fds[1], F_SETFL, O_NONBLOCK);
+     queue->async.write = fds[1];
+     queue->async.read = h2o_evloop_socket_create(loop, fds[0], 0);
+ #endif
++    H2O_HOST_FDS_END();
+     queue->async.read->data = queue;
+     h2o_socket_read_start(queue->async.read, on_read);
+ }
+@@ -161,7 +166,7 @@ void h2o_multithread_destroy_queue(h2o_multithread_queue_t *queue)
+     h2o_socket_close(queue->async.read);
+ #ifndef __linux__
+     /* only one file descriptor is required for eventfd and already closed by h2o_socket_close() */
+-    close(queue->async.write);
++    H2O_HOST_FD_CLOSE(queue->async.write);
+ #endif
+     free(queue);
+ #endif
+diff --git a/lib/common/socket.c b/lib/common/socket.c
+index c1c9979..82b6e96 100644
+--- a/lib/common/socket.c
++++ b/lib/common/socket.c
+@@ -581,7 +581,7 @@ void h2o_socket_dispose_export(h2o_socket_export_t *info)
+         info->ssl = NULL;
+     }
+     h2o_buffer_dispose(&info->input);
+-    close(info->fd);
++    H2O_HOST_FD_CLOSE(info->fd);
+     info->fd = -1;
+ }
+ 
+@@ -1713,10 +1713,13 @@ static void proceed_handshake(h2o_socket_t *sock, const char *err);
+ void h2o_socket_start_async_handshake(h2o_loop_t *loop, int async_fd, void *data, h2o_socket_cb cb)
+ {
+     /* dup async_fd as h2o socket handling will close it */
++    H2O_HOST_FDS_BEGIN();
+     if ((async_fd = dup(async_fd)) == -1) {
+         char errbuf[256];
+         h2o_fatal("dup failed:%s", h2o_strerror_r(errno, errbuf, sizeof(errbuf)));
+     }
++    H2O_HOST_FD_REGISTER(async_fd);
++    H2O_HOST_FDS_END();
+ 
+     /* add async fd to event loop in order to retry when openssl engine is ready */
+ #if H2O_USE_LIBUV
+diff --git a/lib/common/socket/evloop.c.h b/lib/common/socket/evloop.c.h
+index c559c5a..559d6fb 100644
+--- a/lib/common/socket/evloop.c.h
++++ b/lib/common/socket/evloop.c.h
+@@ -394,7 +394,7 @@ void do_dispose_socket(h2o_socket_t *_sock)
+ 
+     /* immediate close */
+     if (sock->fd != -1) {
+-        close(sock->fd);
++        H2O_HOST_FD_CLOSE(sock->fd);
+         sock->fd = -1;
+     }
+     link_to_statechanged(sock);
+@@ -668,6 +668,8 @@ static struct st_h2o_evloop_socket_t *create_socket(h2o_evloop_t *loop, int fd,
+ {
+     struct st_h2o_evloop_socket_t *sock;
+ 
++    H2O_HOST_FDS_BEGIN();
++    H2O_HOST_FD_REGISTER(fd);
+     sock = h2o_mem_alloc(sizeof(*sock));
+     memset(sock, 0, sizeof(*sock));
+     h2o_buffer_init(&sock->super.input, &h2o_socket_buffer_prototype);
+@@ -679,6 +681,7 @@ static struct st_h2o_evloop_socket_t *create_socket(h2o_evloop_t *loop, int fd,
+     sock->_next_statechanged = sock;
+ 
+     evloop_do_on_socket_create(sock);
++    H2O_HOST_FDS_END();
+ 
+     return sock;
+ }
+@@ -718,16 +721,22 @@ h2o_socket_t *h2o_evloop_socket_accept(h2o_socket_t *_listener)
+     } peeraddr;
+     socklen_t peeraddrlen = sizeof(peeraddr);
+ 
++    H2O_HOST_FDS_BEGIN();
+ #if H2O_USE_ACCEPT4
+-    if ((fd = accept4(listener->fd, &peeraddr.sa, &peeraddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC)) == -1)
++    if ((fd = accept4(listener->fd, &peeraddr.sa, &peeraddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC)) == -1) {
++        H2O_HOST_FDS_END();
+         return NULL;
++    }
+     sock = &create_socket(listener->loop, fd, H2O_SOCKET_FLAG_IS_ACCEPTED_CONNECTION)->super;
+ #else
+-    if ((fd = cloexec_accept(listener->fd, &peeraddr.sa, &peeraddrlen)) == -1)
++    if ((fd = cloexec_accept(listener->fd, &peeraddr.sa, &peeraddrlen)) == -1) {
++        H2O_HOST_FDS_END();
+         return NULL;
++    }
+     fcntl(fd, F_SETFL, O_NONBLOCK);
+     sock = &create_socket(listener->loop, fd, H2O_SOCKET_FLAG_IS_ACCEPTED_CONNECTION)->super;
+ #endif
++    H2O_HOST_FDS_END();
+     if (peeraddrlen <= sizeof(peeraddr)) {
+         h2o_socket_setpeername(sock, &peeraddr.sa, peeraddrlen);
+     } else {
+@@ -748,10 +757,12 @@ h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, sockle
+     int fd, connect_ret;
+     struct st_h2o_evloop_socket_t *sock;
+ 
++    H2O_HOST_FDS_BEGIN();
+     if ((fd = cloexec_socket(addr->sa_family, SOCK_STREAM, 0)) == -1) {
+         if (err != NULL) {
+             *err = h2o_socket_error_socket_fail;
+         }
++        H2O_HOST_FDS_END();
+         return NULL;
+     }
+     fcntl(fd, F_SETFL, O_NONBLOCK);
+@@ -759,11 +770,13 @@ h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, sockle
+     if (!((connect_ret = connect(fd, addr, addrlen)) == 0 || errno == EINPROGRESS)) {
+         if (err != NULL)
+             *err = h2o_socket_get_error_string(errno, h2o_socket_error_conn_fail);
+-        close(fd);
++        H2O_HOST_FD_CLOSE(fd);
++        H2O_HOST_FDS_END();
+         return NULL;
+     }
+ 
+     sock = create_socket(loop, fd, H2O_SOCKET_FLAG_IS_CONNECTING);
++    H2O_HOST_FDS_END();
+     set_nodelay_if_likely_tcp(fd, addr);
+ 
+     if (connect_ret == 0) {
+diff --git a/lib/common/socket/evloop/epoll.c.h b/lib/common/socket/evloop/epoll.c.h
+index ac55445..0ac8bd0 100644
+--- a/lib/common/socket/evloop/epoll.c.h
++++ b/lib/common/socket/evloop/epoll.c.h
+@@ -154,7 +154,7 @@ static int update_status(struct st_h2o_evloop_epoll_t *loop)
+                 if (sock->fd != -1) {
+                     if (!delete_from_epoll_on_close(sock))
+                         h2o_error_printf("update_status: epoll(DEL) returned error %d (fd=%d)\n", errno, sock->fd);
+-                    close(sock->fd);
++                    H2O_HOST_FD_CLOSE(sock->fd);
+                 }
+                 free(sock);
+             }
+@@ -320,21 +320,25 @@ static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock)
+ static void evloop_do_dispose(h2o_evloop_t *_loop)
+ {
+     struct st_h2o_evloop_epoll_t *loop = (struct st_h2o_evloop_epoll_t *)_loop;
+-    close(loop->ep);
++    H2O_HOST_FD_CLOSE(loop->ep);
+ }
+ 
+ h2o_evloop_t *h2o_evloop_create(void)
+ {
+     struct st_h2o_evloop_epoll_t *loop = (struct st_h2o_evloop_epoll_t *)create_evloop(sizeof(*loop));
+ 
++    H2O_HOST_FDS_BEGIN();
+     if ((loop->ep = epoll_create1(EPOLL_CLOEXEC)) == -1) {
+         char buf[128];
+         h2o_fatal("h2o_evloop_create: epoll_create1 failed:%d:%s\n", errno, h2o_strerror_r(errno, buf, sizeof(buf)));
+     }
++    H2O_HOST_FD_REGISTER(loop->ep);
+ 
+ #if H2O_USE_IO_URING
++    /* Ring creation and create_socket's nested registration share the fork gate. */
+     h2o_io_uring_init(&loop->super);
+ #endif
++    H2O_HOST_FDS_END();
+ 
+     return &loop->super;
+ }
+diff --git a/lib/common/socket/evloop/kqueue.c.h b/lib/common/socket/evloop/kqueue.c.h
+index c2d076f..103d122 100644
+--- a/lib/common/socket/evloop/kqueue.c.h
++++ b/lib/common/socket/evloop/kqueue.c.h
+@@ -181,14 +181,17 @@ static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock)
+ static void evloop_do_dispose(h2o_evloop_t *_loop)
+ {
+     struct st_h2o_socket_loop_kqueue_t *loop = (struct st_h2o_socket_loop_kqueue_t *)_loop;
+-    close(loop->kq);
++    H2O_HOST_FD_CLOSE(loop->kq);
+ }
+ 
+ h2o_evloop_t *h2o_evloop_create(void)
+ {
+     struct st_h2o_socket_loop_kqueue_t *loop = (struct st_h2o_socket_loop_kqueue_t *)create_evloop(sizeof(*loop));
+ 
++    H2O_HOST_FDS_BEGIN();
+     loop->kq = kqueue();
++    H2O_HOST_FD_REGISTER(loop->kq);
++    H2O_HOST_FDS_END();
+ 
+     return &loop->super;
+ }
 diff --git a/lib/core/request.c b/lib/core/request.c
 index 773e117..af2667f 100644
 --- a/lib/core/request.c
@@ -102,6 +347,39 @@ index 773e117..af2667f 100644
              req->dispatched = 1;
              return;
          }
+diff --git a/lib/handler/configurator/proxy.c b/lib/handler/configurator/proxy.c
+index 4bd414b..2091627 100644
+--- a/lib/handler/configurator/proxy.c
++++ b/lib/handler/configurator/proxy.c
+@@ -29,6 +29,9 @@
+ #include "h2o/configurator.h"
+ #include "h2o/balancer.h"
+ #include "h2o/socket.h"
++#ifdef H2O_WITH_PHP
++#include "assets.h"
++#endif
+ 
+ struct proxy_config_vars_t {
+     h2o_proxy_config_vars_t conf;
+@@ -679,11 +682,18 @@ static int on_config_enter(h2o_configurator_t *_self, h2o_configurator_context_t
+     if (ctx->pathconf == NULL && ctx->hostconf == NULL) {
+         /* is global conf, setup the default SSL context */
+         self->vars->ssl_ctx = create_ssl_ctx();
++#ifdef H2O_WITH_PHP
++        if (hp_assets_ca_store(SSL_CTX_get_cert_store(self->vars->ssl_ctx)) != 0) {
++            h2o_configurator_errprintf(NULL, node, "failed to load the embedded Mozilla CA bundle for outbound proxy TLS");
++            return -1;
++        }
++#else
+         char *ca_bundle = h2o_configurator_get_cmd_path("share/h2o/ca-bundle.crt");
+         if (SSL_CTX_load_verify_locations(self->vars->ssl_ctx, ca_bundle, NULL) != 1)
+             h2o_error_printf("Warning: failed to load the default certificates file at %s. Proxying to HTTPS servers may fail.\n",
+                              ca_bundle);
+         free(ca_bundle);
++#endif
+         SSL_CTX_set_verify(self->vars->ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+         h2o_cache_t *ssl_session_cache =
+             create_ssl_session_cache(H2O_DEFAULT_PROXY_SSL_SESSION_CACHE_CAPACITY, H2O_DEFAULT_PROXY_SSL_SESSION_CACHE_DURATION);
 diff --git a/lib/handler/file.c b/lib/handler/file.c
 index 0c2aec2..651e675 100644
 --- a/lib/handler/file.c
@@ -269,18 +547,291 @@ index 1add643..1023142 100644
          .get_peername = get_peername,
          .get_ptls = get_ptls,
 diff --git a/src/main.c b/src/main.c
-index 826599c..f5303dd 100644
+index 826599c..7ccd7cb 100644
 --- a/src/main.c
 +++ b/src/main.c
-@@ -99,6 +99,7 @@
+@@ -99,6 +99,13 @@
  #include "h2o/io_uring.h"
  #endif
  #include "standalone.h"
 +#include "h2o_php.h"
++#include "../../../src/config/commands.h"
++#include "../../../src/runtime/ocsp.h"
++#include "../../../src/runtime/host_fds.h"
++#include "../../../src/runtime/master.h"
++#include "../../../src/runtime/assets.h"
++static char *hp_executable_path;
  #include "../lib/probes_.h"
  
  #if defined(__linux__)
-@@ -4863,18 +4864,43 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+@@ -106,6 +113,37 @@
+ #define ASYNC_NB_USE_EVENTFD 1
+ #endif
+ 
++/* Descriptor creation and enrollment share the fork snapshot gate. */
++static int hp_main_socket(int domain, int type, int protocol)
++{
++    hp_host_fds_begin(); int fd = socket(domain, type, protocol), saved = errno;
++    hp_host_fd_register_locked(fd); hp_host_fds_end(); errno = saved; return fd;
++}
++static int hp_main_socketpair(int domain, int type, int protocol, int fds[2])
++{
++    hp_host_fds_begin(); int rc = socketpair(domain, type, protocol, fds), saved = errno;
++    if (!rc) { hp_host_fd_register_locked(fds[0]); hp_host_fd_register_locked(fds[1]); }
++    hp_host_fds_end(); errno = saved; return rc;
++}
++static int hp_main_pipe(int fds[2])
++{
++    hp_host_fds_begin(); int rc = pipe(fds), saved = errno;
++    if (!rc) { hp_host_fd_register_locked(fds[0]); hp_host_fd_register_locked(fds[1]); }
++    hp_host_fds_end(); errno = saved; return rc;
++}
++static int hp_main_dup(int original)
++{
++    hp_host_fds_begin(); int fd = dup(original), saved = errno;
++    hp_host_fd_register_locked(fd); hp_host_fds_end(); errno = saved; return fd;
++}
++#if defined(__linux__)
++static int hp_main_eventfd(unsigned initial, int flags)
++{
++    hp_host_fds_begin(); int fd = eventfd(initial, flags), saved = errno;
++    hp_host_fd_register_locked(fd); hp_host_fds_end(); errno = saved; return fd;
++}
++#endif
++
+ #ifdef TCP_FASTOPEN
+ #define H2O_DEFAULT_LENGTH_TCP_FASTOPEN_QUEUE 4096
+ #else
+@@ -362,7 +400,7 @@ static struct {
+     .threads = NULL,
+     .shutdown_requested = 0,
+     .state = {{0}},
+-    .crash_handler = "share/h2o/annotate-backtrace-symbols",
++    .crash_handler = "@native",
+     .crash_handler_wait_pipe_close = 0,
+     .tcp_reuseport = 0,
+     .ssl_zerocopy = 0,
+@@ -620,11 +658,11 @@ static void spawn_acme_loader(void)
+ 
+     /* launch the helper, that exits itself when STDIN is closed */
+     int fds[2];
+-    if (pipe(fds) != 0)
++    if (hp_main_pipe(fds) != 0)
+         h2o_fatal("pipe(2) failed:%s", strerror(errno));
+     if (h2o_spawnp(helper_argv[0], helper_argv, (int[]){fds[0], 0, fds[1], -1, -1}, 0) == -1)
+         h2o_fatal("failed to spawn %s:%s", helper_argv[0], strerror(errno));
+-    close(fds[0]);
++    hp_host_fd_close(fds[0]);
+ 
+     free(helper_argv[4]);
+     free(helper_argv);
+@@ -651,7 +689,7 @@ static void close_acme_loader_pipe(void)
+     if (sscanf(fdstr, "%d", &fd) != 1)
+         h2o_fatal("failed to parse H2O_ACME_LOADER_FD:%s", fdstr);
+ 
+-    close(fd);
++    hp_host_fd_close(fd);
+     unsetenv("H2O_ACME_LOADER_FD");
+ }
+ 
+@@ -837,7 +875,7 @@ static void async_nb_do_async_transaction(ASYNC_JOB *job, neverbleed_iobuf_t *bu
+ 
+     /* setup fd to notify OpenSSL; eventfd is used if available, as it is lightweight and uses only one file descriptor */
+ #if ASYNC_NB_USE_EVENTFD
+-    if ((transaction.notify_fd = eventfd(0, EFD_CLOEXEC)) == -1) {
++    if ((transaction.notify_fd = hp_main_eventfd(0, EFD_CLOEXEC)) == -1) {
+         char errbuf[256];
+         h2o_fatal("eventfd:%s", h2o_strerror_r(errno, errbuf, sizeof(errbuf)));
+     }
+@@ -874,9 +912,9 @@ static void async_nb_do_async_transaction(ASYNC_JOB *job, neverbleed_iobuf_t *bu
+ 
+     /* close the notification file descriptors used for notification */
+ #if !ASYNC_NB_USE_EVENTFD
+-    close(readfd);
++    hp_host_fd_close(readfd);
+ #endif
+-    close(transaction.notify_fd);
++    hp_host_fd_close(transaction.notify_fd);
+ }
+ 
+ #endif
+@@ -1365,7 +1403,9 @@ static void build_ssl_dynamic_data(struct listener_ssl_identity_t *identity, h2o
+ 
+ static int get_ocsp_response(const char *cmd, h2o_iovec_t cert_chain_pem, h2o_buffer_t **resp)
+ {
+-    char *cmd_fullpath = h2o_configurator_get_cmd_path(cmd), *argv[] = {cmd_fullpath, NULL};
++    int internal = strcmp(cmd, "@native") == 0;
++    char *cmd_fullpath = internal ? h2o_strdup(NULL, hp_executable_path, SIZE_MAX).base : h2o_configurator_get_cmd_path(cmd);
++    char *argv[] = {cmd_fullpath, internal ? "--internal-fetch-ocsp-response" : NULL, NULL};
+     int child_status, ret;
+ 
+     if (h2o_read_command(cmd_fullpath, argv, cert_chain_pem, resp, &child_status) != 0) {
+@@ -2299,7 +2339,7 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
+     *ocsp_stapling = (struct listener_ssl_ocsp_stapling_t){
+         .interval = 4 * 60 * 60, /* default update interval of 4 hours */
+         .max_failures = 3,       /* by default, permit 3 consecutive failures before temporary disabling OCSP stapling */
+-        .cmd = "share/h2o/fetch-ocsp-response",
++        .cmd = "@native",
+     };
+     if (ocsp_update_cmd != NULL)
+         ocsp_stapling->cmd = h2o_strdup(NULL, (*ocsp_update_cmd)->data.scalar, SIZE_MAX).base;
+@@ -2310,8 +2350,12 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
+     if (ocsp_update_interval_node != NULL) {
+         if (h2o_configurator_scanf(cmd, *ocsp_update_interval_node, "%" SCNu64, &ocsp_stapling->interval) != 0)
+             goto Error;
+-        if (ocsp_stapling->interval == 0)
++        if (ocsp_stapling->interval == 0) {
++            if (ocsp_update_cmd != NULL)
++                free(ocsp_stapling->cmd);
++            free(ocsp_stapling);
+             ocsp_stapling = NULL;
++        }
+     }
+ 
+     /* add the host to the existing SSL config, if the certificate file is already registered */
+@@ -2323,6 +2367,11 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
+                 continue;
+             /* matched! add host */
+             listener_setup_ssl_add_host(ssl_config, ctx->hostconf->authority.hostport);
++            if (ocsp_stapling != NULL) {
++                if (ocsp_update_cmd != NULL)
++                    free(ocsp_stapling->cmd);
++                free(ocsp_stapling);
++            }
+             return 0;
+         }
+     }
+@@ -2745,7 +2794,7 @@ static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, str
+     }
+ 
+     /* add new listener */
+-    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1 || bind(fd, (void *)sa, sizeof(*sa)) != 0 || listen(fd, H2O_SOMAXCONN) != 0) {
++    if ((fd = hp_main_socket(AF_UNIX, SOCK_STREAM, 0)) == -1 || bind(fd, (void *)sa, sizeof(*sa)) != 0 || listen(fd, H2O_SOMAXCONN) != 0) {
+         h2o_configurator_errprintf(NULL, node, "failed to listen to socket:%s: %s", sa->sun_path, strerror(errno));
+         goto ErrorExit;
+     }
+@@ -2766,7 +2815,7 @@ static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, str
+ 
+ ErrorExit:
+     if (fd != -1)
+-        close(fd);
++        hp_host_fd_close(fd);
+     return -1;
+ }
+ 
+@@ -2786,7 +2835,7 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
+ {
+     int fd;
+ 
+-    if ((fd = socket(domain, type, protocol)) == -1)
++    if ((fd = hp_main_socket(domain, type, protocol)) == -1)
+         goto Error;
+     set_cloexec(fd);
+ 
+@@ -2869,7 +2918,7 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
+ 
+ Error:
+     if (fd != -1)
+-        close(fd);
++        hp_host_fd_close(fd);
+     return -1;
+ }
+ 
+@@ -2959,7 +3008,7 @@ static struct addrinfo *resolve_address(h2o_configurator_command_t *cmd, yoml_t
+         hints.ai_flags &= ~AI_ADDRCONFIG;
+         int fd;
+ #define IS_SUPPORTED(af)                                                                                                           \
+-    ((fd = socket((af), socktype, protocol)) != -1 ? (close(fd), 1) : !(errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT))
++    ((fd = hp_main_socket((af), socktype, protocol)) != -1 ? (hp_host_fd_close(fd), 1) : !(errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT))
+         int has_v4 = IS_SUPPORTED(AF_INET), has_v6 = IS_SUPPORTED(AF_INET6);
+ #undef IS_SUPPORTED
+         if (has_v4 != has_v6)
+@@ -3859,7 +3908,7 @@ static int configure_quic_forward_node(h2o_configurator_command_t *cmd, struct s
+         goto Exit;
+ 
+     /* open connected socket */
+-    if ((target->fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1 ||
++    if ((target->fd = hp_main_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1 ||
+         connect(target->fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+         h2o_configurator_errprintf(cmd, input->value, "failed to connect to %s:%s", input->value->data.scalar, strerror(errno));
+         goto Exit;
+@@ -3870,7 +3919,7 @@ Exit:
+     if (ai != NULL)
+         freeaddrinfo(ai);
+     if (!success && target->fd != -1)
+-        close(target->fd);
++        hp_host_fd_close(target->fd);
+     return success ? 0 : -1;
+ }
+ 
+@@ -4186,11 +4235,13 @@ static void on_sigterm_set_flag_notify_threads(int signo)
+ 
+ static int popen_crash_handler(void)
+ {
++    if (strcmp(conf.crash_handler, "@native") == 0)
++        return STDERR_FILENO;
+     char *cmd_fullpath = h2o_configurator_get_cmd_path(conf.crash_handler), *argv[] = {cmd_fullpath, NULL};
+     int pipefds[2];
+ 
+     /* create pipe */
+-    if (pipe(pipefds) != 0) {
++    if (hp_main_pipe(pipefds) != 0) {
+         perror("pipe failed");
+         return -1;
+     }
+@@ -4204,12 +4255,12 @@ static int popen_crash_handler(void)
+                         -1};
+     if (h2o_spawnp(cmd_fullpath, argv, mapped_fds, 0) == -1) {
+         /* silently ignore error */
+-        close(pipefds[0]);
+-        close(pipefds[1]);
++        hp_host_fd_close(pipefds[0]);
++        hp_host_fd_close(pipefds[1]);
+         return -1;
+     }
+     /* do the rest, and return the fd */
+-    close(pipefds[0]);
++    hp_host_fd_close(pipefds[0]);
+     return pipefds[1];
+ }
+ 
+@@ -4225,7 +4276,7 @@ static void on_sigfatal(int signo)
+     int framecnt = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
+     backtrace_symbols_fd(frames, framecnt, crash_handler_fd);
+ 
+-    if (conf.crash_handler_wait_pipe_close) {
++    if (conf.crash_handler_wait_pipe_close && crash_handler_fd != STDERR_FILENO) {
+         struct pollfd pfd[1];
+         pfd[0].fd = crash_handler_fd;
+         pfd[0].events = POLLERR | POLLHUP;
+@@ -4806,7 +4857,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+             listeners[i].http3.ctx.qpack = listener_config->quic.qpack;
+             int fds[2];
+             /* TODO switch to using named socket in temporary directory to forward packets between server generations */
+-            if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) != 0) {
++            if (hp_main_socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) != 0) {
+                 char buf[256];
+                 h2o_fatal("socketpair(AF_UNIX, SOCK_DGRAM) failed: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
+             }
+@@ -4829,7 +4880,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+ 
+     /* now that all worker threads are ready, in main thread, set signal handler for graceful shutdown / or exit immediately */
+     if (thread_index == 0) {
+-        h2o_set_signal_handler(SIGTERM, on_sigterm_set_flag_notify_threads);
++        hp_process_set_signal(SIGTERM, on_sigterm_set_flag_notify_threads);
+         if (conf.shutdown_requested)
+             exit(0);
+         fprintf(stderr, "h2o server (pid:%d) is ready to serve requests with %zu threads\n", (int)getpid(), conf.thread_map.size);
+@@ -4837,6 +4888,8 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+ 
+     /* let all worker threads start accepting connections */
+     h2o_barrier_wait(&conf.startup_sync_barrier_post);
++    if (thread_index == 0)
++        hp_native_master_notify_ready();
+ 
+     /* the main loop */
+     while (!conf.shutdown_requested) {
+@@ -4863,18 +4916,43 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
              listeners[i].http3.ctx.super.acceptor = NULL;
          }
      }
@@ -328,7 +879,18 @@ index 826599c..f5303dd 100644
      /* remove the pid file */
      if (conf.pid_file != NULL)
          unlink(conf.pid_file);
-@@ -5193,6 +5219,7 @@ static void setup_configurators(void)
+@@ -4963,9 +5041,7 @@ static int run_using_server_starter(const char *h2o_cmd, const char *config_file
+ {
+     char **args = build_server_starter_argv(h2o_cmd, config_file);
+     setenv("H2O_VIA_MASTER", "", 1);
+-    execvp(args[0], args);
+-    fprintf(stderr, "failed to spawn %s:%s\n", args[0], strerror(errno));
+-    return EX_CONFIG;
++    return hp_native_master_run(args, hp_config.startup_timeout_ms, hp_config.shutdown_timeout_ms);
+ }
+ 
+ /* make jemalloc linkage optional by marking the functions as 'weak',
+@@ -5193,6 +5269,7 @@ static void setup_configurators(void)
      h2o_errordoc_register_configurator(&conf.globalconf);
      h2o_fastcgi_register_configurator(&conf.globalconf);
      h2o_file_register_configurator(&conf.globalconf);
@@ -336,20 +898,140 @@ index 826599c..f5303dd 100644
      h2o_throttle_resp_register_configurator(&conf.globalconf);
      h2o_headers_register_configurator(&conf.globalconf);
      h2o_proxy_register_configurator(&conf.globalconf);
-@@ -5342,6 +5369,8 @@ int main(int argc, char **argv)
+@@ -5250,7 +5327,7 @@ static int dup_listener(struct listener_config_t *config)
+         }
+     }
+ #endif
+-    if (!reuseport && (fd = dup(config->fds.entries[0])) == -1) {
++    if (!reuseport && (fd = hp_main_dup(config->fds.entries[0])) == -1) {
+         char buf[256];
+         h2o_fatal("failed to dup listening socket: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
+     }
+@@ -5272,6 +5349,39 @@ static void create_per_thread_listeners(void)
+ 
+ int main(int argc, char **argv)
+ {
++#ifdef H2O_WITH_PHP
++    if (hp_assets_init() != 0) {
++        fprintf(stderr, "cannot initialize bundled runtime assets: %s\n", strerror(errno));
++        return EX_OSERR;
++    }
++    if (argc > 1 && strcmp(argv[1], "--internal-fetch-ocsp-response") == 0)
++        return hp_native_ocsp_main(argc - 1, argv + 1);
++    if (hp_php_cli_should_dispatch(argc, argv))
++        return hp_php_cli_main(argc, argv);
++    if (argc > 1 && strcmp(argv[1], "php-cli") == 0) {
++        /* PHP must see the executable as argv[0], and must initialize before
++         * any H2O configuration, listener, fork or execution thread exists. */
++        argv[1] = argv[0];
++        return hp_php_cli_main(argc - 1, argv + 1);
++    }
++    unsetenv("H2O_PHP_CLI_CHILD");
++    if (argc > 1 && strcmp(argv[1], "serve") == 0) {
++        argv[1] = argv[0];
++        --argc;
++        ++argv;
++    }
++    int php_command_status = hp_config_command_prepare(&argc, &argv);
++    if (php_command_status >= 0)
++        return php_command_status;
++#if defined(__linux__)
++    hp_executable_path = realpath("/proc/self/exe", NULL);
++#endif
++    if (hp_executable_path == NULL)
++        hp_executable_path = realpath(argv[0], NULL);
++    if (hp_executable_path == NULL)
++        hp_executable_path = h2o_strdup(NULL, argv[0], SIZE_MAX).base;
++    hp_native_master_worker_prepare();
++#endif
+     close_acme_loader_pipe();
+ 
+     cmd_argc = argc;
+@@ -5342,6 +5452,9 @@ int main(int argc, char **argv)
                  break;
              case 'v':
                  printf("h2o version " H2O_VERSION "\n");
 +                printf("h2o-php runtime revision: %s\nH2O revision: %s\nPHP: %s (ZTS: YES, ABI: %d)\n",
 +                       H2O_PHP_REVISION, H2O_PHP_H2O_REVISION, H2O_PHP_PHP_VERSION, H2O_PHP_PHP_ABI);
++                printf("Bundled CA: %s (SHA256 %s)\n", hp_assets_ca_date(), hp_assets_ca_sha256());
                  printf("OpenSSL: %s\n", OpenSSL_version(OPENSSL_VERSION));
  #if H2O_USE_MRUBY
                  printf(
-@@ -5719,6 +5748,12 @@ int main(int argc, char **argv)
+@@ -5386,7 +5499,10 @@ int main(int argc, char **argv)
+                 printf("h2o version " H2O_VERSION "\n"
+                        "\n"
+                        "Usage:\n"
+-                       "  h2o [OPTION]...\n"
++                       "  h2o-php [serve] [OPTION]...\n"
++                       "  h2o-php php-cli [PHP OPTION]... [FILE] [ARG]...\n"
++                       "  h2o-php php-server [--root DIR] [--listen HOST:PORT]...\n"
++                       "  h2o-php effective-config -c FILE\n"
+                        "\n"
+                        "Options:\n"
+                        "  -c, --conf FILE    configuration file (default: %s)\n"
+@@ -5397,8 +5513,8 @@ int main(int argc, char **argv)
+                        "                               must be configured when using this mode, as all\n"
+                        "                               the errors are logged to the file instead of\n"
+                        "                               being emitted to STDERR\n"
+-                       "                     - master: invoked process becomes a master process (using\n"
+-                       "                               the `share/h2o/start_server` command) and spawns\n"
++                       "                     - master: invoked process becomes the native supervisor\n"
++                       "                               and spawns the existing H2O worker executable\n"
+                        "                               a worker process for handling incoming\n"
+                        "                               connections. Users may send SIGHUP to the master\n"
+                        "                               process to reconfigure or upgrade the server.\n"
+@@ -5456,6 +5572,10 @@ int main(int argc, char **argv)
+             exit(EX_CONFIG);
+         if (h2o_configurator_apply(&conf.globalconf, conf.yoml, conf.run_mode != RUN_MODE_WORKER) != 0)
+             exit(EX_CONFIG);
++        if (hp_runtime_config_prepare() != 0)
++            exit(EX_CONFIG);
++        if (hp_config_command_wants_dump())
++            return hp_config_command_dump(&conf.globalconf, stdout);
+         dispose_resolve_tag_arg(&resolve_tag_arg);
+         yoml_free(conf.yoml, NULL);
+         conf.yoml = NULL;
+@@ -5468,7 +5588,7 @@ int main(int argc, char **argv)
+                     h2o_socket_buffer_mmap_settings.fn_template, strerror(errno));
+             return EX_CONFIG;
+         }
+-        close(fd);
++        hp_host_fd_close(fd);
+     }
+ 
+     /* ACME: spawn the helper program that issues and rewnews the certificates */
+@@ -5700,13 +5820,13 @@ int main(int argc, char **argv)
+     /* replace STDIN to an closed pipe */
+     {
+         int fds[2];
+-        if (pipe(fds) != 0) {
++        if (hp_main_pipe(fds) != 0) {
+             perror("pipe failed");
+             return EX_OSERR;
+         }
+-        close(fds[1]);
++        hp_host_fd_close(fds[1]);
+         dup2(fds[0], 0);
+-        close(fds[0]);
++        hp_host_fd_close(fds[0]);
+     }
+ 
+     /* redirect STDOUT and STDERR to error_log (if specified) */
+@@ -5715,10 +5835,21 @@ int main(int argc, char **argv)
+             perror("dup(2) failed");
+             return EX_OSERR;
+         }
+-        close(error_log_fd);
++        hp_host_fd_close(error_log_fd);
          error_log_fd = -1;
      }
  
 +    /* The PHP engine is initialized only after process setup and privilege dropping. */
++    hp_host_fds_begin();
++    for (size_t i = 0; i != conf.num_listeners; ++i)
++        for (size_t j = 0; j != conf.listeners[i]->fds.size; ++j)
++            hp_host_fd_register_locked(conf.listeners[i]->fds.entries[j]);
++    hp_host_fds_end();
 +    if (hp_runtime_start() != 0) {
 +        fprintf(stderr, "failed to initialize embedded PHP runtime\n");
 +        return EX_SOFTWARE;

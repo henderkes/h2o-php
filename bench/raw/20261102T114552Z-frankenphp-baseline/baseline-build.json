@@ -1,9 +1,0 @@
-{
-  "binary": "/usr/bin/frankenphp",
-  "binary_sha256": "e3c5f11c4a2c89dee84ddb8f2baf9bdb513f6474dd7f4ae8473f5575018fecc1",
-  "config_sha256": "46d2a45223ab847051babe0cffc48306c9a1a77762d3466a59e21aa05a470ea2",
-  "config": "{\n\tadmin off\n\tauto_https off\n\tfrankenphp {\n\t\tnum_threads 4\n\t\tmax_threads 8\n\t\tphp_ini opcache.enable 1\n\t\tphp_ini opcache.enable_cli 1\n\t\tphp_ini opcache.jit off\n\t}\n}\n\nhttp://127.0.0.1:18081 {\n\troot * {$BENCH_ROOT}\n\tphp_server {\n\t\tworker {\n\t\t\tfile {$BENCH_ROOT}/worker.php\n\t\t\tnum 4\n\t\t\tmatch /worker /worker/*\n\t\t}\n\t}\n}\n",
-  "version": "FrankenPHP v1.13.4 PHP 8.5 Caddy v2.11.7 h1:yj0Y4fYZGPkSvibBJ1sTWE33xC0fxztVyXEW5iIdUT4=\n",
-  "ldd": "\tlinux-vdso.so.1 (0x00007cb05dfe3000)\n\tlibphp-zts-85.so => /lib64/libphp-zts-85.so (0x00007cb055c00000)\n\tlibm.so.6 => /lib64/libm.so.6 (0x00007cb058554000)\n\tlibc.so.6 => /lib64/libc.so.6 (0x00007cb055a26000)\n\t/lib64/ld-linux-x86-64.so.2 (0x00007cb05dfe5000)\n\tlibgcc_s.so.1 => /lib64/libgcc_s.so.1 (0x00007cb05dfa6000)\n\tlibresolv.so.2 => /lib64/libresolv.so.2 (0x00007cb05df92000)\n",
-  "php_extensions": "{\"php\":\"8.5.12\",\"zts\":true,\"extensions\":[\"Core\",\"date\",\"lexbor\",\"uri\",\"pcre\",\"zlib\",\"calendar\",\"ctype\",\"curl\",\"json\",\"SPL\",\"mbstring\",\"session\",\"fileinfo\",\"filter\",\"hash\",\"iconv\",\"standard\",\"Zend OPcache\",\"pcntl\",\"libxml\",\"exif\",\"openssl\",\"posix\",\"random\",\"readline\",\"Reflection\",\"dom\",\"SimpleXML\",\"sockets\",\"sodium\",\"tokenizer\",\"Phar\",\"xml\",\"xmlreader\",\"xmlwriter\",\"frankenphp-cli\",\"gd\",\"imagick\",\"intl\",\"mysqlnd\",\"PDO\",\"shmop\",\"sqlite3\",\"sysvsem\",\"mysqli\",\"pdo_mysql\",\"pdo_sqlite\"],\"zend_extensions\":[\"Zend OPcache\"]}"
-}

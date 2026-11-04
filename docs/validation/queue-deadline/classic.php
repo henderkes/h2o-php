@@ -1,4 +1,0 @@
-<?php
-if (($_GET['id'] ?? '') === 'busy') usleep(600000);
-header('Content-Type: application/json');
-echo json_encode(['id' => $_GET['id'] ?? '']);

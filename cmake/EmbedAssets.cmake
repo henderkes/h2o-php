@@ -1,0 +1,12 @@
+# The input is a reviewed repository asset. Builds perform no downloads.
+function(hp_embed_assets input output)
+  set(expected "796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe")
+  file(SHA256 "${input}" actual)
+  if(NOT actual STREQUAL expected)
+    message(FATAL_ERROR "Pinned Mozilla CA asset SHA256 mismatch: ${actual}; expected ${expected}. Update the reviewed asset, pin and provenance together.")
+  endif()
+  file(READ "${input}" payload HEX)
+  string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${payload}")
+  file(WRITE "${output}" "/* Generated from the pinned curl Mozilla CA extraction.\n * Certificate source: Mozilla NSS; SPDX-License-Identifier: MPL-2.0\n * https://curl.se/ca/cacert-2026-10-20.pem\n * SHA256 ${actual}\n */\n#ifndef HP_EMBEDDED_ASSETS_DATA_H\n#define HP_EMBEDDED_ASSETS_DATA_H\nstatic const unsigned char hp_embedded_ca_data[] = {${bytes}0};\n#define HP_EMBEDDED_CA_SIZE (sizeof(hp_embedded_ca_data) - 1)\n#define HP_EMBEDDED_CA_SHA256 \"${actual}\"\n#define HP_EMBEDDED_CA_SOURCE \"https://curl.se/ca/cacert-2026-10-20.pem\"\n#define HP_EMBEDDED_CA_DATE \"2026-10-20\"\n#endif\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+endfunction()

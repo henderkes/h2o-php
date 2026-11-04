@@ -1,5 +1,5 @@
 listen: 18080
-num-threads: 2
+num-threads: 4
 send-informational: all
 php.runtime:
   threads: 4
@@ -16,7 +16,7 @@ php.ini:
   opcache.enable: 1
   opcache.enable_cli: 1
   opcache.jit: off
-  output_buffering: 0
+  output_buffering: 4096
   display_errors: 0
 hosts:
   "localhost:18080":
@@ -34,4 +34,3 @@ hosts:
         file.dir: /home/m/h2o-php/examples/bench
         file.custom-handler:
           extension: .php
-          php.classic: ON

@@ -15,9 +15,7 @@ hosts:
         php.worker:
           file: /home/m/h2o-php/examples/smoke/worker.php
           num: 1
-      "/mounted":
-        php.front-controller: index.php
-        php.classic: ON
+      "/mounted": {}
       "/upstream":
         file.file: /home/m/h2o-php/examples/smoke/static.txt
       "/proxy":
@@ -27,4 +25,3 @@ hosts:
         file.index: [index.php, index.html]
         file.custom-handler:
           extension: .php
-          php.classic: ON

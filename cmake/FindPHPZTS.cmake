@@ -1,8 +1,11 @@
-# Discover the installed embed-capable ZTS PHP ABI; never build a replacement PHP.
+# Discover a caller-supplied embed-capable ZTS PHP ABI. Discovery never builds PHP.
 include(FindPackageHandleStandardArgs)
 include(CheckCSourceCompiles)
 include(CheckCSourceRuns)
 include(CMakePushCheckState)
+include("${CMAKE_CURRENT_LIST_DIR}/CheckPHPZTS.cmake")
+
+option(PHPZTS_LINK_STATIC "Link a matching static libphp.a instead of the system shared embed library" OFF)
 
 find_program(PHPZTS_CONFIG NAMES php-config-zts DOC "php-config for the installed ZTS PHP")
 if(PHPZTS_CONFIG)
@@ -34,13 +37,40 @@ if(PHPZTS_CONFIG)
   endforeach()
   get_filename_component(_php_embed_name "${PHPZTS_LIB_EMBED}" NAME_WE)
   string(REGEX REPLACE "^lib" "" _php_embed_name "${_php_embed_name}")
-  find_library(PHPZTS_LIBRARY NAMES php-zts "${_php_embed_name}"
+  if(PHPZTS_LINK_STATIC)
+    set(_php_saved_library_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+    set(_php_embed_names php php-zts "${_php_embed_name}")
+  else()
+    set(_php_embed_names php-zts "${_php_embed_name}")
+  endif()
+  find_library(PHPZTS_LIBRARY NAMES ${_php_embed_names}
     HINTS "${PHPZTS_LIB_DIR}" "${PHPZTS_PREFIX}/lib64" "${PHPZTS_PREFIX}/lib"
-    DOC "Actual embed-capable libphp-zts shared library")
+    DOC "Actual embed-capable PHP ZTS library")
+  if(PHPZTS_LINK_STATIC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_php_saved_library_suffixes}")
+    if(PHPZTS_LIBRARY AND NOT PHPZTS_LIBRARY MATCHES "[.]a$")
+      message(FATAL_ERROR "PHPZTS_LINK_STATIC requires a matching libphp.a, not ${PHPZTS_LIBRARY}")
+    endif()
+  endif()
   separate_arguments(PHPZTS_DEPENDENCY_FLAGS UNIX_COMMAND "${PHPZTS_LDFLAGS} ${PHPZTS_LIBS}")
 endif()
 
 if(PHPZTS_INCLUDE_DIRS AND PHPZTS_LIBRARY)
+  set(PHPZTS_ABI_FILES "${PHPZTS_CONFIG}" "${PHPZTS_LIBRARY}")
+  foreach(_php_include IN LISTS PHPZTS_INCLUDE_DIRS)
+    foreach(_header main/php_version.h Zend/zend_modules.h Zend/zend_API.h main/SAPI.h)
+      if(EXISTS "${_php_include}/${_header}")
+        list(APPEND PHPZTS_ABI_FILES "${_php_include}/${_header}")
+      endif()
+    endforeach()
+  endforeach()
+  phpzts_fingerprint(PHPZTS_FINGERPRINT)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PHPZTS_ABI_FILES})
+  if(NOT PHPZTS_FINGERPRINT STREQUAL PHPZTS_CHECKED_FINGERPRINT)
+    unset(PHPZTS_ABI_LINKS CACHE)
+    unset(PHPZTS_RUNTIME_VERSION_MATCHES CACHE)
+  endif()
   cmake_push_check_state(RESET)
   set(CMAKE_REQUIRED_INCLUDES ${PHPZTS_INCLUDE_DIRS})
   set(CMAKE_REQUIRED_LIBRARIES "${PHPZTS_LIBRARY}" ${PHPZTS_DEPENDENCY_FLAGS})
@@ -51,12 +81,13 @@ if(PHPZTS_INCLUDE_DIRS AND PHPZTS_LIBRARY)
 #ifndef ZTS
 #error This PHP was built without ZTS
 #endif
-#if PHP_VERSION_ID < 80500 || PHP_VERSION_ID >= 80600
-#error The worker lifecycle port requires matching PHP 8.5 headers and runtime
+#if PHP_VERSION_ID < 80500 || PHP_VERSION_ID >= 80700
+#error The worker lifecycle port requires matching PHP 8.5 or 8.6 headers and runtime
 #endif
 int main(void) {
   void *volatile p[] = {(void *)php_module_startup, (void *)php_request_startup,
-                       (void *)sapi_startup, (void *)tsrm_startup};
+                       (void *)sapi_startup, (void *)tsrm_startup,
+                       (void *)zend_call_known_function};
   return p[0] == 0;
 }" PHPZTS_ABI_LINKS)
   if(PHPZTS_ABI_LINKS AND PHPZTS_VERSION VERSION_GREATER_EQUAL "8.5" AND NOT CMAKE_CROSSCOMPILING)
@@ -74,10 +105,14 @@ endif()
 find_package_handle_standard_args(PHPZTS REQUIRED_VARS
   PHPZTS_CONFIG PHPZTS_LIBRARY PHPZTS_INCLUDE_DIRS PHPZTS_ABI_LINKS
   VERSION_VAR PHPZTS_VERSION
-  FAIL_MESSAGE "An installed embed-capable ZTS PHP 8.5 runtime is required. Set PHPZTS_CONFIG and PHPZTS_LIBRARY to matching headers/library. Inspect CMakeConfigureLog.yaml for ABI errors.")
+  FAIL_MESSAGE "An installed embed-capable ZTS PHP 8.5 or 8.6 runtime is required. Set PHPZTS_CONFIG and PHPZTS_LIBRARY to matching headers/library. Inspect CMakeConfigureLog.yaml for ABI errors.")
 
 if(PHPZTS_FOUND AND NOT TARGET PHPZTS::PHPZTS)
-  add_library(PHPZTS::PHPZTS SHARED IMPORTED)
+  set(PHPZTS_CHECKED_FINGERPRINT "${PHPZTS_FINGERPRINT}" CACHE INTERNAL "Validated PHP ZTS dependencies" FORCE)
+  # A changed stamp recompiles the SAPI even when package header mtimes are old.
+  set(PHPZTS_ABI_STAMP "${CMAKE_CURRENT_BINARY_DIR}/phpzts-abi.txt")
+  file(CONFIGURE OUTPUT "${PHPZTS_ABI_STAMP}" CONTENT "${PHPZTS_FINGERPRINT}\n")
+  add_library(PHPZTS::PHPZTS UNKNOWN IMPORTED)
   set_target_properties(PHPZTS::PHPZTS PROPERTIES
     IMPORTED_LOCATION "${PHPZTS_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "${PHPZTS_INCLUDE_DIRS}"

@@ -1,0 +1,22 @@
+listen:
+  host: 127.0.0.1
+  port: 18109
+num-threads: 2
+php.runtime:
+  threads: 1
+  max-threads: 2
+php.log: stderr
+hosts:
+  "localhost:18109":
+    paths:
+      "/":
+        file.dir: /home/m/h2o-php/examples/smoke
+        php.worker:
+          file: /home/m/h2o-php/examples/smoke/worker.php
+          num: 1
+          startup-timeout: 5s
+          match:
+            path: '^/api(/|$)'
+            methods: [GET, POST]
+            headers:
+              X-Application: '^example$'

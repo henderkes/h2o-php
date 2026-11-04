@@ -4,8 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/h2o-php -m worker -c /etc/h2o-php/h2o.conf
+Environment=H2O_ROOT=/usr/local
+ExecStart=/usr/local/bin/h2o-php -m master -c /etc/h2o-php/h2o.conf
+ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
+KillMode=mixed
 TimeoutStopSec=35
 Restart=on-failure
 RestartSec=2

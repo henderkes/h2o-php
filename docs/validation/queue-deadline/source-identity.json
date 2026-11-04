@@ -1,5 +1,0 @@
-{
-  "parent_revision": "6427fc77ad00101d0fbad4e7af4027131d87d69d",
-  "runtime_source_sha256": "066ade8b614c391b7a507e1d64b8d2f0d97bee635f91e6f9bf5795fe86ce7cd8",
-  "scope": "Two-request worker reproduction, two-request classic debug check, one-request CPU-bound shutdown. No load generator or benchmark."
-}
