@@ -103,7 +103,7 @@ static void wake_slots(void) {
 void hp_runtime_config_defaults(void) {
     if (defaults_initialized) return;
     defaults_initialized = true;
-    hp_config = (hp_runtime_config_t){ .queue_limit = 0,
+    hp_config = (hp_runtime_config_t){ .queue_limit = 0, .collect_metrics = true,
         .max_buffered_body = 1048576, .max_buffered_response = 262144, .max_buffered_global = 268435456,
         .shutdown_timeout_ms = 30000, .max_idle_ms = 5000, .startup_timeout_ms = 30000 };
 }
@@ -874,7 +874,7 @@ static void *control_main(void *unused) {
         if (asprintf(&entries, "%sopcache.validate_timestamps=1\nopcache.revalidate_freq=0\n", hp_config.ini_entries ? hp_config.ini_entries : "") < 0) goto Failed;
         free(hp_config.ini_entries); hp_config.ini_entries = entries;
     }
-    if (hp_php_metrics_start(minimum_threads)) goto Failed;
+    if (hp_php_metrics_start(minimum_threads, hp_config.collect_metrics)) goto Failed;
     if (hp_process_start()) goto Failed;
     process_initialized = true;
     if (hp_sapi_init(hp_config.ini_entries, hp_config.max_threads + 1)) goto Failed;
@@ -944,12 +944,13 @@ static void *control_main(void *unused) {
             wait_for_monitor(deadline);
         }
     }
-    pthread_mutex_unlock(&lock); reap_threads(); hp_sapi_shutdown(); engine_initialized = false;
+    pthread_mutex_unlock(&lock); reap_threads(); hp_sapi_shutdown(); hp_bridge_cleanup(); engine_initialized = false;
     hp_process_stop(); process_initialized = false;
     hp_php_metrics_shutdown();
     if (startup_failed) goto Failed;
     atomic_store_explicit(&controller_stopped, true, memory_order_release); return NULL;
 Failed:
+    hp_bridge_cleanup();
     hp_php_metrics_shutdown();
     if (engine_initialized) hp_sapi_shutdown();
     if (process_initialized) hp_process_stop();

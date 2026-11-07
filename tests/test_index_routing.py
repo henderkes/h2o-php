@@ -52,6 +52,39 @@ class IndexRoutingTest(unittest.TestCase):
         )
         (cls.root / "escape").symlink_to(cls.base / "outside", target_is_directory=True)
         (cls.root / "escape.php").symlink_to(cls.base / "outside" / "index.php")
+        # Keep source canaries separate from the normal front-controller fixture.
+        cls.guard_root = cls.base / "guard-public"
+        cls.guard_next = cls.base / "guard-next"
+        guard_outside = cls.base / "guard-outside"
+        for directory in (cls.guard_root, cls.guard_next, guard_outside):
+            directory.mkdir()
+        for path, body in (
+            (cls.guard_root / "inside.php", "inside executed"),
+            (cls.guard_root / "script.php", "A"),
+            (cls.guard_next / "script.php", "B"),
+            (cls.guard_next / "secret.php", "B secret executed"),
+            (guard_outside / "secret.php", "outside secret executed"),
+            (cls.guard_root / "inside.PHTML", "custom executed"),
+            (guard_outside / "secret.PHTML", "custom secret executed"),
+        ):
+            path.write_text(
+                '<?php /* STATIC_ALIAS_PHP_SOURCE_CANARY */ echo "' + body + '\n";\n'
+            )
+        (guard_outside / "asset.txt").write_text("outside ordinary\n")
+        (cls.guard_root / "inside-alias.txt").symlink_to(cls.guard_root / "inside.php")
+        (cls.guard_root / "outside-alias.txt").symlink_to(guard_outside / "secret.php")
+        (cls.guard_root / "outside-asset.txt").symlink_to(guard_outside / "asset.txt")
+        # Existing non-PHP A file ensures PHP falls through before H2O resolves L.
+        (cls.guard_root / "flip-alias.txt").write_text("A alias before retarget\n")
+        (cls.guard_next / "flip-alias.txt").symlink_to(cls.guard_next / "secret.php")
+        (cls.guard_root / "ordinary.txt").write_text("A static\n")
+        (cls.guard_next / "ordinary.txt").write_text("B static\n")
+        (cls.guard_root / "denied-dir").mkdir()
+        (cls.guard_root / "denied-dir" / "index.html").symlink_to(guard_outside / "secret.php")
+        (cls.guard_root / "custom-alias.txt").symlink_to(guard_outside / "secret.PHTML")
+        (cls.guard_root / "inside-custom.txt").symlink_to(cls.guard_root / "inside.PHTML")
+        cls.guard_link = cls.base / "guard-current"
+        cls.guard_link.symlink_to(cls.guard_root, target_is_directory=True)
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             cls.port = listener.getsockname()[1]
@@ -125,6 +158,29 @@ hosts:
           file: {cls.worker}
           num: 1
       /: {{}}
+  guard.test:
+    php.root: {cls.guard_root}
+    paths:
+      /:
+        php_server: ON
+  guard-flip.test:
+    php.root: {cls.guard_link}
+    php.resolve-root-symlink: ON
+    paths:
+      /:
+        php_server: ON
+  guard-index.test:
+    php.root: {cls.guard_root}
+    php.index: OFF
+    paths:
+      /:
+        php_server: ON
+  guard-custom.test:
+    php.root: {cls.guard_root}
+    php.split-path: [.phtml]
+    paths:
+      /:
+        php_server: ON
 """
         )
         cls.log = (cls.base / "server.log").open("w+")
@@ -256,6 +312,31 @@ hosts:
         self.assert_script("/", "root", "/index.php", "extension.test")
         self.assert_script("/direct.php/more", "direct", "/direct.php", "extension.test", "/more")
         self.assertEqual(self.request("/login", "extension.test")[0], 404)
+
+    def test_php_server_does_not_serve_canonical_php_through_static_aliases(self):
+        def check(path, status, expected=None, host="guard.test"):
+            with self.subTest(host=host, path=path):
+                actual, _, body = self.request(path, host)
+                self.assertEqual(actual, status, body)
+                if expected is None:
+                    self.assertNotIn(b"STATIC_ALIAS_PHP_SOURCE_CANARY", body)
+                else:
+                    self.assertEqual(body, expected)
+
+        check("/inside-alias.txt", 200, b"inside executed\n")
+        check("/outside-alias.txt", 404)
+        # Explicit static links are supported; PHP source protection is narrower.
+        check("/outside-asset.txt", 200, b"outside ordinary\n")
+        check("/script.php", 200, b"A\n", "guard-flip.test")
+        self.guard_link.unlink()
+        self.guard_link.symlink_to(self.guard_next, target_is_directory=True)
+        check("/script.php", 200, b"A\n", "guard-flip.test")
+        # Never requested before retarget: exercise H2O's current logical root.
+        check("/flip-alias.txt", 404, host="guard-flip.test")
+        check("/ordinary.txt", 200, b"B static\n", "guard-flip.test")
+        check("/denied-dir/", 404, host="guard-index.test")
+        check("/custom-alias.txt", 404, host="guard-custom.test")
+        check("/inside-custom.txt", 200, b"custom executed\n", "guard-custom.test")
 
     def test_invalid_index_configuration_is_rejected(self):
         for value in ("../outside/index.php", "/absolute.php", "nested/../outside.php", '""'):

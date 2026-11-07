@@ -51,6 +51,8 @@ static _Thread_local hp_request_t dummy_request;
 static _Thread_local bool worker_bootstrapped;
 static _Thread_local bool partial_active;
 static _Thread_local bool http_finished;
+static _Thread_local bool sapi_final_headers_sent;
+static _Thread_local bool sapi_headers_finishing;
 static _Thread_local unsigned worker_requests;
 typedef struct hp_php_owner {
     atomic_uint refs;
@@ -232,6 +234,8 @@ static void bind_lease(hp_php_lease_t *lease)
     if (lease == local_lease) return;
     lease_retain(lease);
     hp_php_lease_t *old = local_lease; local_lease = lease;
+    if (current_request && current_request != &dummy_request)
+        (void)hp_sapi_response_publish(current_request);
     current_request = lease->request;
     if (!current_request) {
         memset(&dummy_request, 0, sizeof(dummy_request));
@@ -246,6 +250,8 @@ static void bind_lease(hp_php_lease_t *lease)
     }
     publish_request(lease->request);
     http_finished = false;
+    sapi_final_headers_sent = false;
+    sapi_headers_finishing = false;
     /* The extension creates one full PHP request per Runtime. Leave its fresh
      * SG metadata and superglobals intact across tasks; only output/callback
      * ownership follows the per-task lease. No parent's Zend data is borrowed. */
@@ -271,7 +277,11 @@ static void parallel_task_enter(void *opaque)
 static void parallel_task_leave(void *opaque)
 {
     (void)opaque;
-    if (!hp_process_is_fork_child() && local_auxiliary) php_output_flush_all();
+    if (!hp_process_is_fork_child() && local_auxiliary) {
+        php_output_flush_all();
+        if (current_request && current_request != &dummy_request)
+            (void)hp_sapi_response_publish(current_request);
+    }
     /* Keep the lease through idle time and shutdown hooks. A next task first
      * flushes old buffers before changing generation, never into a new reply. */
 }
@@ -334,6 +344,8 @@ static void parallel_thread_done(void *opaque)
     pthread_cond_broadcast(&slots_cond); pthread_mutex_unlock(&slots_mutex);
     if (!local_auxiliary) return;
     /* parallel has already freed its own TSRM context. Only C ownership remains. */
+    if (local_lease && local_lease->request)
+        (void)hp_sapi_response_publish(local_lease->request);
     lease_release(local_lease); local_lease = NULL; current_request = NULL;
     owner_release(local_owner); local_owner = NULL; local_auxiliary = false;
 }
@@ -351,6 +363,8 @@ static void parallel_thread_stopping(void *opaque)
     hp_pcntl_context_leave();
     if (local_slot.registered) unregister_slot();
     hp_env_after_shutdown();
+    if (current_request && current_request != &dummy_request)
+        (void)hp_sapi_response_publish(current_request);
     current_request = NULL; SG(server_context) = NULL;
 }
 static void parallel_thread_joined(void *opaque)
@@ -425,7 +439,7 @@ static void log_message(const char *message, int severity)
     hp_log_message("php.engine", message, severity, is_real_request() ? current_request->id : 0);
 }
 
-static int send_headers(sapi_headers_struct *headers)
+static int publish_headers(sapi_headers_struct *headers)
 {
     if (hp_process_is_fork_child() || !is_real_request() || SG(request_info).no_headers || http_finished)
         return SAPI_HEADER_SENT_SUCCESSFULLY;
@@ -464,16 +478,43 @@ static int send_headers(sapi_headers_struct *headers)
     }
     /* 101 is never informational: on HTTP/1.1 it is committed as the final,
      * bodyless header set; the bridge rejects it on every other protocol. */
-    int result = hp_response_headers(current_request, status, list, status >= 100 && status < 200 && status != 101);
-    hp_headers_free(list);
+    bool info = status >= 100 && status < 200 && status != 101;
+    int result;
+    if (info) {
+        result = hp_response_headers(current_request, status, list, true);
+        hp_headers_free(list);
+    } else {
+        /* Native success accepts an owned immutable system-buffer snapshot.
+         * Explicit progress boundaries and conservative bodyless/reproxy cases
+         * publish immediately; only an actual later ub_write may compound. */
+        bool defer = !sapi_headers_finishing && status != 101 && status != 204 && status != 304 &&
+            !SG(request_info).headers_only &&
+            !(current_request->method && !strcmp(current_request->method, "HEAD")) &&
+            !hp_header_get(list, "x-reproxy-url");
+        result = hp_sapi_response_headers(current_request, status, list, defer);
+    }
+    if (!result && !info) sapi_final_headers_sent = true;
     return result ? SAPI_HEADER_SEND_FAILED : SAPI_HEADER_SENT_SUCCESSFULLY;
+}
+
+static int send_headers(sapi_headers_struct *headers)
+{
+    /* PHP may reenter its native callback after releasing the header callable:
+     * a callable destructor can flush the same final headers before this call. */
+    if (sapi_final_headers_sent) return SAPI_HEADER_SENT_SUCCESSFULLY;
+    return publish_headers(headers);
 }
 
 static size_t write_output(const char *data, size_t length)
 {
     if (hp_process_is_fork_child() || !is_real_request() || http_finished) return length;
-    if (local_owner) pthread_mutex_lock(&local_owner->output_mutex);
-    ssize_t written = hp_response_write(current_request, data, length);
+    if (local_owner && pthread_mutex_trylock(&local_owner->output_mutex)) {
+        /* A competing producer may be blocked on capacity. Its progress must
+         * not depend on this thread first acquiring producer serialization. */
+        (void)hp_sapi_response_publish(current_request);
+        pthread_mutex_lock(&local_owner->output_mutex);
+    }
+    ssize_t written = hp_sapi_response_write(current_request, data, length);
     if (local_owner) pthread_mutex_unlock(&local_owner->output_mutex);
     if (written < 0) {
         php_handle_aborted_connection();
@@ -487,6 +528,9 @@ static void flush_output(void *server_context)
     (void)server_context;
     if (hp_process_is_fork_child() || !is_real_request()) return;
     if (!http_finished) sapi_send_headers();
+    /* Core short-circuits when SG(headers_sent) is already true. The native
+     * system buffer still has to publish on every explicit flush boundary. */
+    (void)hp_sapi_response_publish(current_request);
     hp_response_flush_notify(current_request);
 }
 
@@ -502,6 +546,68 @@ static size_t read_post(char *buffer, size_t count)
         total += (size_t)got;
     }
     return total;
+}
+
+/* Keep PHP's public default reader and its 16KiB logical reads. When a full
+ * contiguous native block already exists, pass that immutable block directly
+ * to the same PHP temp stream instead of copying through a stack buffer.
+ * Registered POST readers and replaced SAPI read hooks retain PHP's path. */
+static void read_default_post(void)
+{
+    if (hp_process_is_fork_child() || !is_real_request() || http_finished ||
+        sapi_module.read_post != read_post ||
+        strcmp(SG(request_info).request_method, "POST") || SG(request_info).post_entry) {
+        php_default_post_reader();
+        return;
+    }
+    zend_long post_max_size = REQUEST_PARSE_BODY_OPTION_GET(post_max_size, SG(post_max_size));
+    if (post_max_size > 0 && SG(request_info).content_length > post_max_size) {
+        php_error_docref(NULL, E_WARNING, "POST Content-Length of " ZEND_LONG_FMT " bytes exceeds the limit of " ZEND_LONG_FMT " bytes",
+                        SG(request_info).content_length, post_max_size);
+        return;
+    }
+    SG(request_info).request_body = php_stream_temp_create_ex(TEMP_STREAM_DEFAULT, SAPI_POST_BLOCK_SIZE, PG(upload_tmp_dir));
+    for (;;) {
+        char buffer[SAPI_POST_BLOCK_SIZE];
+        hp_sapi_body_view_t view = {0};
+        size_t read_bytes;
+        ssize_t written = 0;
+        if (hp_sapi_request_body_borrow(current_request, SAPI_POST_BLOCK_SIZE, &view)) {
+            read_bytes = view.len;
+            SG(read_post_bytes) += read_bytes;
+            if (read_bytes < SAPI_POST_BLOCK_SIZE) SG(post_read) = true;
+            /* PHP stream writes can bail out (including temporary-file error
+             * handlers). The entire logical read has happened in either case. */
+            zend_try {
+                written = php_stream_write(SG(request_info).request_body, view.data, read_bytes);
+            } zend_catch {
+                hp_sapi_request_body_release(&view);
+                zend_bailout();
+            } zend_end_try();
+            hp_sapi_request_body_release(&view);
+        } else {
+            read_bytes = sapi_read_post_block(buffer, SAPI_POST_BLOCK_SIZE);
+            if (read_bytes > 0)
+                written = php_stream_write(SG(request_info).request_body, buffer, read_bytes);
+        }
+        if (read_bytes > 0 && written != (ssize_t)read_bytes) {
+            php_stream_truncate_set_size(SG(request_info).request_body, 0);
+            php_error_docref(NULL, E_WARNING, "POST data can't be buffered; all data discarded");
+            break;
+        }
+        if (post_max_size > 0 && SG(read_post_bytes) > post_max_size) {
+            php_error_docref(NULL, E_WARNING, "Actual POST length does not match Content-Length, and exceeds " ZEND_LONG_FMT " bytes", post_max_size);
+            break;
+        }
+        if (read_bytes < SAPI_POST_BLOCK_SIZE) break;
+    }
+    php_stream_rewind(SG(request_info).request_body);
+    if (SG(request_info).request_body != NULL) {
+        /* The temp stream forwards this public option to its inner stream.
+         * Replay remains valid if the optional buffering hint is rejected. */
+        (void)php_stream_set_option(SG(request_info).request_body, PHP_STREAM_OPTION_READ_BUFFER,
+                                    PHP_STREAM_BUFFER_NONE, NULL);
+    }
 }
 
 static char *read_cookies(void) { return current_request ? current_request->cookie : NULL; }
@@ -661,9 +767,13 @@ static zend_result request_time(double *time)
 
 static void install_context(hp_request_t *request)
 {
+    if (current_request && current_request != &dummy_request && current_request != request)
+        (void)hp_sapi_response_publish(current_request);
     current_request = request;
     publish_request(request);
     http_finished = false;
+    sapi_final_headers_sent = false;
+    sapi_headers_finishing = false;
     SG(server_context) = local_owner;
     SG(sapi_headers).http_response_code = 200;
     SG(request_info).request_method = request->method ? request->method : "GET";
@@ -686,6 +796,8 @@ static void install_context(hp_request_t *request)
 
 static void clear_context(void)
 {
+    if (!hp_process_is_fork_child() && is_real_request())
+        (void)hp_sapi_response_publish(current_request);
     publish_request(NULL);
     SG(request_info).request_method = NULL;
     SG(request_info).query_string = NULL;
@@ -976,11 +1088,16 @@ PHP_FUNCTION(headers_send)
     int previous = SG(sapi_headers).http_response_code;
     SG(sapi_headers).http_response_code = (int)status;
     if (status >= 100 && status < 200) {
-        int result = send_headers(&SG(sapi_headers));
+        int result = publish_headers(&SG(sapi_headers));
         SG(sapi_headers).http_response_code = previous;
         RETURN_LONG(result);
     }
-    RETURN_LONG(sapi_send_headers());
+    int result = sapi_send_headers();
+    /* headers_send(final) is an explicit publication boundary even if core
+     * previously accepted the snapshot and now skips its native callback. */
+    if (!hp_process_is_fork_child() && is_real_request() &&
+        hp_sapi_response_publish(current_request)) result = FAILURE;
+    RETURN_LONG(result);
 }
 
 PHP_FUNCTION(frankenphp_request_headers)
@@ -1124,6 +1241,16 @@ static PHP_MINIT_FUNCTION(frankenphp)
     return SUCCESS;
 }
 
+static PHP_RSHUTDOWN_FUNCTION(frankenphp)
+{
+    /* PHP drains normal output before module RSHUTDOWN. Publish its accepted
+     * snapshot now; later header-only sends must also precede SAPI teardown. */
+    sapi_headers_finishing = true;
+    if (!hp_process_is_fork_child() && is_real_request())
+        (void)hp_sapi_response_publish(current_request);
+    return SUCCESS;
+}
+
 static PHP_MINFO_FUNCTION(frankenphp)
 {
     php_info_print_table_start();
@@ -1136,7 +1263,7 @@ static PHP_MINFO_FUNCTION(frankenphp)
 static zend_module_entry frankenphp_module = {
     STANDARD_MODULE_HEADER,
     "frankenphp", ext_functions,
-    PHP_MINIT(frankenphp), NULL, NULL, NULL,
+    PHP_MINIT(frankenphp), NULL, NULL, PHP_RSHUTDOWN(frankenphp),
     PHP_MINFO(frankenphp), "h2o-native-0.1",
     STANDARD_MODULE_PROPERTIES
 };
@@ -1230,6 +1357,9 @@ static int activate(void)
 }
 static int deactivate(void)
 {
+    /* Native-only cleanup fallback, including auxiliary interpreter teardown. */
+    if (!hp_process_is_fork_child() && is_real_request())
+        (void)hp_sapi_response_publish(current_request);
     if (!hp_process_is_fork_child() && local_auxiliary) {
         hp_pcntl_context_leave();
         hp_env_script_reset();
@@ -1346,6 +1476,16 @@ int hp_sapi_init(const char *ini, unsigned max_threads)
         hp_log_close();
         return -1;
     }
+    /* Extensions may install their own reader during module startup. A
+     * symbolically bound shared PHP stores its implementation address, while
+     * this executable's direct reference can name its canonical PLT entry.
+     * RTLD_NEXT skips that executable entry; direct equality also covers PHP
+     * linked statically or with ordinary interposition. */
+    void (*shared_default_post_reader)(void) =
+        (void (*)(void))dlsym(RTLD_NEXT, "php_default_post_reader");
+    if (sapi_module.default_post_reader == php_default_post_reader ||
+        (shared_default_post_reader && sapi_module.default_post_reader == shared_default_post_reader))
+        sapi_register_default_post_reader(read_default_post);
     install_php_metrics_opcache_hook();
     /* The installed default unsafe_raw alone must not enable PARSE_SERVER:
      * the pinned SAPI calls this hook only for an explicit config entry. */
@@ -1401,6 +1541,8 @@ void hp_sapi_thread_init(void)
 
 void hp_sapi_thread_shutdown(void)
 {
+    if (!hp_process_is_fork_child() && is_real_request())
+        (void)hp_sapi_response_publish(current_request);
     hp_pcntl_context_leave();
     unregister_slot();
     /* An execution thread can remain unused for its whole lifetime. */
@@ -1520,6 +1662,9 @@ static hp_execution_result_t execute_script(hp_request_t *request, const char *f
         /* If a callback exited/fataled, full shutdown cleans its active partial
          * request as well as the persistent script. PHP catches normal exit. */
         phase = HP_PHASE_SHUTDOWN;
+        if (is_real_request()) (void)hp_sapi_response_publish(current_request);
+        /* Failed startup may skip module RSHUTDOWN entirely. */
+        if (failure_phase == HP_PHASE_STARTUP) sapi_headers_finishing = true;
         zend_try { hp_env_script_reset(); php_request_shutdown(NULL); }
         zend_catch { status = 255; health = HP_THREAD_UNHEALTHY; failure_phase = HP_PHASE_SHUTDOWN; }
         zend_end_try();
@@ -1527,8 +1672,9 @@ static hp_execution_result_t execute_script(hp_request_t *request, const char *f
         hp_env_after_shutdown();
     }
     if (is_real_request()) {
+        (void)hp_sapi_response_publish(current_request);
         pthread_mutex_lock(&current_request->mutex);
-        bool headers_ready = current_request->headers_ready;
+        bool headers_ready = current_request->headers_ready || current_request->sapi_headers_accepted;
         pthread_mutex_unlock(&current_request->mutex);
         if (status && !headers_ready) hp_response_headers(current_request, 500, NULL, false);
         /* PHP shutdown has already flushed all output and sent headers. */

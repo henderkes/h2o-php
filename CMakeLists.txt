@@ -49,25 +49,47 @@ add_subdirectory(upstream/h2o h2o)
 # when that installed header fails the declaration check.
 include(CheckCSourceCompiles)
 include(CheckCSourceRuns)
-set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
-check_c_source_compiles("#include <openssl/engine.h>
-int main(void) { return sizeof(&ENGINE_by_id) == 0; }" H2O_PHP_OPENSSL_ENGINE_DECLARED)
-unset(CMAKE_REQUIRED_INCLUDES)
-if(NOT H2O_PHP_OPENSSL_ENGINE_DECLARED)
-  if(OPENSSL_VERSION VERSION_EQUAL "3.5.8")
-    set(CMAKE_REQUIRED_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compat" ${OPENSSL_INCLUDE_DIR})
-    set(CMAKE_REQUIRED_LIBRARIES OpenSSL::Crypto)
-    check_c_source_runs("#include <openssl/engine.h>
-int main(void) { ENGINE *e = ENGINE_new(); if (!e) return 1; ENGINE_free(e); return 0; }" H2O_PHP_OPENSSL_ENGINE_ABI_WORKS)
-    unset(CMAKE_REQUIRED_INCLUDES)
-    unset(CMAKE_REQUIRED_LIBRARIES)
-    if(NOT H2O_PHP_OPENSSL_ENGINE_ABI_WORKS)
-      message(FATAL_ERROR "Installed libcrypto does not provide functional ENGINE ABI required by H2O neverbleed")
+if(OPENSSL_VERSION VERSION_GREATER_EQUAL "4.0")
+  # Never resolve removed ENGINE symbols from libphp's bundled older libcrypto.
+  # OpenSSL 4 uses our neverbleed provider; validate against libcrypto alone.
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+  set(CMAKE_REQUIRED_LIBRARIES OpenSSL::Crypto)
+  check_c_source_runs("#include <openssl/provider.h>
+#include <openssl/opensslv.h>
+#include <openssl/crypto.h>
+int main(void) {
+  if (OPENSSL_version_major() != OPENSSL_VERSION_MAJOR) return 1;
+  OSSL_PROVIDER *p = OSSL_PROVIDER_load(NULL, \"default\");
+  if (!p) return 2;
+  OSSL_PROVIDER_unload(p); return 0;
+}" H2O_PHP_OPENSSL_PROVIDER_WORKS)
+  cmake_pop_check_state()
+  if(NOT H2O_PHP_OPENSSL_PROVIDER_WORKS)
+    message(FATAL_ERROR "OpenSSL provider headers/runtime do not match or the default provider cannot load")
+  endif()
+  message(STATUS "Using provider-based neverbleed with OpenSSL ${OPENSSL_VERSION}")
+else()
+  set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+  check_c_source_compiles("#include <openssl/engine.h>
+  int main(void) { return sizeof(&ENGINE_by_id) == 0; }" H2O_PHP_OPENSSL_ENGINE_DECLARED)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(NOT H2O_PHP_OPENSSL_ENGINE_DECLARED)
+    if(OPENSSL_VERSION VERSION_EQUAL "3.5.8")
+      set(CMAKE_REQUIRED_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compat" ${OPENSSL_INCLUDE_DIR})
+      set(CMAKE_REQUIRED_LIBRARIES OpenSSL::Crypto)
+      check_c_source_runs("#include <openssl/engine.h>
+  int main(void) { ENGINE *e = ENGINE_new(); if (!e) return 1; ENGINE_free(e); return 0; }" H2O_PHP_OPENSSL_ENGINE_ABI_WORKS)
+      unset(CMAKE_REQUIRED_INCLUDES)
+      unset(CMAKE_REQUIRED_LIBRARIES)
+      if(NOT H2O_PHP_OPENSSL_ENGINE_ABI_WORKS)
+        message(FATAL_ERROR "Installed libcrypto does not provide functional ENGINE ABI required by H2O neverbleed")
+      endif()
+      message(WARNING "Installed OpenSSL engine.h lacks ENGINE declarations. Using bundled official OpenSSL 3.5.8 header; shared system libcrypto remains linked.")
+      target_include_directories(h2o BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compat")
+    else()
+      message(FATAL_ERROR "H2O neverbleed requires OpenSSL ENGINE declarations. Repair the OpenSSL development headers for ${OPENSSL_VERSION}.")
     endif()
-    message(WARNING "Installed OpenSSL engine.h lacks ENGINE declarations. Using bundled official OpenSSL 3.5.8 header; shared system libcrypto remains linked.")
-    target_include_directories(h2o BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compat")
-  else()
-    message(FATAL_ERROR "H2O neverbleed requires OpenSSL ENGINE declarations. Repair the OpenSSL development headers for ${OPENSSL_VERSION}.")
   endif()
 endif()
 
@@ -94,7 +116,16 @@ target_compile_definitions(h2o PRIVATE H2O_PHP_PREFER_EMBEDDED_CA=$<BOOL:${H2O_P
 target_link_libraries(h2o PHPZTS::PHPZTS Threads::Threads)
 set_target_properties(h2o PROPERTIES OUTPUT_NAME h2o-php
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+if(OPENSSL_VERSION VERSION_GREATER_EQUAL "4.0" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_custom_target(h2o-php-openssl-import-check
+    COMMAND "${CMAKE_COMMAND}" "-DNM=${CMAKE_NM}" "-DBINARY=$<TARGET_FILE:h2o>"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckOpenSSLImports.cmake"
+    DEPENDS h2o VERBATIM)
+endif()
 add_custom_target(native-server DEPENDS h2o)
+if(TARGET h2o-php-openssl-import-check)
+  add_dependencies(native-server h2o-php-openssl-import-check)
+endif()
 
 add_custom_target(h2o-php-php-abi-check
   COMMAND "${CMAKE_COMMAND}"

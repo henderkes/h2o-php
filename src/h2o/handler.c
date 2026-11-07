@@ -2,8 +2,11 @@
 #define _GNU_SOURCE
 #endif
 #include "php_handler.h"
+#include "input_return.h"
+#include "h2o/http1.h"
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fnmatch.h>
 #include <limits.h>
 #include <netdb.h>
@@ -14,6 +17,12 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#if defined(__linux__) && defined(__has_include)
+#if __has_include(<linux/openat2.h>)
+#include <linux/openat2.h>
+#include <sys/syscall.h>
+#endif
+#endif
 
 typedef struct {
     h2o_handler_t super;
@@ -29,6 +38,12 @@ typedef struct {
 typedef struct {
     h2o_multithread_message_t super;
     hp_request_t *request;
+    hp_input_origin_t input_origin;
+    /* Owned input returns use this same receiver and shutdown drain. They do
+     * not depend on the H2O request/generator surviving the PHP consumer. */
+    h2o_multithread_receiver_t *return_receiver;
+    h2o_buffer_t *return_buffer;
+    size_t return_capacity;
 } php_message_t;
 typedef struct {
     h2o_generator_t super;
@@ -39,8 +54,10 @@ typedef struct {
     uint64_t body_timeout_ms, response_timeout_ms;
     h2o_linklist_t context_link;
     size_t input_offset;
+    php_message_t *input_owned;
     int abort_status;
     unsigned started : 1, headers_sent : 1, in_flight : 1, finalized : 1, input_waiting : 1, input_eof : 1, aborted : 1;
+    unsigned lease_returning : 1;
 } php_generator_t;
 
 static void pump_output(php_generator_t *g);
@@ -79,22 +96,123 @@ static void notify_request(hp_request_t *r)
     atomic_fetch_add_explicit(&context->pending_messages, 1, memory_order_relaxed);
     h2o_multithread_send_message((h2o_multithread_receiver_t *)r->notify_data, &m->super);
 }
+static void body_lease_notify(void *data) { hp_request_notify(data); }
+static int body_lease_write(void *token, const void *data, size_t length, uint64_t deadline_ns,
+                            size_t *written, int *error)
+{
+    /* A PHP child inherits descriptor numbers but never host transport
+     * ownership. Keep this guard at the final worker API boundary as well as
+     * the ordinary SAPI guard. This adapter never accesses req or conn. */
+    if (hp_process_is_fork_child()) { *written = 0; *error = ECANCELED; return -1; }
+    h2o_http1_body_lease_result_t result;
+    int status = h2o_http1_body_lease_write(token, data, length, deadline_ns, &result);
+    *written = result.payload_bytes;
+    *error = result.error;
+    return status;
+}
+static void body_lease_revoke(void *token) { if (!hp_process_is_fork_child()) h2o_http1_body_lease_revoke(token); }
+static void body_lease_release(void *token) { if (!hp_process_is_fork_child()) h2o_http1_body_lease_release(token); }
+static hp_response_lease_ops_t body_lease_ops = {
+    .write = body_lease_write, .revoke = body_lease_revoke, .release = body_lease_release
+};
+static pthread_once_t body_lease_once = PTHREAD_ONCE_INIT;
+static void body_lease_init(void)
+{
+    /* Include all new per-request bridge state in addition to H2O's opaque
+     * allocation (which includes its cancelFD bookkeeping). */
+    body_lease_ops.charge = h2o_http1_body_lease_charge() +
+        offsetof(hp_request_t, status) - offsetof(hp_request_t, response_lease_ops);
+}
+static void *acquire_body_lease(void *data)
+{
+    php_generator_t *g = data;
+    return h2o_http1_body_lease_acquire(g->req, body_lease_notify, g->native);
+}
+/* Return may close the protocol and dispose g synchronously. Keep the request
+ * alive, and let this stack release the caller token instead of a reentrant
+ * close_generator. Never inspect g after a protocol disposal. */
+static bool return_body_lease(php_generator_t *g, void *token)
+{
+    hp_request_t *r = g->native;
+    hp_request_retain(r);
+    g->lease_returning = 1;
+    int detached = h2o_http1_body_lease_return(token);
+    if (detached) hp_response_lease_returned(r, token);
+    bool alive = r->network_data == g;
+    if (alive) g->lease_returning = 0;
+    hp_request_release(r);
+    return detached && alive;
+}
+static void return_input_buffer(void *owner, size_t capacity)
+{
+    php_message_t *m = owner;
+    if (capacity == 0) {
+        /* Finish won the push race: the bridge never adopted or charged this
+         * allocation. This callback is still inside the origin-loop push, so
+         * dispose now instead of leaving uncharged storage in its queue. The
+         * push caller retires the envelope. */
+        h2o_buffer_dispose(&m->return_buffer);
+        return;
+    }
+    m->return_capacity = capacity;
+    php_context_t *context = H2O_STRUCT_FROM_MEMBER(php_context_t, receiver, m->return_receiver);
+    atomic_fetch_add_explicit(&context->pending_messages, 1, memory_order_relaxed);
+    h2o_multithread_send_message(m->return_receiver, &m->super);
+}
 static void receive_messages(h2o_multithread_receiver_t *receiver, h2o_linklist_t *messages)
 {
     php_context_t *context = H2O_STRUCT_FROM_MEMBER(php_context_t, receiver, receiver);
     while (!h2o_linklist_is_empty(messages)) {
         php_message_t *m = H2O_STRUCT_FROM_MEMBER(php_message_t, super.link, messages->next);
         h2o_linklist_unlink(&m->super.link);
-        hp_request_t *r = m->request;
-        atomic_store_explicit(&r->notification_pending, false, memory_order_release);
-        php_generator_t *g = r->network_data;
-        if (g) {
-            pump_input(g);
-            /* Input resumption may synchronously dispose the H2O request. */
-            g = r->network_data;
-            if (g) pump_output(g);
+        if (m->return_buffer) {
+            /* This receiver runs on the buffer's allocating H2O loop. Only
+             * here may it re-enter H2O's thread-local recycle bins. */
+            /* A nonfinal return has an origin-thread-only weak pointer while
+             * g holds its native ref. Close clears it before releasing that
+             * ref, avoiding an unread-body -> envelope -> request cycle. */
+            hp_request_t *r = hp_input_origin_acquire(&m->input_origin);
+            php_generator_t *g = r ? r->network_data : NULL;
+            if (g && g->input_owned == m) {
+                g->input_owned = NULL;
+                /* This temporary ref keeps only r alive across callbacks.
+                 * network_data is rechecked after any H2O pool disposal. */
+                if (!g->aborted)
+                    h2o_http1_restore_request_body(g->req, &m->return_buffer);
+            } else {
+                g = NULL;
+            }
+            if (m->return_buffer) h2o_buffer_dispose(&m->return_buffer);
+            hp_request_body_release_owned_capacity(m->return_capacity);
+            if (g) {
+                pump_input(g);
+                /* Proceed may synchronously dispose the request pool. */
+                g = r->network_data;
+                if (g) pump_output(g);
+            }
+            if (r) hp_request_release(r);
+        } else {
+            hp_request_t *r = m->request;
+            atomic_store_explicit(&r->notification_pending, false, memory_order_release);
+            php_generator_t *g = r->network_data;
+            if (g) {
+                pump_input(g);
+                /* Input resumption may synchronously dispose the H2O request. */
+                g = r->network_data;
+                if (g) pump_output(g);
+            }
+            if (!r->network_data) {
+                /* A protocol close can dispose the generator in the short
+                 * interval between worker publication and H2O API entry.
+                 * Its externally referenced, detached token is independent
+                 * of that pool and is released after the worker exit wake. */
+                bool returning, active;
+                void *token = hp_response_lease_get(r, &returning, &active);
+                if (token && returning && !active && h2o_http1_body_lease_return(token))
+                    hp_response_lease_returned(r, token);
+            }
+            hp_request_release(r);
         }
-        hp_request_release(r);
         free(m);
         atomic_fetch_sub_explicit(&context->pending_messages, 1, memory_order_release);
     }
@@ -125,6 +243,17 @@ static void close_generator(void *data)
     if (g->native) {
         hp_request_t *r = g->native;
         r->network_data = NULL;
+        if (g->input_owned) {
+            hp_input_origin_invalidate(&g->input_owned->input_origin);
+            g->input_owned = NULL;
+        }
+        if (!g->lease_returning) {
+            bool returning, active;
+            void *token = hp_response_lease_get(r, &returning, &active);
+            /* H2O defers request-pool destruction while its worker is in I/O.
+             * A protocol close has already detached this idle token. */
+            if (token && h2o_http1_body_lease_return(token)) hp_response_lease_returned(r, token);
+        }
         pthread_mutex_lock(&r->mutex);
         bool completed_response = g->finalized && r->response_finished;
         if (completed_response) {
@@ -247,8 +376,18 @@ static void arm_response_timeout(php_generator_t *g)
 }
 static void pump_output(php_generator_t *g)
 {
-    if (!g->native || g->aborted) return;
+    if (!g->native || g->lease_returning) return;
     hp_request_t *r = g->native;
+    bool returning, call_active;
+    void *token = hp_response_lease_get(r, &returning, &call_active);
+    /* Revoked active writes notify this same receiver when I/O has stopped.
+     * Process their return even when abort_response already marked g aborted. */
+    if (token) {
+        if (!returning || !return_body_lease(g, token)) return;
+    } else if (call_active && !hp_response_lease_requested(r)) {
+        return; /* The worker is retiring its borrowed CALL credit. */
+    }
+    if (g->aborted) return;
     pthread_mutex_lock(&r->mutex);
     bool cancelled = r->cancelled;
     int status = r->status >= 500 ? r->status : 504;
@@ -288,13 +427,34 @@ static void pump_output(php_generator_t *g)
     /* Send only what is already available, without waiting for another PHP
      * write or flush. Queued/reserved plus in-flight payload stays within the
      * configured per-request limit; global credit lasts through completion. */
+    bool no_body = g->req->method.len == 4 && !memcmp(g->req->method.base, "HEAD", 4);
+    no_body |= g->req->res.status == 204 || g->req->res.status == 304;
+    no_body |= g->req->res.status == 101; /* final 101 is bodyless on every pump */
+    if (hp_response_lease_requested(r)) {
+        if (no_body || !g->input_eof || g->input_waiting || g->req->conn->ctx->shutdown_requested) {
+            hp_response_lease_acquire(r, NULL, NULL);
+        } else if (!g->headers_sent) {
+            /* Filters and H2O's header encoder run on their owning loop. The
+             * first worker CALL remains borrowed through this bounded wait. */
+            g->in_flight = 1;
+            g->headers_sent = 1;
+            arm_response_timeout(g);
+            h2o_send(g->req, NULL, 0, H2O_SEND_STATE_IN_PROGRESS);
+            return;
+        } else {
+            hp_response_lease_acquire(r, acquire_body_lease, g);
+            token = hp_response_lease_get(r, &returning, &call_active);
+            if (token) return;
+        }
+    }
+    /* The worker alone retires its full borrowed-span reservation. Do not
+     * terminal-send until a racing finish has allowed that call to return. */
+    hp_response_lease_get(r, &returning, &call_active);
+    if (call_active) return;
     enum { MAX_SEND_CHUNKS = 16, MAX_SEND_BYTES = 262144 };
     size_t batch_bytes = r->output_limit < MAX_SEND_BYTES ? r->output_limit : MAX_SEND_BYTES;
     bool finished;
     hp_chunk_t *chunks = hp_response_pop_batch(r, MAX_SEND_CHUNKS, batch_bytes, &finished);
-    bool no_body = g->req->method.len == 4 && !memcmp(g->req->method.base, "HEAD", 4);
-    no_body |= g->req->res.status == 204 || g->req->res.status == 304;
-    no_body |= g->req->res.status == 101; /* final 101 is bodyless on every pump */
     if (no_body) {
         while (chunks) {
             hp_response_release_chunks(r, chunks);
@@ -333,7 +493,7 @@ static void pump_output(php_generator_t *g)
 }
 static void pump_input(php_generator_t *g)
 {
-    if (!g->native || !g->input_waiting || g->aborted) return;
+    if (!g->native || !g->input_waiting || g->input_owned || g->aborted) return;
     hp_request_t *r = g->native;
 Retry:
     pthread_mutex_lock(&r->mutex);
@@ -343,13 +503,53 @@ Retry:
     pthread_mutex_unlock(&r->mutex);
     if (cancelled) return;
     /* The pinned H2O fork refreshes this view when its HTTP/2 body buffer
-     * grows. Only this owning event loop reads it; PHP sees copied chunks. */
+     * grows. Only this owning event loop reads it. */
     size_t left = g->req->entity.len - g->input_offset;
     /* PHP has relinquished its body after finish. Consume the complete
      * current H2O lease without allocating or copying a discarded prefix. */
     size_t n = discard ? left : (left < room ? left : room);
     bool eof = g->input_eof && n == left;
-    if (n || eof) {
+    bool owned = false;
+    if (!discard && n == left && n >= 256 * 1024 && g->input_offset == 0) {
+        /* Allocate the return envelope before detaching so every adopted
+         * buffer has a no-allocation path back to its origin receiver. */
+        php_message_t *m = calloc(1, sizeof(*m));
+        h2o_buffer_t *body = m ? h2o_http1_take_request_body(g->req) : NULL;
+        if (body != NULL) {
+            m->return_receiver = r->notify_data;
+            m->return_buffer = body;
+            if (!eof) {
+                /* Keep socket reads paused until this fragment is consumed
+                 * and the origin receiver can reuse its actual allocation. */
+                m->input_origin.request = r;
+                g->input_owned = m;
+            }
+            int status = hp_request_body_push_owned(r, m, body->bytes, n,
+                offsetof(h2o_buffer_t, _buf) + body->capacity, return_input_buffer, eof);
+            if (status <= 0) {
+                /* Tight global budgets still admit the old exact-length copy.
+                 * Fallback disposal is already on the allocating loop. */
+                if (status == 0) status = hp_request_body_push(r, body->bytes, n, eof);
+                h2o_buffer_dispose(&body);
+                if (m->input_origin.request) g->input_owned = NULL;
+                free(m);
+            }
+            if (status < 0) {
+                hp_request_cancel(r);
+                schedule_abort(g, 503);
+                return;
+            }
+            if (status > 0 && m->return_buffer == NULL) {
+                if (m->input_origin.request) g->input_owned = NULL;
+                free(m);
+            }
+            if (g->input_owned) return;
+            owned = true; /* take cleared the H2O lease; proceed consumes zero. */
+        } else {
+            free(m);
+        }
+    }
+    if (!owned && (n || eof)) {
         if (hp_request_body_push(r, g->req->entity.base ? g->req->entity.base + g->input_offset : "", n, eof) != 0) {
             hp_request_cancel(r);
             schedule_abort(g, 503);
@@ -402,16 +602,35 @@ static void on_timeout(h2o_timer_t *timer)
     hp_request_cancel(g->native);
     abort_response(g, status);
 }
-static void set_address(h2o_req_t *req, hp_request_t *r, int peer)
+static void set_remote_address(h2o_req_t *req, hp_request_t *r)
 {
     struct sockaddr_storage ss;
-    socklen_t n = peer ? req->conn->callbacks->get_peername(req->conn, (void *)&ss) : req->conn->callbacks->get_sockname(req->conn, (void *)&ss);
+    socklen_t n = req->conn->callbacks->get_peername(req->conn, (void *)&ss);
     char host[NI_MAXHOST], port[16];
     if (!n || h2o_socket_getnumerichost((void *)&ss, n, host) == SIZE_MAX) strcpy(host, "");
     int value = n ? h2o_socket_getport((void *)&ss) : 0;
     snprintf(port, sizeof(port), "%d", value < 0 ? 0 : value);
-    if (peer) { r->remote_addr = strdup(host); r->remote_port = strdup(port); }
-    else r->server_port = strdup(port);
+    r->remote_addr = strdup(host); r->remote_port = strdup(port);
+}
+static void set_cgi_authority(hp_request_t *r, const char *authority)
+{
+    /* Keep the pinned request.Host / net.SplitHostPort convention separate
+     * from H2O's normalized virtual-host matching and real listener address. */
+    const char *host = authority, *port = NULL, *colon = strrchr(authority, ':');
+    size_t host_length = strlen(authority);
+    if (colon) {
+        if (authority[0] == '[') {
+            const char *end = strchr(authority, ']');
+            if (end && end + 1 == colon && !strchr(authority + 1, '[') && !strchr(end + 1, ']')) {
+                host = authority + 1; host_length = (size_t)(end - host); port = colon + 1;
+            }
+        } else if (strchr(authority, ':') == colon && !strpbrk(authority, "[]")) {
+            host_length = (size_t)(colon - authority); port = colon + 1;
+        }
+    }
+    if (!host_length) { host = authority; host_length = strlen(authority); }
+    r->server_name = strndup(host, host_length);
+    r->server_port = strdup(port && *port ? port : (r->tls ? "443" : "80"));
 }
 static int inside_root(const char *root, const char *path)
 {
@@ -449,6 +668,75 @@ static bool script_suffix(const hp_route_config_t *c, const char *path)
     }
     return false;
 }
+static char *canonical_path(const char *path, char *resolved)
+{
+#if defined(SYS_openat2) && defined(RESOLVE_NO_SYMLINKS) && defined(O_PATH)
+    /* For an absolute path without dot components, a successful no-symlink
+     * lookup certifies the spelling after repeated slashes are collapsed.
+     * Symlinks and every unsupported/error case retain libc's realpath
+     * behavior. This is only a pathname snapshot, not an inode/content lease. */
+    if (path && path[0] == '/' && strnlen(path, PATH_MAX) < PATH_MAX) {
+        const char *at = path;
+        size_t used = 0;
+        while (*at) {
+            if (*at == '/') {
+                resolved[used++] = '/';
+                while (*at == '/') ++at;
+                if (!*at && used != 1) goto fallback;
+            } else {
+                const char *component = at;
+                while (*at && *at != '/') ++at;
+                size_t length = (size_t)(at - component);
+                if ((length == 1 && component[0] == '.') ||
+                    (length == 2 && component[0] == '.' && component[1] == '.')) goto fallback;
+                memcpy(resolved + used, component, length);
+                used += length;
+            }
+        }
+        resolved[used] = '\0';
+        struct open_how how = {.flags = O_PATH | O_CLOEXEC, .resolve = RESOLVE_NO_SYMLINKS};
+        int fd = (int)syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how));
+        if (fd >= 0 && close(fd) == 0) return resolved;
+    }
+fallback:
+#endif
+    return realpath(path, resolved);
+}
+static int static_source_access_check(const char *path, int fd, void *data)
+{
+    const hp_route_config_t *suffixes = data;
+    char canonical[PATH_MAX];
+    struct stat selected, opened;
+    /* This is a pathname/descriptor identity snapshot, not an atomic namespace
+     * or content lease. Ordinary regular static hardlinks remain allowed. */
+    if (!canonical_path(path, canonical) || script_suffix(suffixes, canonical) ||
+        lstat(canonical, &selected) != 0 || !S_ISREG(selected.st_mode) ||
+        fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode)) return 0;
+    return selected.st_dev == opened.st_dev && selected.st_ino == opened.st_ino;
+}
+static void static_source_access_dispose(void *data)
+{
+    hp_route_config_t *suffixes = data;
+    for (size_t i = 0; i < suffixes->num_split_paths; ++i) free(suffixes->split_paths[i]);
+    free(suffixes->split_paths);
+    free(suffixes);
+}
+void hp_h2o_register_server_files(h2o_pathconf_t *path, const hp_route_config_t *config, h2o_mimemap_t *mimemap)
+{
+    hp_route_config_t *suffixes = h2o_mem_alloc(sizeof(*suffixes));
+    memset(suffixes, 0, sizeof(*suffixes));
+    suffixes->num_split_paths = config->num_split_paths;
+    if (suffixes->num_split_paths != 0) {
+        suffixes->split_paths = h2o_mem_alloc(suffixes->num_split_paths * sizeof(*suffixes->split_paths));
+        for (size_t i = 0; i < suffixes->num_split_paths; ++i) {
+            size_t len = strlen(config->split_paths[i]) + 1;
+            suffixes->split_paths[i] = h2o_mem_alloc(len);
+            memcpy(suffixes->split_paths[i], config->split_paths[i], len);
+        }
+    }
+    h2o_file_handler_t *file = h2o_file_register(path, config->root, NULL, mimemap, 0);
+    h2o_file_set_static_access_check(file, static_source_access_check, suffixes, static_source_access_dispose);
+}
 /* Keep no-delimiter distinct from a delimiter ending at the path boundary:
  * Go's unset pathInfo is NULL, while an empty suffix retains its backing data. */
 static size_t script_path_split(const hp_route_config_t *c, h2o_iovec_t path, size_t prefix)
@@ -484,7 +772,7 @@ static int php_path(const hp_route_config_t *c, h2o_iovec_t path)
 }
 static int resolve_php_script(const hp_route_config_t *c, const char *root, const char *candidate, char *resolved)
 {
-    if (!realpath(candidate, resolved) || !inside_root(root, resolved)) return 0;
+    if (!canonical_path(candidate, resolved) || !inside_root(root, resolved)) return 0;
     struct stat st;
     return !stat(resolved, &st) && S_ISREG(st.st_mode) && script_suffix(c, resolved);
 }
@@ -496,10 +784,10 @@ static int worker_static_file(php_handler_t *handler, h2o_req_t *req)
     if (req->path_normalized.len - prefix_len > INT_MAX) return 0;
     for (size_t i = 0; i < handler->static_roots.size; ++i) {
         char root[PATH_MAX], candidate[PATH_MAX], resolved[PATH_MAX];
-        if (!realpath(handler->static_roots.entries[i], root)) continue;
+        if (!canonical_path(handler->static_roots.entries[i], root)) continue;
         int len = snprintf(candidate, sizeof(candidate), "%s/%.*s", root,
                            (int)(req->path_normalized.len - prefix_len), req->path_normalized.base + prefix_len);
-        if (len < 0 || len >= (int)sizeof(candidate) || !realpath(candidate, resolved) || !inside_root(root, resolved)) continue;
+        if (len < 0 || len >= (int)sizeof(candidate) || !canonical_path(candidate, resolved) || !inside_root(root, resolved)) continue;
         if (script_suffix(&handler->config, resolved)) continue;
         struct stat st;
         if (!stat(resolved, &st) && S_ISREG(st.st_mode)) return 1;
@@ -539,14 +827,31 @@ static void reject_cgi_path(h2o_req_t *req, hp_cgi_path_error_t error)
 {
     h2o_send_error_400(req, "Bad Request", error == HP_CGI_PATH_NUL ? "invalid request path" : "400 Bad Request", 0);
 }
-static bool redirect_directory(php_handler_t *handler, h2o_req_t *req, hp_cgi_path_error_t path_error)
+static bool redirect_directory(php_handler_t *handler, h2o_req_t *req, hp_cgi_path_error_t path_error,
+                               char *root, bool *root_available, char *resolved, bool *regular_file_available)
 {
     const hp_route_config_t *c = &handler->config;
     if (c->mode != HP_ROUTE_SERVER || !c->index_file || !c->root || !req->path_normalized.len ||
         req->path_normalized_has_null_char || req->path_normalized.base[req->path_normalized.len - 1] == '/') return false;
     size_t prefix = mount_prefix(req);
-    char root[PATH_MAX], candidate[PATH_MAX], resolved[PATH_MAX];
-    if (!realpath(c->root, root)) return false;
+    char candidate[PATH_MAX];
+    if (!canonical_path(c->root, root)) return false;
+    /* Reuse only the configured physical root. Logical roots are resolved
+     * again by dispatch so their existing retarget behavior stays intact. */
+    *root_available = c->resolve_root_symlink && !strcmp(root, c->root);
+    if (*root_available && !req->filereq) {
+        size_t script_len = script_path_length(c, req->path_normalized, prefix);
+        int len = snprintf(candidate, sizeof(candidate), "%s/%.*s", root,
+                           (int)(script_len - prefix), req->path_normalized.base + prefix);
+        struct stat initial;
+        /* A regular script prefix cannot contain a directory index. Keep its
+         * canonical result for dispatch within this request only. */
+        if (len >= 0 && len < (int)sizeof(candidate) && canonical_path(candidate, resolved) &&
+            !stat(resolved, &initial) && S_ISREG(initial.st_mode)) {
+            *regular_file_available = true;
+            return false;
+        }
+    }
     int n = snprintf(candidate, sizeof(candidate), "%s/%.*s/%s", root,
                      (int)(req->path_normalized.len - prefix), req->path_normalized.base + prefix, c->index_file);
     if (n < 0 || n >= (int)sizeof(candidate) || !resolve_php_script(c, root, candidate, resolved)) return false;
@@ -569,9 +874,11 @@ static void free_script_metadata(char *script_name, char *path_info, char *docum
     free(script_name); free(path_info);
 }
 static char *resolve_script(php_handler_t *handler, h2o_req_t *req, hp_worker_group_t *group,
-                            char **script_name, char **path_info, char **document_uri)
+                            char **script_name, char **path_info, char **document_uri,
+                            char *root, bool root_available, char *resolved, bool regular_file_available)
 {
-    char candidate[PATH_MAX], resolved[PATH_MAX], root[PATH_MAX];
+    char candidate[PATH_MAX];
+    bool candidate_resolved = false;
     const hp_route_config_t *c = &handler->config;
     if (group) {
         const char *file = hp_worker_group_config(group)->file;
@@ -622,7 +929,7 @@ static char *resolve_script(php_handler_t *handler, h2o_req_t *req, hp_worker_gr
         *document_uri = *script_name;
         *path_info = strdup(""); return strdup(c->script);
     }
-    if (req->path_normalized_has_null_char || !c->root || !realpath(c->root, root)) return NULL;
+    if (req->path_normalized_has_null_char || !c->root || (!root_available && !canonical_path(c->root, root))) return NULL;
     if (req->filereq) {
         if (req->filereq->local_path.len >= sizeof(candidate)) return NULL;
         memcpy(candidate, req->filereq->local_path.base, req->filereq->local_path.len);
@@ -633,8 +940,8 @@ static char *resolve_script(php_handler_t *handler, h2o_req_t *req, hp_worker_gr
         size_t script_len = script_path_length(c, req->path_normalized, prefix_len);
         if (snprintf(candidate, sizeof(candidate), "%s/%.*s", root, (int)(script_len - prefix_len), req->path_normalized.base + prefix_len) >= (int)sizeof(candidate)) return NULL;
         struct stat initial;
-        int exists = realpath(candidate, resolved) && !stat(resolved, &initial);
-        if ((!exists || S_ISDIR(initial.st_mode)) && c->index_file) {
+        int exists = regular_file_available || (canonical_path(candidate, resolved) && !stat(resolved, &initial));
+        if ((!exists || (!regular_file_available && S_ISDIR(initial.st_mode))) && c->index_file) {
             char directory_index[PATH_MAX];
             int len = snprintf(directory_index, sizeof(directory_index), "%s/%s", candidate, c->index_file);
             if (len >= 0 && len < (int)sizeof(directory_index) && resolve_php_script(c, root, directory_index, resolved)) {
@@ -647,11 +954,17 @@ static char *resolve_script(php_handler_t *handler, h2o_req_t *req, hp_worker_gr
             }
             *path_info = strdup("");
         } else {
+            /* The initial lookup already supplies this request's canonical
+             * regular-file result. Retain the same confinement and canonical
+             * suffix checks without walking the identical path a second time. */
+            candidate_resolved = regular_file_available || (exists && S_ISREG(initial.st_mode));
             *script_name = strndup(req->path_normalized.base, script_len);
             *path_info = strndup(req->path_normalized.base + script_len, req->path_normalized.len - script_len);
         }
     }
     *document_uri = *script_name;
+    if (candidate_resolved)
+        return inside_root(root, resolved) && script_suffix(c, resolved) ? strdup(resolved) : NULL;
     return resolve_php_script(c, root, candidate, resolved) ? strdup(resolved) : NULL;
 }
 static int is_local(h2o_req_t *req)
@@ -760,9 +1073,12 @@ static int handle_request(h2o_handler_t *self, h2o_req_t *req)
     if (path_error && (group || handler->config.mode == HP_ROUTE_DIRECT || req->filereq)) {
         reject_cgi_path(req, path_error); return 0;
     }
-    if (!group && redirect_directory(handler, req, path_error)) return 0;
+    char root[PATH_MAX], resolved[PATH_MAX];
+    bool root_available = false, regular_file_available = false;
+    if (!group && redirect_directory(handler, req, path_error, root, &root_available, resolved, &regular_file_available)) return 0;
     char *script_name = NULL, *path_info = NULL, *document_uri = NULL;
-    char *script = resolve_script(handler, req, group, &script_name, &path_info, &document_uri);
+    char *script = resolve_script(handler, req, group, &script_name, &path_info, &document_uri,
+                                  root, root_available, resolved, regular_file_available);
     if (script && !group && handler->config.workers) {
         for (size_t i = 0; i < handler->config.workers->entries.size; ++i) {
             hp_worker_group_t *candidate = handler->config.workers->entries.entries[i].group;
@@ -798,18 +1114,27 @@ static int handle_request(h2o_handler_t *self, h2o_req_t *req)
     char protocol[16]; size_t plen = h2o_stringify_protocol_version(protocol, req->version);
     r->protocol = req->version == 0x200 ? strdup("HTTP/2.0") : req->version == 0x300 ? strdup("HTTP/3.0") : strndup(protocol, plen);
     r->document_root = handler->config.root ? strdup(handler->config.root) : strdup("");
-    r->server_name = copy_iov(req->hostconf->authority.host);
     r->tls = req->scheme == &H2O_URL_SCHEME_HTTPS;
     r->content_length = req->content_length;
     struct timespec wall; clock_gettime(CLOCK_REALTIME, &wall);
     r->request_time = (double)wall.tv_sec + (double)wall.tv_nsec / 1e9;
-    set_address(req, r, 1); set_address(req, r, 0);
+    set_remote_address(req, r);
     for (size_t i = 0; i < req->headers.size; ++i) {
         h2o_header_t *h = req->headers.entries + i;
         char *name = copy_iov(*h->name), *value = copy_iov(h->value);
         hp_header_add(&r->headers, name, value); free(name); free(value);
     }
+#ifdef H2O_WITH_PHP
+    /* Framing parsers retain the validated lexical field separately, so it
+     * cannot duplicate H2O's synthesized proxy framing header. PHP sees the
+     * first original field exactly once, including explicit 0/leading zeros. */
+    if (req->content_length_header.base != NULL) {
+        char *value = copy_iov(req->content_length_header);
+        hp_header_add(&r->headers, "Content-Length", value); free(value);
+    }
+#endif
     char *authority = copy_iov(req->authority);
+    set_cgi_authority(r, authority);
     hp_header_add(&r->headers, "Host", authority); free(authority);
     /* H2/H3 deliver each Cookie field as a separate header; coalesce them
      * into the first Cookie node with the same "; " join r->cookie uses, so
@@ -846,6 +1171,12 @@ static int handle_request(h2o_handler_t *self, h2o_req_t *req)
     g->body_timeout_ms = handler->config.body_timeout_ms; g->response_timeout_ms = handler->config.response_timeout_ms;
     h2o_linklist_insert(&ctx->generators, &g->context_link);
     r->notify = notify_request; r->notify_data = &ctx->receiver; r->network_data = g;
+    if (!r->tls && req->version < 0x200 && !req->conn->ctx->shutdown_requested) {
+        pthread_once(&body_lease_once, body_lease_init);
+        r->response_lease_ops = &body_lease_ops;
+        r->response_lease_timeout_ns = g->response_timeout_ms > UINT64_MAX / 1000000
+            ? UINT64_MAX : g->response_timeout_ms * 1000000;
+    }
     uint64_t timeout = handler->config.timeout_set ? handler->config.timeout_ms : hp_config.request_timeout_ms;
     uint64_t now = hp_now_ns();
     r->deadline_ns = !timeout || timeout > (UINT64_MAX - now) / 1000000ULL ? UINT64_MAX : now + timeout * 1000000ULL;
@@ -889,7 +1220,7 @@ void hp_h2o_register(h2o_pathconf_t *path, const hp_route_config_t *config)
     hp_route_config_clone(&handler->config, config);
     if (config->root && config->resolve_root_symlink) {
         char canonical[PATH_MAX];
-        if (realpath(config->root, canonical)) { free(handler->config.root); handler->config.root = strdup(canonical); }
+        if (canonical_path(config->root, canonical)) { free(handler->config.root); handler->config.root = strdup(canonical); }
     }
 }
 
@@ -970,6 +1301,7 @@ void h2o_php_context_shutdown(void *context)
                 uint64_t now = hp_now_ns();
                 uint64_t request_remaining = g->native->deadline_ns > now
                     ? (g->native->deadline_ns - now + 999999) / 1000000 : 0;
+                hp_response_lease_yield(g->native);
                 uint64_t timeout = request_remaining < hp_config.shutdown_timeout_ms
                     ? request_remaining : hp_config.shutdown_timeout_ms;
                 h2o_timer_link(ctx->loop, timeout, &g->timeout);

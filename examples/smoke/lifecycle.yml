@@ -5,7 +5,7 @@ php.runtime:
   max-threads: 8
   request-timeout: 2s
   shutdown-timeout: 3s
-php.root: /home/m/h2o-php/examples/smoke
+php.root: examples/smoke
 php.ini:
   display_errors: 0
   output_buffering: 0
@@ -16,10 +16,10 @@ hosts:
     paths:
       "/worker":
         php.worker:
-          file: /home/m/h2o-php/examples/smoke/worker-probe.php
+          file: worker-probe.php
           num: 1
           max-requests: 20
       "/metrics":
         php.metrics: ON
       "/":
-        file.dir: /home/m/h2o-php/examples/smoke
+        file.dir: examples/smoke

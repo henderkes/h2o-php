@@ -21,6 +21,10 @@ typedef struct worker_catalog {
 typedef struct {
     h2o_configurator_t super;
     uint64_t runtime_seen;
+    bool runtime_mapping_seen;
+    /* Borrowed only during synchronous configuration application. */
+    yoml_t *pending_global_workers;
+    h2o_configurator_command_t *pending_global_workers_cmd;
     hp_header_t *ini_seen;
     worker_catalog_t *catalog;
     hp_route_config_t *vars;
@@ -111,8 +115,12 @@ static int number(h2o_configurator_command_t *cmd, yoml_t *node, uint64_t *out, 
         h2o_configurator_errprintf(cmd, node, "expected nonnegative duration (ns, us, ms, s, m, h; fractions and composites allowed)");
         return -1;
     }
+    const unsigned char *digits = (const unsigned char *)node->data.scalar;
+    if (*digits == '+') ++digits;
+    if (!*digits) goto Invalid;
+    for (; *digits; ++digits)
+        if (*digits < '0' || *digits > '9') goto Invalid;
     char *end; errno = 0;
-    if (*node->data.scalar == '-' || !*node->data.scalar) goto Invalid;
     unsigned long long value = strtoull(node->data.scalar, &end, 10);
     if (errno || *end) goto Invalid;
     *out = value; return 0;
@@ -138,12 +146,17 @@ static int set_runtime_value(h2o_configurator_command_t *cmd, const char *origin
 {
     php_configurator_t *c = (void *)cmd->configurator;
     char key[64]; option_key(original_key, key, sizeof(key));
-    static const char *keys[] = {"threads", "max-threads", "queue-limit", "max-requests", "max-wait-time", "request-timeout", "shutdown-timeout", "startup-timeout", "max-idle-time", "max-buffered-body", "max-buffered-response", "max-buffered-global"};
+    static const char *keys[] = {"threads", "max-threads", "queue-limit", "max-requests", "max-wait-time", "request-timeout", "shutdown-timeout", "startup-timeout", "max-idle-time", "max-buffered-body", "max-buffered-response", "max-buffered-global", "collect-metrics"};
     size_t which;
     for (which = 0; which < sizeof(keys)/sizeof(keys[0]); ++which) if (!strcmp(key, keys[which])) break;
     if (which == sizeof(keys)/sizeof(keys[0])) { h2o_configurator_errprintf(cmd, node, "unknown PHP runtime option: %s", original_key); return -1; }
     if (c->runtime_seen & (1ULL << which)) { h2o_configurator_errprintf(cmd, node, "duplicate or conflicting PHP runtime aliases for %s", keys[which]); return -1; }
     c->runtime_seen |= 1ULL << which;
+    if (!strcmp(key, "collect-metrics")) {
+        int enabled;
+        if (boolean(cmd, node, &enabled)) return -1;
+        hp_config.collect_metrics = enabled != 0; return 0;
+    }
     if (!strcmp(key, "max-threads") && node->type == YOML_TYPE_SCALAR && !strcasecmp(node->data.scalar, "auto")) {
         hp_config.max_threads_auto = hp_config.max_threads_explicit = true; hp_config.max_threads = 0; return 0;
     }
@@ -161,6 +174,12 @@ static int set_runtime_value(h2o_configurator_command_t *cmd, const char *origin
     else if (!strcmp(key, "startup-timeout")) { if (!value) goto Range; hp_config.startup_timeout_ms = value; }
     else if (!strcmp(key, "max-idle-time")) hp_config.max_idle_ms = value;
     else {
+        /* Match the runtime's 16 KiB global minimum during validation.
+         * Per-request body and response limits retain their 4 KiB minimum. */
+        if (!strcmp(key, "max-buffered-global") && value < 16384) {
+            h2o_configurator_errprintf(cmd, node, "max-buffered-global must be at least 16384 bytes (got %" PRIu64 ")", value);
+            return -1;
+        }
         if (value < 4096 || value > SIZE_MAX) goto Range;
         if (!strcmp(key, "max-buffered-body")) hp_config.max_buffered_body = (size_t)value;
         else if (!strcmp(key, "max-buffered-response")) hp_config.max_buffered_response = (size_t)value;
@@ -632,7 +651,10 @@ static int on_worker(h2o_configurator_command_t *cmd, h2o_configurator_context_t
 }
 static int on_runtime(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
+    (void)ctx;
     php_configurator_t *c = (void *)cmd->configurator;
+    if (c->runtime_mapping_seen) { h2o_configurator_errprintf(cmd, node, "duplicate php.runtime mapping"); return -1; }
+    c->runtime_mapping_seen = true;
     yoml_t *workers = NULL;
     for (size_t i = 0; i < node->data.mapping.size; ++i) {
         yoml_mapping_element_t *e = node->data.mapping.elements + i;
@@ -644,12 +666,21 @@ static int on_runtime(h2o_configurator_command_t *cmd, h2o_configurator_context_
             workers = e->value;
         } else if (set_runtime_value(cmd, e->key->data.scalar, e->value)) return -1;
     }
-    /* Worker defaults must see every global runtime value, regardless of YAML order. */
-    if (workers) {
-        hp_route_config_t route; hp_route_config_clone(&route, c->vars);
-        int rc = parse_workers(cmd, ctx, workers, &route, false, true); hp_route_config_dispose(&route); return rc;
-    }
+    c->pending_global_workers = workers;
+    c->pending_global_workers_cmd = workers ? cmd : NULL;
     return 0;
+}
+static int finalize_global_workers(php_configurator_t *c, h2o_configurator_context_t *ctx)
+{
+    yoml_t *workers = c->pending_global_workers;
+    if (!workers) return 0;
+    h2o_configurator_command_t *cmd = c->pending_global_workers_cmd;
+    c->pending_global_workers = NULL; c->pending_global_workers_cmd = NULL;
+    /* Global defaults/root/env are final before any host or extension enters.
+     * Keep runtime scalars immediate: file.custom-handler is semi-deferred. */
+    hp_route_config_t route; hp_route_config_clone(&route, c->vars);
+    int rc = parse_workers(cmd, ctx, workers, &route, false, true);
+    hp_route_config_dispose(&route); return rc;
 }
 static int on_php(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
@@ -723,7 +754,7 @@ static int on_php(h2o_configurator_command_t *cmd, h2o_configurator_context_t *c
         }
     }
     hp_h2o_register(ctx->pathconf, &route);
-    if (route.mode == HP_ROUTE_SERVER && route.file_server) h2o_file_register(ctx->pathconf, route.root, NULL, *ctx->mimemap, 0);
+    if (route.mode == HP_ROUTE_SERVER && route.file_server) hp_h2o_register_server_files(ctx->pathconf, &route, *ctx->mimemap);
     rc = 0;
 Done:
     hp_headers_free(seen); hp_route_config_dispose(&route); return rc;
@@ -763,13 +794,15 @@ static void register_automatic(php_configurator_t *c, h2o_pathconf_t *path)
 }
 static int enter_config(h2o_configurator_t *self, h2o_configurator_context_t *ctx, yoml_t *node)
 {
-    (void)ctx; (void)node; php_configurator_t *c = (void *)self;
+    (void)node; php_configurator_t *c = (void *)self;
+    if (ctx->parent && finalize_global_workers(c, ctx)) return -1;
     hp_route_config_clone(c->vars + 1, c->vars); ++c->vars; c->vars->declared = 0; c->vars->specified_options = 0; return 0;
 }
 static int exit_config(h2o_configurator_t *self, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     php_configurator_t *c = (void *)self;
     int rc = 0;
+    if (!ctx->parent && finalize_global_workers(c, ctx)) { rc = -1; goto Done; }
     if (ctx->pathconf && !c->vars->disabled) {
         size_t num_dirs = 0;
         if (node) {
@@ -862,7 +895,7 @@ void h2o_php_register_configurator(void *globalconf)
     const int scalar_all = H2O_CONFIGURATOR_FLAG_ALL_LEVELS | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR;
     const int route = H2O_CONFIGURATOR_FLAG_PATH | H2O_CONFIGURATOR_FLAG_EXTENSION | H2O_CONFIGURATOR_FLAG_DEFERRED;
     h2o_configurator_define_command(&c->super, "php.runtime", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_MAPPING, on_runtime);
-    const char *keys[] = {"php.threads", "php.max-threads", "php.max-wait-time", "php.max-requests", "php.queue-limit", "php.max-buffered-body", "php.max-buffered-response", "php.max-buffered-global", "php.shutdown-timeout", "php.startup-timeout", "php.max-idle-time", "php.num_threads", "php.max_threads", "php.max_wait_time", "php.max_idle_time", "php.max_requests", "php.startup_timeout", "php.shutdown_timeout"};
+    const char *keys[] = {"php.threads", "php.max-threads", "php.max-wait-time", "php.max-requests", "php.queue-limit", "php.max-buffered-body", "php.max-buffered-response", "php.max-buffered-global", "php.shutdown-timeout", "php.startup-timeout", "php.max-idle-time", "php.collect-metrics", "php.num_threads", "php.max_threads", "php.max_wait_time", "php.max_idle_time", "php.max_requests", "php.startup_timeout", "php.shutdown_timeout", "php.collect_metrics"};
     for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); ++i) h2o_configurator_define_command(&c->super, keys[i], scalar_global, on_runtime_scalar);
     h2o_configurator_define_command(&c->super, "php.ini", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_MAPPING, on_ini);
     h2o_configurator_define_command(&c->super, "php_ini", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_MAPPING, on_ini);

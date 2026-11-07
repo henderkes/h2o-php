@@ -6,7 +6,7 @@ exec python3 - "$project_root" "$@" <<'PY'
 import argparse,hashlib,json,os,pathlib,shutil,subprocess,tarfile,time
 root=pathlib.Path(__import__('sys').argv[1]);p=argparse.ArgumentParser()
 p.add_argument('--work',type=pathlib.Path,default=root/'build/distribution')
-p.add_argument('--stage',type=pathlib.Path,help='Stage into a new directory without replacing an earlier artifact')
+p.add_argument('--stage',type=pathlib.Path,help='Stage into a fresh directory without replacing any existing entry; failed validation may leave an incomplete new stage')
 p.add_argument('--cache-prefix',type=pathlib.Path,default=pathlib.Path('/home/m/static-php-cli/buildroot'))
 p.add_argument('--dependency-source',type=pathlib.Path,default=pathlib.Path('/home/m/static-php-cli/source'))
 p.add_argument('--jobs',type=int,default=4);p.add_argument('--build',action='store_true')
@@ -14,8 +14,12 @@ p.add_argument('--skip-php-build',action='store_true');p.add_argument('--manifes
 p.add_argument('--fully-static',action='store_true',help='Require no PT_INTERP or DT_NEEDED; requires matching static libc/toolchain')
 p.add_argument('--libc-prefix',type=pathlib.Path,help='Optional extracted matching GNU libc-static prefix')
 p.add_argument('--functional-evidence',type=pathlib.Path,help='Finite functional result JSON bound to this exact artifact SHA256')
-a=p.parse_args(__import__('sys').argv[2:]);work=a.work.resolve();cache=a.cache_prefix.resolve();php=work/'php-static-gnu';build=work/('h2o-gnu-static' if a.fully_static else 'h2o-gnu');stage=a.stage.resolve() if a.stage else work/('gnu-static-artifact' if a.fully_static else 'gnu-artifact')
+a=p.parse_args(__import__('sys').argv[2:]);work=a.work.resolve();cache=a.cache_prefix.resolve();php=work/'php-static-gnu';build=work/('h2o-gnu-static' if a.fully_static else 'h2o-gnu');stage=a.stage if a.stage else work/('gnu-static-artifact' if a.fully_static else 'gnu-artifact')
+if not stage.is_absolute():stage=pathlib.Path.cwd()/stage
 if not 1<=a.jobs<=32:p.error('--jobs must be 1..32')
+# Check the requested entry itself, including dangling final symlinks. Plan-only
+# invocations do not materialize a stage and may still describe an existing one.
+if (a.build or a.manifest_only) and os.path.lexists(stage):raise SystemExit('Refusing existing stage; choose a new --stage directory: '+str(stage))
 def run(argv,**kw):return subprocess.run([str(x) for x in argv],check=True,**kw)
 def output(argv):return subprocess.check_output([str(x) for x in argv],text=True).strip()
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -50,7 +54,10 @@ if not a.manifest_only:
 binary=build/'h2o-php'
 if not binary.is_file():raise SystemExit('Artifact missing: '+str(binary))
 result=json.loads((php/'result.json').read_text())
-stage.mkdir(parents=True,exist_ok=True);shutil.copy2(binary,stage/'h2o-php')
+# Exclusive creation is authoritative if an entry appeared after the early
+# guard. Validation failures may leave this new stage as incomplete evidence;
+# publishing the package is not claimed to be atomic.
+stage.mkdir(mode=0o700,parents=True,exist_ok=False);shutil.copy2(binary,stage/'h2o-php')
 elf=output(['readelf','-W','-l',binary]);dynamic=run(['readelf','-W','-d',binary],capture_output=True,text=True).stdout
 needed=[]
 for line in dynamic.splitlines():

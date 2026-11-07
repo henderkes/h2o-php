@@ -14,8 +14,9 @@ import unittest
 
 
 BINARY = Path(sys.argv.pop(1) if len(sys.argv) > 1 else "build/release/h2o-php").resolve()
-# H2O uses _SC_NPROCESSORS_ONLN, independently of explicit num-threads.
-CPU_COUNT = os.sysconf("SC_NPROCESSORS_ONLN")
+# Keep omitted worker-count checks independent of host affinity/cgroup policy.
+DEFAULT_CPUS = 2
+DEFAULT_WORKERS = 2 * DEFAULT_CPUS
 
 
 def wait_until(predicate, timeout=5):
@@ -32,7 +33,8 @@ class WorkerServer:
                  fail_once=False, max_requests=0, max_wait="2s"):
         self.temp = tempfile.TemporaryDirectory(prefix="h2o-php-pool-")
         self.base = Path(self.temp.name)
-        self.num = CPU_COUNT if num is None else num
+        self.default_count = num is None
+        self.num = DEFAULT_WORKERS if self.default_count else num
         self.process = None
         self.log = None
         self.worker = self.base / "worker.php"
@@ -109,6 +111,7 @@ hosts:
         self.process = subprocess.Popen(
             [str(BINARY), "-c", str(self.config)],
             stdout=self.log, stderr=subprocess.STDOUT,
+            env={**os.environ, **({"GOMAXPROCS": str(DEFAULT_CPUS)} if self.default_count else {})},
         )
         if wait:
             self.wait_ready()
@@ -184,13 +187,13 @@ class WorkerPoolTest(unittest.TestCase):
         self.addCleanup(server.stop)
         return server.start()
 
-    def test_default_count_matches_h2o_with_scalar_and_mapping(self):
+    def test_default_count_is_twice_cpu_budget_with_scalar_and_mapping(self):
         for scalar in (True, False):
             with self.subTest(scalar=scalar):
                 server = self.server(num=None, scalar=scalar)
-                self.assertEqual(len(server.boots()), CPU_COUNT)
-                self.assertEqual(server.metrics()["ready_workers"], CPU_COUNT)
-                self.assertEqual(server.metrics()["threads"], CPU_COUNT + 1)
+                self.assertEqual(len(server.boots()), DEFAULT_WORKERS)
+                self.assertEqual(server.metrics()["ready_workers"], DEFAULT_WORKERS)
+                self.assertEqual(server.metrics()["threads"], DEFAULT_WORKERS + 1)
                 server.stop()
 
     def test_eager_bootstrap_then_prefer_first_available_worker(self):
@@ -253,7 +256,7 @@ class WorkerPoolTest(unittest.TestCase):
             busy = pool.submit(server.json, "/?hold=busy")
             try:
                 server.entered("busy")
-                self.assertEqual(server.request()[0], 504)
+                self.assertEqual(server.request()[0], 503)
                 self.assertFalse(busy.done())
             finally:
                 server.release("busy")
@@ -278,10 +281,12 @@ class WorkerPoolTest(unittest.TestCase):
         server.all_idle()
         self.assertEqual(server.metrics()["threads"], 3)
 
-    def test_parked_bootstrap_failure_can_recover(self):
+    def test_single_bootstrap_failure_recovers_before_ready(self):
         server = self.server(num=2, fail_once=True)
-        self.assertEqual(server.metrics()["failed_workers"], 1)
-        self.assertEqual(server.metrics()["ready_workers"], 1)
+        self.assertEqual(server.metrics()["worker_startup_failures"], 1)
+        self.assertEqual(server.metrics()["failed_workers"], 0)
+        self.assertEqual(server.metrics()["ready_workers"], 2)
+        self.assertEqual(len(server.boots()), 3)
         self.assertEqual(server.request()[0], 200)
         self.assertEqual(server.request("/restart", method="POST")[0], 202)
         server.all_idle()

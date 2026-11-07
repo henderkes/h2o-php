@@ -19,8 +19,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#include <linux/magic.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -58,10 +63,15 @@ typedef struct pcntl_context {
 typedef struct child_record {
     struct child_record *next;
     pid_t pid, pgid;
-    uint64_t owner;
+    uint64_t owner, serial;
     bool orphan, exited;
     int status;
     struct rusage usage;
+#ifdef __linux__
+    int pidfd;
+    dev_t pidfd_device;
+    ino_t pidfd_inode;
+#endif
 } child_record_t;
 #define CHILD_STATUS_LIMIT 4096
 static pthread_mutex_t signal_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -83,6 +93,7 @@ static _Atomic(struct sigaction *) chained_actions[NSIG];
 static atomic_bool broker_stopping;
 static bool broker_started;
 static uint64_t next_context_id = 1;
+static uint64_t next_child_serial = 1;
 static volatile sig_atomic_t fork_child;
 static int wake_signal, restart_wake_signal;
 static _Thread_local pcntl_context_t *local_context;
@@ -90,6 +101,60 @@ static _Thread_local bool context_closing;
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "The signal broker needs lock-free pointer loads");
 
 bool hp_process_is_fork_child(void) { return fork_child != 0; }
+static void free_child(child_record_t *child) {
+    if (!child) return;
+#ifdef __linux__
+    if (child->pidfd >= 0) close(child->pidfd);
+#endif
+    free(child);
+}
+#ifdef __linux__
+/* PIDFD is a Linux waitid kind even when PHP's headers omit its constant.
+ * PIDFS gives distinct opens of the same process a stable inode. Retaining an
+ * anchor prevents inode lifetime/reuse ambiguity after the broker reaps it. */
+#define HP_P_PIDFD ((idtype_t)3)
+#ifndef PID_FS_MAGIC
+#define PID_FS_MAGIC 0x50494446
+#endif
+static void anchor_child(child_record_t *child) {
+    child->pidfd = -1;
+#ifdef SYS_pidfd_open
+    int fd = (int)syscall(SYS_pidfd_open, child->pid, 0);
+    if (fd < 0) return;
+    struct stat identity; struct statfs filesystem;
+    if (fstat(fd, &identity) || fstatfs(fd, &filesystem) || filesystem.f_type != PID_FS_MAGIC) { close(fd); return; }
+    child->pidfd = fd; child->pidfd_device = identity.st_dev; child->pidfd_inode = identity.st_ino;
+#endif
+}
+/* Only called after a nonconsuming kernel wait has validated the pinned FD.
+ * A live fallback never associates a cached record by a recycled numeric PID.
+ * On pre-PIDFS kernels, a separately opened already-reaped PIDFD therefore
+ * retains native ECHILD rather than guessing ownership from an anonymous inode. */
+static child_record_t *pidfd_child(int fd) {
+    struct stat identity; struct statfs filesystem;
+    if (!fstat(fd, &identity) && !fstatfs(fd, &filesystem) && filesystem.f_type == PID_FS_MAGIC) {
+        for (child_record_t *child = children; child; child = child->next)
+            if (child->pidfd >= 0 && child->pidfd_device == identity.st_dev && child->pidfd_inode == identity.st_ino) return child;
+    }
+    char path[64], line[128]; long pid = -1;
+    snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+    FILE *file = fopen(path, "re");
+    if (!file) return NULL;
+    while (fgets(line, sizeof(line), file)) if (sscanf(line, "Pid:\t%ld", &pid) == 1) break;
+    fclose(file);
+    if (pid > 0 && pid <= INT_MAX) for (child_record_t *child = children; child; child = child->next)
+        if (!child->exited && child->pid == (pid_t)pid) return child;
+    return NULL;
+}
+static int kernel_waitid(idtype_t kind, id_t id, siginfo_t *info, int options, struct rusage *usage) {
+#ifdef SYS_waitid
+    return (int)syscall(SYS_waitid, kind, id, info, options, usage);
+#else
+    (void)usage;
+    return waitid(kind, id, info, options);
+#endif
+}
+#endif
 static void wake_handler(int sig) { (void)sig; }
 static pid_t current_tid(void) {
 #ifdef SYS_gettid
@@ -160,7 +225,7 @@ static void reap_orphans(void) {
             if (reaped == child->pid) child->exited = true;
         }
         if ((child->orphan && child->exited) || (reaped < 0 && errno == ECHILD)) {
-            *link = child->next; free(child);
+            *link = child->next; free_child(child);
         } else link = &child->next;
     }
     pthread_mutex_unlock(&signal_lock);
@@ -246,6 +311,7 @@ void hp_process_stop(void) {
     atomic_store(&broker_stopping, true);
     signal_event_t end = {0}; (void)write(signal_pipe[1], &end, sizeof(end));
     pthread_join(broker_thread, NULL);
+    while (children) { child_record_t *child = children; children = child->next; free_child(child); }
     for (int sig = 1; sig < NSIG; ++sig) if (installed_actions[sig]) {
         sigaction(sig, atomic_load_explicit(&chained_actions[sig], memory_order_acquire), NULL); installed_actions[sig] = false;
     }
@@ -437,6 +503,9 @@ static PHP_FUNCTION(hp_fork) {
     if (!local_context) { errno = EINVAL; RETURN_LONG(-1); }
     child_record_t *record = calloc(1, sizeof(*record));
     if (!record) { local_context->globals->last_error = ENOMEM; RETURN_LONG(-1); }
+#ifdef __linux__
+    record->pidfd = -1;
+#endif
     if (hp_runtime_fork_prepare(hp_sapi_worker_token(), 2000)) { free(record); local_context->globals->last_error = EAGAIN; RETURN_LONG(-1); }
     if (hp_sapi_fork_prepare(2000)) {
         hp_runtime_fork_parent(); free(record); local_context->globals->last_error = EAGAIN; RETURN_LONG(-1);
@@ -452,7 +521,7 @@ static PHP_FUNCTION(hp_fork) {
         if ((*link)->exited) evict = link;
     }
     if (recorded >= CHILD_STATUS_LIMIT) {
-        if (evict) { child_record_t *old = *evict; *evict = old->next; free(old); }
+        if (evict) { child_record_t *old = *evict; *evict = old->next; free_child(old); }
         else {
             pthread_mutex_unlock(&signal_lock);
             hp_host_fds_fork_parent(); hp_sapi_fork_parent(); hp_runtime_fork_parent(); free(record);
@@ -468,6 +537,13 @@ static PHP_FUNCTION(hp_fork) {
         if (signal_pipe[1] >= 0) close(signal_pipe[1]);
         signal_pipe[0] = signal_pipe[1] = -1; broker_started = false;
         contexts = local_context; local_context->next = NULL; local_context->count = 0;
+        /* These anchors belong to the discarded host graph, not PHP streams.
+         * signal_lock protects their descriptor lifetime across this fork.
+         * Explicit close avoids taking the host-FD gate under signal_lock. */
+#ifdef __linux__
+        for (child_record_t *child = children; child; child = child->next)
+            if (child->pidfd >= 0) close(child->pidfd);
+#endif
         children = NULL;
         for (int sig = 1; sig < NSIG; ++sig) if (installed_actions[sig]) {
             struct sigaction action = {0}; sigemptyset(&action.sa_mask);
@@ -482,7 +558,11 @@ static PHP_FUNCTION(hp_fork) {
     }
     if (Z_TYPE_P(return_value) == IS_LONG && Z_LVAL_P(return_value) > 0) {
         record->pid = (pid_t)Z_LVAL_P(return_value); record->owner = local_context->id;
+        record->serial = next_child_serial++;
         record->pgid = getpgrp();
+#ifdef __linux__
+        anchor_child(record);
+#endif
         record->next = children; children = record; record = NULL;
     }
     pthread_mutex_unlock(&signal_lock);
@@ -498,6 +578,15 @@ static bool child_matches(child_record_t *child, pid_t selector) {
 static pid_t wait_owned(pid_t selector, int *status, int options, struct rusage *usage) {
     pcntl_context_t *c = local_context;
     if (!c) { errno = ECHILD; return -1; }
+    /* Validate even cached/no-match waits without consuming another context's
+     * child: the serving process cannot be its own child. */
+    int validation_status = 0;
+    if (waitpid(getpid(), &validation_status, options | WNOHANG) < 0 && errno != ECHILD) return -1;
+#if defined(__WCLONE) && defined(__WALL)
+    /* Every tracked child is an ordinary SIGCHLD fork. A clone-only selection
+     * matches none; retain both live records and broker-cached exit status. */
+    if ((options & __WCLONE) && !(options & __WALL)) { errno = ECHILD; return -1; }
+#endif
     for (;;) {
         pthread_mutex_lock(&signal_lock);
         bool found = false;
@@ -508,10 +597,10 @@ static pid_t wait_owned(pid_t selector, int *status, int options, struct rusage 
             if (child->exited) { pid = child->pid; *status = child->status; if (usage) *usage = child->usage; }
             else pid = usage ? wait4(child->pid, status, options | WNOHANG, usage) : waitpid(child->pid, status, options | WNOHANG);
             if (pid > 0) {
-                if (child->exited || WIFEXITED(*status) || WIFSIGNALED(*status)) { *link = child->next; free(child); }
+                if (child->exited || WIFEXITED(*status) || WIFSIGNALED(*status)) { *link = child->next; free_child(child); }
                 pthread_mutex_unlock(&signal_lock); return pid;
             }
-            if (pid < 0 && errno == ECHILD) { *link = child->next; free(child); continue; }
+            if (pid < 0 && errno == ECHILD) { *link = child->next; free_child(child); continue; }
             if (pid < 0) { int saved = errno; pthread_mutex_unlock(&signal_lock); errno = saved; return -1; }
             found = true; link = &child->next;
         }
@@ -545,16 +634,19 @@ static PHP_FUNCTION(hp_waitpid) {
     ZEND_PARSE_PARAMETERS_START(2, 4)
         Z_PARAM_LONG(pid) Z_PARAM_ZVAL(status_value) Z_PARAM_OPTIONAL Z_PARAM_LONG(options) Z_PARAM_ZVAL(usage_value)
     ZEND_PARSE_PARAMETERS_END();
-    if (pid > 0) {
-        bool owned = false;
+    pid_t selector = (pid_t)pid;
+    if (selector > 0) {
+        bool tracked = false;
         pthread_mutex_lock(&signal_lock);
         for (child_record_t *child = children; child; child = child->next)
-            if (child->pid == (pid_t)pid && local_context && child->owner == local_context->id) { owned = true; break; }
+            if (child->pid == selector) { tracked = true; break; }
         pthread_mutex_unlock(&signal_lock);
-        if (!owned) { native_waitpid(INTERNAL_FUNCTION_PARAM_PASSTHRU); return; }
+        /* Only untracked children (e.g. proc_open) use the process-wide native
+         * wait. A known PID must keep its PHP context's ownership filter. */
+        if (!tracked) { native_waitpid(INTERNAL_FUNCTION_PARAM_PASSTHRU); return; }
     }
     int status = (int)zval_get_long(status_value); struct rusage usage = {0};
-    pid_t result = wait_owned((pid_t)pid, &status, (int)options, usage_value ? &usage : NULL);
+    pid_t result = wait_owned(selector, &status, (int)options, usage_value ? &usage : NULL);
     if (result < 0 && local_context) local_context->globals->last_error = errno;
     ZEND_TRY_ASSIGN_REF_LONG(status_value, status); if (result > 0) fill_usage(usage_value, &usage);
     RETURN_LONG(result);
@@ -609,6 +701,73 @@ static void child_exit_info(const child_record_t *child, siginfo_t *info) {
         info->si_stime = child->usage.ru_stime.tv_sec * ticks + child->usage.ru_stime.tv_usec * ticks / 1000000;
     }
 }
+#ifdef __linux__
+static int wait_pidfd(int fd, int options, siginfo_t *info, struct rusage *usage) {
+    int descriptor_flags = fcntl(fd, F_GETFL);
+    if (descriptor_flags < 0) return -1;
+    pthread_mutex_lock(&signal_lock);
+    /* Validate the actual syscall-width flags and descriptor without consuming
+     * status. ECHILD is expected for a valid anchor already reaped by the broker.
+     * Do not use these added validation flags for the caller's actual wait. */
+    siginfo_t probe = {0};
+    int valid = kernel_waitid(HP_P_PIDFD, (id_t)fd, &probe, options | WNOHANG | WNOWAIT, NULL);
+    if (valid < 0 && errno != ECHILD) {
+        int saved = errno; pthread_mutex_unlock(&signal_lock); errno = saved; return -1;
+    }
+    child_record_t *selected = pidfd_child(fd);
+    if (!selected) {
+        pthread_mutex_unlock(&signal_lock);
+        /* Legitimate untracked children, including proc_open, retain the real
+         * kernel's blocking, O_NONBLOCK, flag and error behavior on the pinned FD. */
+        return kernel_waitid(HP_P_PIDFD, (id_t)fd, info, options, usage);
+    }
+    pcntl_context_t *c = local_context;
+    if (!c || selected->owner != c->id || selected->orphan) {
+        pthread_mutex_unlock(&signal_lock); errno = ECHILD; return -1;
+    }
+#if defined(__WCLONE) && defined(__WALL)
+    if ((options & __WCLONE) && !(options & __WALL)) {
+        pthread_mutex_unlock(&signal_lock); errno = ECHILD; return -1;
+    }
+#endif
+    uint64_t serial = selected->serial;
+    for (;;) {
+        child_record_t **link = &children;
+        while (*link && (*link)->serial != serial) link = &(*link)->next;
+        child_record_t *child = *link;
+        if (!child || child->owner != c->id || child->orphan) {
+            pthread_mutex_unlock(&signal_lock); errno = ECHILD; return -1;
+        }
+        int result;
+        if (child->exited) {
+            if (!(options & WEXITED)) { pthread_mutex_unlock(&signal_lock); errno = ECHILD; return -1; }
+            child_exit_info(child, info); if (usage) *usage = child->usage; result = 0;
+        } else result = kernel_waitid(HP_P_PIDFD, (id_t)fd, info, options | WNOHANG, usage);
+        if (!result && info->si_pid) {
+            if (!(options & WNOWAIT) && (info->si_code == CLD_EXITED || info->si_code == CLD_KILLED || info->si_code == CLD_DUMPED)) {
+                *link = child->next; free_child(child);
+            }
+            pthread_mutex_unlock(&signal_lock); return 0;
+        }
+        if (result < 0) {
+            int saved = errno;
+            if (saved == ECHILD) { *link = child->next; free_child(child); }
+            pthread_mutex_unlock(&signal_lock); errno = saved; return -1;
+        }
+        pthread_mutex_unlock(&signal_lock);
+        if (options & WNOHANG) return 0;
+        if (descriptor_flags & O_NONBLOCK) { errno = EAGAIN; return -1; }
+        pthread_mutex_lock(&signal_lock);
+        struct timespec until; clock_gettime(CLOCK_MONOTONIC, &until); until.tv_nsec += 100000000;
+        if (until.tv_nsec >= 1000000000) { ++until.tv_sec; until.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&c->changed, &signal_lock, &until);
+        pthread_mutex_unlock(&signal_lock);
+        drain_pending();
+        if (zend_atomic_bool_load(&EG(vm_interrupt))) { errno = EINTR; return -1; }
+        pthread_mutex_lock(&signal_lock);
+    }
+}
+#endif
 static PHP_FUNCTION(hp_waitid) {
     if (fork_child) { native_waitid(INTERNAL_FUNCTION_PARAM_PASSTHRU); return; }
     zend_long kind = P_ALL, id = 0, options = WEXITED; bool id_null = true;
@@ -617,31 +776,72 @@ static PHP_FUNCTION(hp_waitid) {
         Z_PARAM_OPTIONAL Z_PARAM_LONG(kind) Z_PARAM_LONG_OR_NULL(id, id_null)
         Z_PARAM_ZVAL(info_value) Z_PARAM_LONG(options) Z_PARAM_ZVAL(usage_value)
     ZEND_PARSE_PARAMETERS_END();
-    if (kind != P_ALL && kind != P_PID && kind != P_PGID) {
+    idtype_t selected_kind = (idtype_t)kind;
+    pid_t selected_id = (pid_t)(id_t)id;
+    pcntl_context_t *c = local_context;
+    siginfo_t info = {0}; struct rusage usage = {0}; int result = -1;
+#ifdef __linux__
+    if (selected_kind == HP_P_PIDFD) {
+        /* Pin the open file description before inspecting it. Closing/reusing
+         * the caller's numeric FD cannot change the selected process mid-wait. */
+        hp_host_fds_begin();
+        int fd = fcntl((int)(id_t)id, F_DUPFD_CLOEXEC, 0);
+        if (fd >= 0) hp_host_fd_register_locked(fd);
+        int pin_error = errno; hp_host_fds_end(); errno = pin_error;
+        if (fd >= 0) {
+            zend_try {
+                result = wait_pidfd(fd, (int)options, &info, usage_value ? &usage : NULL);
+            } zend_catch {
+                hp_host_fd_close(fd); zend_bailout();
+            } zend_end_try();
+            int saved = errno; hp_host_fd_close(fd); errno = saved;
+        } else {
+            /* Linux validates wait flags before resolving the PIDFD. Preserve
+             * that precedence without ever retrying the caller's reusable FD.
+             * The retained signal pipe is a valid non-PIDFD until PHP stops;
+             * unlike -1, it yields EBADF rather than EINVAL for valid flags. */
+            int saved = errno; siginfo_t probe = {0};
+            pthread_mutex_lock(&signal_lock);
+            if ((int)(id_t)id < 0) {
+                /* Negative PIDFD IDs have native EINVAL semantics, unlike
+                 * fcntl's EBADF. A fixed negative control cannot name an FD. */
+                (void)kernel_waitid(HP_P_PIDFD, (id_t)-1, &probe, (int)options | WNOHANG | WNOWAIT, NULL);
+                saved = errno;
+            } else if (signal_pipe[0] >= 0 && kernel_waitid(HP_P_PIDFD, (id_t)signal_pipe[0], &probe,
+                    (int)options | WNOHANG | WNOWAIT, NULL) < 0 && errno == EINVAL)
+                saved = EINVAL;
+            pthread_mutex_unlock(&signal_lock);
+            errno = saved;
+        }
+        goto Finished;
+    }
+#endif
+    if (selected_kind != P_ALL && selected_kind != P_PID && selected_kind != P_PGID) {
         native_waitid(INTERNAL_FUNCTION_PARAM_PASSTHRU); return;
     }
-    pcntl_context_t *c = local_context;
     if (!c) { errno = ECHILD; RETURN_FALSE; }
-    if (kind == P_PID) {
-        bool owned = false;
+    if (selected_kind == P_PGID && selected_id < 0) {
+        c->globals->last_error = EINVAL; RETURN_FALSE;
+    }
+    if (selected_kind == P_PID) {
+        bool tracked = false;
         pthread_mutex_lock(&signal_lock);
         for (child_record_t *child = children; child; child = child->next)
-            if (child->pid == (pid_t)id && child->owner == c->id) { owned = true; break; }
+            if (child->pid == selected_id) { tracked = true; break; }
         pthread_mutex_unlock(&signal_lock);
-        if (!owned) { native_waitid(INTERNAL_FUNCTION_PARAM_PASSTHRU); return; }
+        if (!tracked) { native_waitid(INTERNAL_FUNCTION_PARAM_PASSTHRU); return; }
     }
     if (!(options & (WEXITED | WSTOPPED | WCONTINUED)) || (options & ~(WEXITED | WSTOPPED | WCONTINUED | WNOHANG | WNOWAIT))) {
         c->globals->last_error = EINVAL; RETURN_FALSE;
     }
-    siginfo_t info = {0}; struct rusage usage = {0}; int result = -1;
     for (;;) {
         pthread_mutex_lock(&signal_lock);
         bool found = false;
         for (child_record_t **link = &children; *link;) {
             child_record_t *child = *link;
             if (child->owner != c->id || child->orphan ||
-                (kind == P_PID && child->pid != (pid_t)id) ||
-                (kind == P_PGID && !child_matches(child, id ? -(pid_t)id : 0)) ||
+                (selected_kind == P_PID && child->pid != selected_id) ||
+                (selected_kind == P_PGID && !child_matches(child, selected_id ? (pid_t)-(int64_t)selected_id : 0)) ||
                 (child->exited && !(options & WEXITED))) { link = &child->next; continue; }
             if (child->exited) { child_exit_info(child, &info); usage = child->usage; result = 0; }
             else {
@@ -652,11 +852,11 @@ static PHP_FUNCTION(hp_waitid) {
 #endif
             }
             if (!result && info.si_pid) {
-                if (!(options & WNOWAIT) && (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED)) { *link = child->next; free(child); }
+                if (!(options & WNOWAIT) && (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED)) { *link = child->next; free_child(child); }
                 pthread_mutex_unlock(&signal_lock);
                 goto Finished;
             }
-            if (result < 0 && errno == ECHILD) { *link = child->next; free(child); continue; }
+            if (result < 0 && errno == ECHILD) { *link = child->next; free_child(child); continue; }
             if (result < 0) { int saved = errno; pthread_mutex_unlock(&signal_lock); errno = saved; goto Finished; }
             found = true; link = &child->next;
         }
@@ -672,7 +872,11 @@ static PHP_FUNCTION(hp_waitid) {
         if (zend_atomic_bool_load(&EG(vm_interrupt))) { result = -1; errno = EINTR; break; }
     }
 Finished:
-    if (result < 0) { c->globals->last_error = errno; RETURN_FALSE; }
+    if (result < 0) {
+        pcntl_globals_t *globals = c ? c->globals : get_globals();
+        if (globals) globals->last_error = errno;
+        RETURN_FALSE;
+    }
     /* Native waitid includes the SIGCHLD fields even for a WNOHANG miss. */
     if (!info.si_signo) info.si_signo = SIGCHLD;
     fill_siginfo(info_value, &info); fill_usage(usage_value, &usage); RETURN_TRUE;

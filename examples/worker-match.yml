@@ -10,9 +10,9 @@ hosts:
   "localhost:18109":
     paths:
       "/":
-        file.dir: /home/m/h2o-php/examples/smoke
+        file.dir: examples/smoke
         php.worker:
-          file: /home/m/h2o-php/examples/smoke/worker.php
+          file: examples/smoke/worker.php
           num: 1
           startup-timeout: 5s
           match:

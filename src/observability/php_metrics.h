@@ -25,7 +25,7 @@ typedef enum {
  * lifetime. No collector/label is destroyed while callbacks can still refer to
  * it. Start is supported once per process, including a failed startup. */
 hp_php_metric_worker_t *hp_php_metrics_worker_register(const char *label);
-int hp_php_metrics_start(unsigned initial_total);
+int hp_php_metrics_start(unsigned initial_total, bool collect);
 void hp_php_metrics_shutdown(void);
 void hp_php_metrics_opcache_available(bool available);
 bool hp_php_metrics_owner_process(void);
@@ -49,7 +49,8 @@ int64_t hp_php_metrics_queue_depth(hp_php_metric_worker_t *); /* NULL: regular *
 void hp_php_metrics_opcache_restart(int reason);
 
 /* Caller owns *output and frees it only after its HTTP adapter has copied the
- * bytes. Returns -1 with *output=NULL on failure/inactive/child. Atomic values
+ * bytes. Disabled collection returns an empty exposition successfully.
+ * Returns -1 with *output=NULL on failure/inactive/child. Atomic values
  * are individually sampled; this does not promise a transactional scrape. */
 int hp_php_metrics_prometheus(char **output, size_t *length);
 

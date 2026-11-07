@@ -32,6 +32,7 @@ typedef struct hp_route_config {
     unsigned specified_options;
 } hp_route_config_t;
 void hp_h2o_register(h2o_pathconf_t *, const hp_route_config_t *);
+void hp_h2o_register_server_files(h2o_pathconf_t *, const hp_route_config_t *, h2o_mimemap_t *);
 int hp_h2o_is_worker(h2o_handler_t *);
 void hp_h2o_worker_add_static_root(h2o_handler_t *, const char *);
 void hp_route_match_release(hp_route_match_t *);

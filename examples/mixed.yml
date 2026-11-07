@@ -5,7 +5,7 @@ php.runtime:
   threads: 2
   max-threads: 8
   request-timeout: 5s
-php.root: /home/m/h2o-php/examples/smoke
+php.root: examples/smoke
 php.ini:
   output_buffering: 0
 hosts:
@@ -13,15 +13,15 @@ hosts:
     paths:
       "/worker":
         php.worker:
-          file: /home/m/h2o-php/examples/smoke/worker.php
+          file: worker.php
           num: 1
       "/mounted": {}
       "/upstream":
-        file.file: /home/m/h2o-php/examples/smoke/static.txt
+        file.file: examples/smoke/static.txt
       "/proxy":
         proxy.reverse.url: http://127.0.0.1:18107/upstream
       "/":
-        file.dir: /home/m/h2o-php/examples/smoke
+        file.dir: examples/smoke
         file.index: [index.php, index.html]
         file.custom-handler:
           extension: .php

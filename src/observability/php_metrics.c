@@ -32,7 +32,7 @@ struct hp_php_metric_worker {
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static hp_php_metric_worker_t *workers, **workers_tail = &workers;
 static _Atomic bool active, opcache_available;
-static bool started;
+static bool started, collect_metrics;
 static _Atomic pid_t owner_pid;
 static locale_t numeric_locale;
 static _Atomic int64_t total_threads, busy_threads, queue_depth;
@@ -95,11 +95,18 @@ hp_php_metric_worker_t *hp_php_metrics_worker_register(const char *label)
     pthread_mutex_unlock(&registry_mutex);
     return w;
 }
-int hp_php_metrics_start(unsigned initial_total)
+int hp_php_metrics_start(unsigned initial_total, bool collect)
 {
     if (!hp_php_metrics_owner_process()) { errno = EPERM; return -1; }
     pthread_mutex_lock(&registry_mutex);
     if (started) { pthread_mutex_unlock(&registry_mutex); errno = EALREADY; return -1; }
+    if (!collect) {
+        /* Collection policy is fixed before PHP threads start. Keep mandatory
+         * admission, budget and JSON accounting outside this collector. */
+        atomic_store_explicit(&owner_pid, getpid(), memory_order_relaxed);
+        started = true;
+        pthread_mutex_unlock(&registry_mutex); return 0;
+    }
     numeric_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
     if (!numeric_locale) { pthread_mutex_unlock(&registry_mutex); return -1; }
     /* Do not hide an inherited lock inside a non-lock-free atomic on another
@@ -110,7 +117,7 @@ int hp_php_metrics_start(unsigned initial_total)
     }
     atomic_store_explicit(&owner_pid, getpid(), memory_order_relaxed);
     atomic_store_explicit(&total_threads, initial_total, memory_order_relaxed);
-    started = true;
+    started = collect_metrics = true;
     atomic_store_explicit(&active, true, memory_order_release);
     pthread_mutex_unlock(&registry_mutex);
     return 0;
@@ -297,6 +304,11 @@ int hp_php_metrics_prometheus(char **output, size_t *length)
     *output = NULL; *length = 0;
     if (!hp_php_metrics_owner_process()) { errno = EPERM; return -1; }
     pthread_mutex_lock(&registry_mutex);
+    if (started && !collect_metrics) {
+        /* Do not advertise synthetic zero families when collection is OFF. */
+        *output = strdup("");
+        pthread_mutex_unlock(&registry_mutex); return *output ? 0 : -1;
+    }
     if (!atomic_load_explicit(&active, memory_order_acquire) || !numeric_locale) {
         pthread_mutex_unlock(&registry_mutex); errno = ENOENT; return -1;
     }

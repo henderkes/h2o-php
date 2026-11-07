@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 8a25b1b..e6814f6 100644
+index 8a25b1bc9..5086b73a0 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -128,7 +128,7 @@ IF(OPENSSL_VERSION VERSION_EQUAL "1.1.0" AND OPENSSL_VERSION STRLESS "1.1.0g")
@@ -24,8 +24,229 @@ index 8a25b1b..e6814f6 100644
      LIST(APPEND LIB_SOURCE_FILES
           ${CMAKE_CURRENT_BINARY_DIR}/picotls-probes.h
           ${CMAKE_CURRENT_BINARY_DIR}/quicly-probes.h
+@@ -527,6 +527,7 @@ SET(UNIT_TEST_SOURCE_FILES
+     t/00unit/lib/common/httpclient.c
+     t/00unit/lib/common/multithread.c
+     t/00unit/lib/common/serverutil.c
++    t/00unit/lib/http1.c
+     t/00unit/lib/common/socket.c
+     t/00unit/lib/common/socketpool.c
+     t/00unit/lib/common/string.c
+@@ -558,6 +559,7 @@ SET(UNIT_TEST_SOURCE_FILES
+     t/00unit/issues/percent-encode-zero-byte.c)
+ 
+ LIST(REMOVE_ITEM UNIT_TEST_SOURCE_FILES
++    lib/http1.c
+     lib/common/balancer/least_conn.c
+     lib/common/balancer/roundrobin.c
+     lib/common/cache.c
+diff --git a/deps/neverbleed/neverbleed.c b/deps/neverbleed/neverbleed.c
+index 9951ac3e9..e3afbc780 100644
+--- a/deps/neverbleed/neverbleed.c
++++ b/deps/neverbleed/neverbleed.c
+@@ -55,6 +55,9 @@
+ 
+ #include <openssl/opensslconf.h>
+ #include <openssl/opensslv.h>
++#if OPENSSL_VERSION_NUMBER >= 0x40000000L
++#define NEVERBLEED_USE_PROVIDER 1
++#endif
+ 
+ #if defined(LIBRESSL_VERSION_NUMBER) ? LIBRESSL_VERSION_NUMBER >= 0x3050000fL : OPENSSL_VERSION_NUMBER >= 0x1010000fL
+ /* RSA_METHOD is opaque, so RSA_meth* are used. */
+@@ -145,6 +148,12 @@ struct st_neverbleed_rsa_exdata_t {
+     size_t key_index;
+ };
+ 
++#if NEVERBLEED_USE_PROVIDER
++static EVP_PKEY *nbp_create_rsa(neverbleed_t *, size_t, const char *, const char *);
++static EVP_PKEY *nbp_create_ec(neverbleed_t *, size_t, int, const void *, size_t);
++static struct st_neverbleed_rsa_exdata_t *nbp_exdata(EVP_PKEY *);
++#endif
++
+ struct st_neverbleed_thread_data_t {
+     pid_t self_pid;
+     int fd;
+@@ -903,6 +912,9 @@ static int sign_stub(neverbleed_iobuf_t *buf)
+ 
+ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebuf, const char *nbuf)
+ {
++#if NEVERBLEED_USE_PROVIDER
++    return nbp_create_rsa(nb, key_index, ebuf, nbuf);
++#else
+     struct st_neverbleed_rsa_exdata_t *exdata;
+     RSA *rsa;
+     EVP_PKEY *pkey;
+@@ -935,6 +947,7 @@ static EVP_PKEY *create_pkey(neverbleed_t *nb, size_t key_index, const char *ebu
+     RSA_free(rsa);
+ 
+     return pkey;
++#endif
+ }
+ 
+ #ifdef NEVERBLEED_ECDSA
+@@ -1050,6 +1063,9 @@ static int ecdsa_sign_proxy(int type, const unsigned char *m, int m_len, unsigne
+ 
+ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve_name, const void *pubkey, size_t pubkey_len)
+ {
++#if NEVERBLEED_USE_PROVIDER
++    return nbp_create_ec(nb, key_index, curve_name, pubkey, pubkey_len);
++#else
+     struct st_neverbleed_rsa_exdata_t *exdata;
+     EC_KEY *ec_key;
+     EC_GROUP *ec_group;
+@@ -1090,6 +1106,7 @@ static EVP_PKEY *ecdsa_create_pkey(neverbleed_t *nb, size_t key_index, int curve
+     EC_KEY_free(ec_key);
+ 
+     return pkey;
++#endif
+ }
+ 
+ #endif
+@@ -1300,6 +1317,11 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const
+     struct st_neverbleed_thread_data_t *thdata;
+     const char *cmd = "digestsign";
+ 
++#if NEVERBLEED_USE_PROVIDER
++    exdata = nbp_exdata(pkey);
++    if (!exdata) dief("invalid neverbleed provider key");
++    if (EVP_PKEY_is_a(pkey, "RSA")) cmd = "digestsign-rsa";
++#else
+     /* obtain reference */
+     switch (EVP_PKEY_base_id(pkey)) {
+     case EVP_PKEY_RSA: {
+@@ -1318,6 +1340,8 @@ void neverbleed_start_digestsign(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const
+         break;
+     }
+ 
++#endif
++
+     *buf = (neverbleed_iobuf_t){NULL};
+     iobuf_push_str(buf, cmd);
+     iobuf_push_num(buf, exdata->key_index);
+@@ -1402,6 +1426,10 @@ void neverbleed_start_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const voi
+     struct st_neverbleed_rsa_exdata_t *exdata;
+     struct st_neverbleed_thread_data_t *thdata;
+ 
++#if NEVERBLEED_USE_PROVIDER
++    exdata = nbp_exdata(pkey);
++    if (!exdata) dief("invalid neverbleed provider key");
++#else
+     {
+         RSA *rsa = EVP_PKEY_get1_RSA(pkey); /* get0 is available not available in OpenSSL 1.0.2 */
+         assert(rsa != NULL);
+@@ -1409,6 +1437,8 @@ void neverbleed_start_decrypt(neverbleed_iobuf_t *buf, EVP_PKEY *pkey, const voi
+         RSA_free(rsa);
+     }
+ 
++#endif
++
+     *buf = (neverbleed_iobuf_t){NULL};
+     iobuf_push_str(buf, "decrypt");
+     iobuf_push_num(buf, exdata->key_index);
+@@ -1748,6 +1778,10 @@ Redo:
+     _exit(0);
+ }
+ 
++#if NEVERBLEED_USE_PROVIDER
++#include "../../../../cmake/compat/neverbleed-provider.h"
++#endif
++
+ static int del_pkey_stub(neverbleed_iobuf_t *buf)
+ {
+     size_t key_index;
+@@ -1997,6 +2031,12 @@ static void *daemon_conn_thread(void *_sock_fd)
+         } else if (strcmp(cmd, "decrypt") == 0) {
+             if (offload_start(decrypt_stub, buf) != 0)
+                 break;
++#if NEVERBLEED_USE_PROVIDER
++        } else if (strcmp(cmd, "provider_sign") == 0) {
++            if (nbp_private_stub(buf, 0) != 0) break;
++        } else if (strcmp(cmd, "provider_decrypt") == 0) {
++            if (nbp_private_stub(buf, 1) != 0) break;
++#endif
+         } else if (strcmp(cmd, "load_key") == 0) {
+             if (load_key_stub(buf) != 0)
+                 break;
+@@ -2100,7 +2140,7 @@ __attribute__((noreturn)) static void daemon_main(int listen_fd, int close_notif
+         ENGINE_load_qat();
+         bssl_qat_set_default_string("RSA");
+         use_offload = ENGINE_QAT_PTR_GET() != NULL;
+-#elif USE_OFFLOAD && !defined(OPENSSL_IS_BORINGSSL)
++#elif USE_OFFLOAD && !defined(OPENSSL_IS_BORINGSSL) && !NEVERBLEED_USE_PROVIDER
+         ENGINE *qat = ENGINE_by_id("qatengine");
+         if (qat != NULL && ENGINE_init(qat)) {
+             if (!ENGINE_set_default_RSA(qat))
+@@ -2224,7 +2264,7 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
+     close(pipe_fds[0]);
+     pipe_fds[0] = -1;
+ 
+-#if defined(OPENSSL_IS_BORINGSSL)
++#if defined(OPENSSL_IS_BORINGSSL) || NEVERBLEED_USE_PROVIDER
+     nb->engine = NULL;
+ #else
+     { /* setup engine */
+@@ -2276,6 +2316,9 @@ int neverbleed_init(neverbleed_t *nb, char *errbuf)
+ 
+     /* setup thread key */
+     pthread_key_create(&nb->thread_key, dispose_thread_data);
++#if NEVERBLEED_USE_PROVIDER
++    if (!nbp_init()) { snprintf(errbuf, NEVERBLEED_ERRBUF_SIZE, "failed to initialize neverbleed provider"); goto Fail; }
++#endif
+ 
+     free(tempdir);
+     return 0;
+@@ -2290,10 +2333,12 @@ Fail:
+     }
+     if (listen_fd != -1)
+         close(listen_fd);
++#if !NEVERBLEED_USE_PROVIDER
+     if (nb->engine != NULL) {
+         ENGINE_free(nb->engine);
+         nb->engine = NULL;
+     }
++#endif
+     return -1;
+ }
+ 
+diff --git a/deps/picotls/lib/openssl.c b/deps/picotls/lib/openssl.c
+index 7d9109c91..27d2934f2 100644
+--- a/deps/picotls/lib/openssl.c
++++ b/deps/picotls/lib/openssl.c
+@@ -150,8 +150,22 @@ const ptls_openssl_signature_scheme_t *ptls_openssl_lookup_signature_schemes(EVP
+         schemes = rsa_signature_schemes;
+         break;
+     case EVP_PKEY_EC: {
++        int curve;
++#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER) && !defined(OPENSSL_IS_BORINGSSL)
++        /* Provider-backed private keys can deliberately prohibit exporting a
++         * legacy EC_KEY. Reading the public group parameter needs no export. */
++        char group[80]; size_t group_length;
++        if (!EVP_PKEY_get_group_name(key, group, sizeof(group), &group_length))
++            break;
++        curve = OBJ_txt2nid(group);
++#else
+         EC_KEY *eckey = EVP_PKEY_get1_EC_KEY(key);
+-        switch (EC_GROUP_get_curve_name(EC_KEY_get0_group(eckey))) {
++        if (eckey == NULL)
++            break;
++        curve = EC_GROUP_get_curve_name(EC_KEY_get0_group(eckey));
++        EC_KEY_free(eckey);
++#endif
++        switch (curve) {
+         case NID_X9_62_prime256v1:
+             schemes = secp256r1_signature_schemes;
+             break;
+@@ -168,7 +182,6 @@ const ptls_openssl_signature_scheme_t *ptls_openssl_lookup_signature_schemes(EVP
+         default:
+             break;
+         }
+-        EC_KEY_free(eckey);
+     } break;
+ #if PTLS_OPENSSL_HAVE_ED25519
+     case EVP_PKEY_ED25519:
 diff --git a/include/h2o.h b/include/h2o.h
-index 48333ec..6ea96fe 100644
+index 48333ec67..eef5eba8a 100644
 --- a/include/h2o.h
 +++ b/include/h2o.h
 @@ -120,6 +120,11 @@ typedef struct st_h2o_handler_t {
@@ -76,8 +297,141 @@ index 48333ec..6ea96fe 100644
       */
      h2o_iovec_t entity;
      /**
+@@ -1324,6 +1338,14 @@ struct st_h2o_req_t {
+      * If different of SIZE_MAX, the numeric value of the received content-length: header
+      */
+     size_t content_length;
++#ifdef H2O_WITH_PHP
++    /**
++     * First validated Content-Length field, copied into the request pool.
++     * NULL means absent (including chunked framing); keep separate from
++     * headers because proxy dispatch synthesizes its own framing field.
++     */
++    h2o_iovec_t content_length_header;
++#endif
+     /**
+      * timestamp when the request was processed
+      */
+@@ -2220,6 +2242,14 @@ enum {
+ 
+ typedef struct st_h2o_file_handler_t h2o_file_handler_t;
+ 
++/** Optional per-handler check of a selected static file and its retained fd.
++ * A zero return denies the response before file-derived headers or bytes.
++ * Dynamic MIME delegation is not checked. The handler owns data until disposal.
++ */
++typedef int (*h2o_file_static_access_check_cb)(const char *path, int fd, void *data);
++void h2o_file_set_static_access_check(h2o_file_handler_t *handler, h2o_file_static_access_check_cb check,
++                                    void *data, void (*dispose)(void *));
++
+ extern const char **h2o_file_default_index_files;
+ 
+ /**
+diff --git a/include/h2o/hpack.h b/include/h2o/hpack.h
+index 9e775ecc3..ed05c1480 100644
+--- a/include/h2o/hpack.h
++++ b/include/h2o/hpack.h
+@@ -100,6 +100,17 @@ int h2o_hpack_parse_request(h2o_mem_pool_t *pool, h2o_hpack_decode_header_cb dec
+                             const h2o_url_scheme_t **scheme, h2o_iovec_t *authority, h2o_iovec_t *path, h2o_iovec_t *protocol,
+                             h2o_headers_t *headers, int *pseudo_header_exists_map, size_t *content_length, h2o_iovec_t *expect,
+                             h2o_iovec_t *datagram_flow_id, const uint8_t *src, size_t len, const char **err_desc);
++/**
++ * Request parser with optional original Content-Length output. On success,
++ * raw_content_length receives a pool-owned copy of the first validated field,
++ * preserving its lexical value. It is cleared on entry and remains absent on
++ * errors or when no field is present. Generic headers and framing are unchanged.
++ */
++int h2o_hpack_parse_request_ex(h2o_mem_pool_t *pool, h2o_hpack_decode_header_cb decode_cb, void *decode_ctx, h2o_iovec_t *method,
++                               const h2o_url_scheme_t **scheme, h2o_iovec_t *authority, h2o_iovec_t *path, h2o_iovec_t *protocol,
++                               h2o_headers_t *headers, int *pseudo_header_exists_map, size_t *content_length, h2o_iovec_t *expect,
++                               h2o_iovec_t *datagram_flow_id, const uint8_t *src, size_t len, const char **err_desc,
++                               h2o_iovec_t *raw_content_length);
+ /**
+  * Response parser that uses given callback as the decoder.
+  */
+diff --git a/include/h2o/http1.h b/include/h2o/http1.h
+index 03768a639..edcab239e 100644
+--- a/include/h2o/http1.h
++++ b/include/h2o/http1.h
+@@ -30,6 +30,54 @@ typedef void (*h2o_http1_upgrade_cb)(void *user_data, h2o_socket_t *sock, size_t
+ 
+ void h2o_http1_accept(h2o_accept_ctx_t *ctx, h2o_socket_t *sock, struct timeval connected_at);
+ void h2o_http1_upgrade(h2o_req_t *req, h2o_iovec_t *inbufs, size_t inbufcnt, h2o_http1_upgrade_cb on_complete, void *user_data);
++/* Private native-host extension: detach a whole decoded Content-Length
++ * fragment's heap buffer, or return NULL without changing the request. This
++ * does not imply EOF; the caller retains the actual write_req EOF flag and
++ * acknowledges a nonfinal fragment with proceed_req as usual. The caller must
++ * dispose the returned allocation on this owning loop; it is no longer owned
++ * by the connection or its request pool.
++ * TLS, chunked, tunnels and pipelined input retain the ordinary copy path. */
++h2o_buffer_t *h2o_http1_take_request_body(h2o_req_t *req);
++/* Return an exhausted nonfinal take to its still-live, paused request on the
++ * owning loop, before proceed_req. On success the existing socket input owns
++ * the warm allocation and *body is NULL. On refusal the caller still owns it.
++ * The caller must separately ensure the request pool is live; an external
++ * native request reference alone does not retain that pool. */
++int h2o_http1_restore_request_body(h2o_req_t *req, h2o_buffer_t **body);
++
++
++/* Private native-host body writer. Only native Linux epoll, plain H1, completed
++ * request input and an unfiltered, header-flushed response can acquire a lease.
++ * Acquire/return run on the owning loop. The opaque token has a caller reference
++ * in addition to H1's reference; release the caller reference after return says
++ * detached. The token remains valid after an idle abort destroys the request.
++ * No worker API accesses request/connection/socket-wrapper storage. */
++typedef struct st_h2o_http1_body_lease_t h2o_http1_body_lease_t;
++typedef struct st_h2o_http1_body_lease_result_t {
++    size_t payload_bytes, wire_bytes;
++    int error;
++} h2o_http1_body_lease_result_t;
++/* Optional cold-start resource discovery. Call once before spawning workers
++ * or pinning loops; absent/unsupported discovery keeps unrestricted sends. */
++void h2o_http1_body_lease_startup(void);
++size_t h2o_http1_body_lease_charge(void);
++h2o_http1_body_lease_t *h2o_http1_body_lease_acquire(h2o_req_t *req, void (*notify)(void *), void *data);
++/* Worker only: 0 = complete, 1 = refused before any I/O, -1 = terminal failure.
++ * deadline_ns is absolute CLOCK_MONOTONIC (UINT64_MAX disables that deadline).
++ * Payload and framing are fully consumed before return; no caller bytes survive
++ * the call. A terminal failure must never be retried through owned output.
++ * The first accepted writer pthread remains the sole permitted writer. */
++int h2o_http1_body_lease_write(h2o_http1_body_lease_t *, const void *, size_t, uint64_t deadline_ns,
++                             h2o_http1_body_lease_result_t *);
++/* Terminal cancellation, any thread. notify is thread-safe publication ONLY;
++ * it is called once idle, or after the active writer has stopped touching I/O.
++ * A normal completed write has no notification or loop handoff. */
++void h2o_http1_body_lease_revoke(h2o_http1_body_lease_t *);
++/* Loop only: 1 = detached, 0 = active frame finishing (notify will follow).
++ * This can synchronously destroy req/conn after an abort or failed write.
++ * Orderly return lets an active frame complete; revoke interrupts it. */
++int h2o_http1_body_lease_return(h2o_http1_body_lease_t *);
++void h2o_http1_body_lease_release(h2o_http1_body_lease_t *);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/include/h2o/qpack.h b/include/h2o/qpack.h
+index 2602dcb31..f9f6f1876 100644
+--- a/include/h2o/qpack.h
++++ b/include/h2o/qpack.h
+@@ -80,6 +80,17 @@ int h2o_qpack_parse_request(h2o_mem_pool_t *pool, h2o_qpack_decoder_t *qpack, in
+                             h2o_iovec_t *datagram_flow_id, uint64_t num_blocked, uint64_t *blocked_ref,
+                             h2o_qpack_section_stats_t *stats_updated, uint8_t *outbuf, size_t *outbufsize, const uint8_t *src,
+                             size_t len, const char **err_desc);
++/**
++ * Request parser with the optional original Content-Length output described by
++ * h2o_hpack_parse_request_ex. Blocked sections leave the output absent; it is
++ * published only after a complete successful decode, never from trailers.
++ */
++int h2o_qpack_parse_request_ex(h2o_mem_pool_t *pool, h2o_qpack_decoder_t *qpack, int64_t stream_id, h2o_iovec_t *method,
++                               const h2o_url_scheme_t **scheme, h2o_iovec_t *authority, h2o_iovec_t *path, h2o_iovec_t *protocol,
++                               h2o_headers_t *headers, int *pseudo_header_exists_map, size_t *content_length, h2o_iovec_t *expect,
++                               h2o_iovec_t *datagram_flow_id, uint64_t num_blocked, uint64_t *blocked_ref,
++                               h2o_qpack_section_stats_t *stats_updated, uint8_t *outbuf, size_t *outbufsize, const uint8_t *src,
++                               size_t len, const char **err_desc, h2o_iovec_t *raw_content_length);
+ /**
+  * Parses a QPACK response. The input should be the *payload* of the HTTP/3 HEADERS frame. `outbuf` should be at least
+  * H2O_HPACK_ENCODE_INT_MAX_LENGTH long. `num_blocked` and `blocked_ref` follow the same rules as `h2o_qpack_parse_request`.
 diff --git a/include/h2o/socket.h b/include/h2o/socket.h
-index 810bd09..50c65a9 100644
+index 810bd0960..8f2656aa2 100644
 --- a/include/h2o/socket.h
 +++ b/include/h2o/socket.h
 @@ -109,6 +109,24 @@ void h2o_sliding_counter_stop(h2o_sliding_counter_t *counter, uint64_t now);
@@ -105,8 +459,45 @@ index 810bd09..50c65a9 100644
  typedef void (*h2o_socket_cb)(h2o_socket_t *sock, const char *err);
  
  /**
+@@ -317,6 +335,11 @@ void h2o_socket_notify_write(h2o_socket_t *sock, h2o_socket_cb cb);
+  * Obtain the underlying fd of a sock struct
+  */
+ int h2o_socket_get_fd(h2o_socket_t *sock);
++/* Private loop-only plain writer suspension. Retains the wrapper and descriptor
++ * while removing all native-loop I/O interest. Unsupported backends fail. */
++int h2o_socket_plain_write_suspend(h2o_socket_t *sock);
++void h2o_socket_plain_write_resume(h2o_socket_t *sock);
++
+ /**
+  * Set/Unset the H2O_SOCKET_FLAG_DONT_READ flag.
+  * Setting it allows to be simply notified rather than having the data
+diff --git a/include/h2o/socket/evloop.h b/include/h2o/socket/evloop.h
+index 0dbd9702f..a27cd0921 100644
+--- a/include/h2o/socket/evloop.h
++++ b/include/h2o/socket/evloop.h
+@@ -34,6 +34,7 @@
+ #define H2O_SOCKET_FLAG_IS_CONNECTING 0x40
+ #define H2O_SOCKET_FLAG_IS_ACCEPTED_CONNECTION 0x80
+ #define H2O_SOCKET_FLAG_IS_CONNECTING_CONNECTED 0x100
++#define H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED 0x200
+ /**
+  * Determines if the socket has been registered to epoll. Must be preserved when setting H2O_SOCKET_FLAG_IS_DISPOSED, as this flag
+  * is used for skipping unnecessary invocations of `epoll_ctl` or for determining the `op` being specified.
+@@ -69,6 +70,12 @@ h2o_socket_t *h2o_evloop_socket_accept(h2o_socket_t *listener);
+  * Sets number of bytes that can be read at once (default: 1MB).
+  */
+ void h2o_evloop_socket_set_max_read_size(h2o_socket_t *sock, size_t max_size);
++/**
++ * Bound the next positive plain read to the current empty concrete input
++ * buffer's capacity. EAGAIN retains the bound; data or a terminal error clears
++ * it before the application callback. The configured read limit is preserved.
++ */
++void h2o_evloop_socket_read_current_buffer(h2o_socket_t *sock);
+ 
+ h2o_evloop_t *h2o_evloop_create(void);
+ void h2o_evloop_destroy(h2o_evloop_t *loop);
 diff --git a/lib/common/multithread.c b/lib/common/multithread.c
-index 4d77758..f9fe9bb 100644
+index 4d7775847..f9fe9bb82 100644
 --- a/lib/common/multithread.c
 +++ b/lib/common/multithread.c
 @@ -92,6 +92,7 @@ static void on_read(h2o_socket_t *sock, const char *err)
@@ -149,7 +540,7 @@ index 4d77758..f9fe9bb 100644
      free(queue);
  #endif
 diff --git a/lib/common/socket.c b/lib/common/socket.c
-index c1c9979..82b6e96 100644
+index c1c9979bd..696d00c52 100644
 --- a/lib/common/socket.c
 +++ b/lib/common/socket.c
 @@ -581,7 +581,7 @@ void h2o_socket_dispose_export(h2o_socket_export_t *info)
@@ -161,7 +552,47 @@ index c1c9979..82b6e96 100644
      info->fd = -1;
  }
  
-@@ -1713,10 +1713,13 @@ static void proceed_handshake(h2o_socket_t *sock, const char *err);
+@@ -609,6 +609,39 @@ int h2o_socket_export(h2o_socket_t *sock, h2o_socket_export_t *info)
+     return 0;
+ }
+ 
++int h2o_socket_plain_write_suspend(h2o_socket_t *sock)
++{
++#if !H2O_USE_LIBUV && H2O_USE_EPOLL
++    struct st_h2o_evloop_socket_t *s = (void *)sock;
++    if (sock->ssl != NULL || sock->_zerocopy != NULL || sock->_cb.read != NULL || sock->_cb.write != NULL ||
++        sock->_write_buf.cnt != 0 || s->sendvec.callbacks != NULL ||
++        (s->_flags & (H2O_SOCKET_FLAG_IS_DISPOSED | H2O_SOCKET_FLAG_IS_READ_READY | H2O_SOCKET_FLAG_IS_WRITE_NOTIFY |
++                      H2O_SOCKET_FLAG_IS_CONNECTING | H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED)) != 0)
++        return -1;
++    /* Delete synchronously before publishing the FD to the writer. Pending and
++     * statechanged lists may still contain the wrapper, so both phases skip it. */
++    if (!delete_from_epoll_on_close(s))
++        return -1;
++    s->_flags &= ~(H2O_SOCKET_FLAG_IS_POLLED_FOR_READ | H2O_SOCKET_FLAG_IS_POLLED_FOR_WRITE | H2O_SOCKET_FLAG__EPOLL_IS_REGISTERED);
++    s->_flags |= H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED;
++    return 0;
++#else
++    return -1;
++#endif
++}
++
++void h2o_socket_plain_write_resume(h2o_socket_t *sock)
++{
++#if !H2O_USE_LIBUV && H2O_USE_EPOLL
++    struct st_h2o_evloop_socket_t *s = (void *)sock;
++    assert((s->_flags & H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED) != 0);
++    s->_flags &= ~H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED;
++    link_to_statechanged(s);
++#else
++    assert(!"unsupported body writer resume");
++#endif
++}
++
+ h2o_socket_t *h2o_socket_import(h2o_loop_t *loop, h2o_socket_export_t *info)
+ {
+     h2o_socket_t *sock;
+@@ -1713,10 +1746,13 @@ static void proceed_handshake(h2o_socket_t *sock, const char *err);
  void h2o_socket_start_async_handshake(h2o_loop_t *loop, int async_fd, void *data, h2o_socket_cb cb)
  {
      /* dup async_fd as h2o socket handling will close it */
@@ -176,10 +607,106 @@ index c1c9979..82b6e96 100644
      /* add async fd to event loop in order to retry when openssl engine is ready */
  #if H2O_USE_LIBUV
 diff --git a/lib/common/socket/evloop.c.h b/lib/common/socket/evloop.c.h
-index c559c5a..559d6fb 100644
+index c559c5a70..b9db93740 100644
 --- a/lib/common/socket/evloop.c.h
 +++ b/lib/common/socket/evloop.c.h
-@@ -394,7 +394,7 @@ void do_dispose_socket(h2o_socket_t *_sock)
+@@ -22,6 +22,7 @@
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
+ #include <stdlib.h>
++#include <sys/ioctl.h>
+ #include <sys/time.h>
+ #include <sys/uio.h>
+ #include <unistd.h>
+@@ -51,6 +52,7 @@ struct st_h2o_evloop_socket_t {
+     int _flags;
+     h2o_evloop_t *loop;
+     size_t max_read_size;
++    unsigned read_current_buffer : 1;
+     struct st_h2o_evloop_socket_t *_next_pending;
+     struct st_h2o_evloop_socket_t *_next_statechanged;
+     struct {
+@@ -137,18 +139,40 @@ void link_to_statechanged(struct st_h2o_evloop_socket_t *sock)
+ 
+ static const char *on_read_core(int fd, h2o_buffer_t **input, size_t max_bytes)
+ {
+-    ssize_t read_so_far = 0;
++    size_t read_so_far = 0;
+ 
+-    while (1) {
++    while (read_so_far < max_bytes) {
+         ssize_t rret;
+-        h2o_iovec_t buf = h2o_buffer_try_reserve(input, max_bytes < 4096 ? max_bytes : 4096);
++        size_t remaining = max_bytes - read_so_far;
++        size_t min_guarantee = remaining < 4096 ? remaining : 4096;
++#ifdef FIONREAD
++        /* Keep small reads on the usual path. When a filled buffer must grow,
++         * reserve the bytes already queued by the peer in one step rather than
++         * copying the same prefix at each intermediate power-of-two capacity.
++         * The hint never exceeds this callback's remaining read budget. */
++        h2o_buffer_t *inbuf = *input;
++        if (inbuf->bytes != NULL && min_guarantee > inbuf->capacity - inbuf->size - (inbuf->bytes - inbuf->_buf) &&
++            (inbuf->size + min_guarantee) * 2 > inbuf->capacity) {
++            int queued;
++            if (ioctl(fd, FIONREAD, &queued) == 0) {
++                if (queued == 0 && read_so_far != 0)
++                    break; /* avoid growing just to discover EAGAIN or EOF */
++                if (queued > 0) {
++                    size_t available = (size_t)queued < remaining ? (size_t)queued : remaining;
++                    if (available > min_guarantee)
++                        min_guarantee = available;
++                }
++            }
++        }
++#endif
++        h2o_iovec_t buf = h2o_buffer_try_reserve(input, min_guarantee);
+         if (buf.base == NULL) {
+             /* memory allocation failed */
+             return h2o_socket_error_out_of_memory;
+         }
+         size_t read_size = buf.len <= INT_MAX / 2 ? buf.len : INT_MAX / 2 + 1;
+-        if (read_size > max_bytes)
+-            read_size = max_bytes;
++        if (read_size > remaining)
++            read_size = remaining;
+         while ((rret = read(fd, buf.base, read_size)) == -1 && errno == EINTR)
+             ;
+         if (rret == -1) {
+@@ -363,8 +387,23 @@ static void read_on_ready(struct st_h2o_evloop_socket_t *sock)
+     if ((sock->_flags & H2O_SOCKET_FLAG_DONT_READ) != 0)
+         goto Notify;
+ 
+-    if ((err = on_read_core(sock->fd, sock->super.ssl == NULL ? &sock->super.input : &sock->super.ssl->input.encrypted,
+-                            sock->max_read_size)) != NULL)
++    size_t max_read_size = sock->max_read_size;
++    if (sock->read_current_buffer) {
++        h2o_buffer_t *input = sock->super.input;
++        if (sock->super.ssl == NULL && input->size == 0 && input->bytes == input->_buf) {
++            /* The consumer returned this allocation empty. Deliver its next
++             * fragment before growing and copying the newly read prefix. */
++            if (max_read_size > input->capacity)
++                max_read_size = input->capacity;
++        } else {
++            sock->read_current_buffer = 0;
++        }
++    }
++    err = on_read_core(sock->fd, sock->super.ssl == NULL ? &sock->super.input : &sock->super.ssl->input.encrypted,
++                       max_read_size);
++    if (err != NULL || sock->super.input->size != prev_size)
++        sock->read_current_buffer = 0;
++    if (err != NULL)
+         goto Notify;
+ 
+     if (sock->super.ssl != NULL && sock->super.ssl->handshake.cb == NULL)
+@@ -382,6 +421,7 @@ Notify:
+ void do_dispose_socket(h2o_socket_t *_sock)
+ {
+     struct st_h2o_evloop_socket_t *sock = (struct st_h2o_evloop_socket_t *)_sock;
++    assert((sock->_flags & H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED) == 0);
+ 
+     dispose_write_buf(&sock->super);
+ 
+@@ -394,7 +434,7 @@ void do_dispose_socket(h2o_socket_t *_sock)
  
      /* immediate close */
      if (sock->fd != -1) {
@@ -188,7 +715,23 @@ index c559c5a..559d6fb 100644
          sock->fd = -1;
      }
      link_to_statechanged(sock);
-@@ -668,6 +668,8 @@ static struct st_h2o_evloop_socket_t *create_socket(h2o_evloop_t *loop, int fd,
+@@ -416,6 +456,7 @@ void do_write(h2o_socket_t *_sock, h2o_iovec_t *bufs, size_t bufcnt)
+ {
+     struct st_h2o_evloop_socket_t *sock = (struct st_h2o_evloop_socket_t *)_sock;
+     size_t first_buf_written;
++    assert((sock->_flags & H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED) == 0);
+ 
+     /* Don't write too much; if more than 1MB have been already written in the current invocation of `h2o_evloop_run`, wait until
+      * the event loop notifies us that the socket is writable. */
+@@ -598,6 +639,7 @@ int h2o_socket_get_fd(h2o_socket_t *_sock)
+ void do_read_start(h2o_socket_t *_sock)
+ {
+     struct st_h2o_evloop_socket_t *sock = (struct st_h2o_evloop_socket_t *)_sock;
++    assert((sock->_flags & H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED) == 0);
+ 
+     link_to_statechanged(sock);
+ }
+@@ -668,6 +710,8 @@ static struct st_h2o_evloop_socket_t *create_socket(h2o_evloop_t *loop, int fd,
  {
      struct st_h2o_evloop_socket_t *sock;
  
@@ -197,7 +740,7 @@ index c559c5a..559d6fb 100644
      sock = h2o_mem_alloc(sizeof(*sock));
      memset(sock, 0, sizeof(*sock));
      h2o_buffer_init(&sock->super.input, &h2o_socket_buffer_prototype);
-@@ -679,6 +681,7 @@ static struct st_h2o_evloop_socket_t *create_socket(h2o_evloop_t *loop, int fd,
+@@ -679,6 +723,7 @@ static struct st_h2o_evloop_socket_t *create_socket(h2o_evloop_t *loop, int fd,
      sock->_next_statechanged = sock;
  
      evloop_do_on_socket_create(sock);
@@ -205,7 +748,7 @@ index c559c5a..559d6fb 100644
  
      return sock;
  }
-@@ -718,16 +721,22 @@ h2o_socket_t *h2o_evloop_socket_accept(h2o_socket_t *_listener)
+@@ -718,16 +763,22 @@ h2o_socket_t *h2o_evloop_socket_accept(h2o_socket_t *_listener)
      } peeraddr;
      socklen_t peeraddrlen = sizeof(peeraddr);
  
@@ -230,7 +773,7 @@ index c559c5a..559d6fb 100644
      if (peeraddrlen <= sizeof(peeraddr)) {
          h2o_socket_setpeername(sock, &peeraddr.sa, peeraddrlen);
      } else {
-@@ -748,10 +757,12 @@ h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, sockle
+@@ -748,10 +799,12 @@ h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, sockle
      int fd, connect_ret;
      struct st_h2o_evloop_socket_t *sock;
  
@@ -243,7 +786,7 @@ index c559c5a..559d6fb 100644
          return NULL;
      }
      fcntl(fd, F_SETFL, O_NONBLOCK);
-@@ -759,11 +770,13 @@ h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, sockle
+@@ -759,11 +812,13 @@ h2o_socket_t *h2o_socket_connect(h2o_loop_t *loop, struct sockaddr *addr, sockle
      if (!((connect_ret = connect(fd, addr, addrlen)) == 0 || errno == EINPROGRESS)) {
          if (err != NULL)
              *err = h2o_socket_get_error_string(errno, h2o_socket_error_conn_fail);
@@ -258,11 +801,36 @@ index c559c5a..559d6fb 100644
      set_nodelay_if_likely_tcp(fd, addr);
  
      if (connect_ret == 0) {
+@@ -783,6 +838,13 @@ void h2o_evloop_socket_set_max_read_size(h2o_socket_t *_sock, size_t max_size)
+     sock->max_read_size = max_size;
+ }
+ 
++void h2o_evloop_socket_read_current_buffer(h2o_socket_t *_sock)
++{
++    struct st_h2o_evloop_socket_t *sock = (void *)_sock;
++    assert(_sock->ssl == NULL && _sock->input->size == 0 && _sock->input->bytes == _sock->input->_buf);
++    sock->read_current_buffer = 1;
++}
++
+ h2o_evloop_t *create_evloop(size_t sz)
+ {
+     h2o_evloop_t *loop = h2o_mem_alloc(sz);
+@@ -834,8 +896,8 @@ void h2o_socket_notify_write(h2o_socket_t *_sock, h2o_socket_cb cb)
+ 
+ static void run_socket(struct st_h2o_evloop_socket_t *sock)
+ {
+-    if ((sock->_flags & H2O_SOCKET_FLAG_IS_DISPOSED) != 0) {
+-        /* is freed in updatestates phase */
++    if ((sock->_flags & (H2O_SOCKET_FLAG_IS_DISPOSED | H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED)) != 0) {
++        /* Disposed wrappers are freed in updatestates; leased wrappers stay pinned. */
+         return;
+     }
+ 
 diff --git a/lib/common/socket/evloop/epoll.c.h b/lib/common/socket/evloop/epoll.c.h
-index ac55445..0ac8bd0 100644
+index ac554450e..dc28653fc 100644
 --- a/lib/common/socket/evloop/epoll.c.h
 +++ b/lib/common/socket/evloop/epoll.c.h
-@@ -154,7 +154,7 @@ static int update_status(struct st_h2o_evloop_epoll_t *loop)
+@@ -154,11 +154,11 @@ static int update_status(struct st_h2o_evloop_epoll_t *loop)
                  if (sock->fd != -1) {
                      if (!delete_from_epoll_on_close(sock))
                          h2o_error_printf("update_status: epoll(DEL) returned error %d (fd=%d)\n", errno, sock->fd);
@@ -271,7 +839,21 @@ index ac55445..0ac8bd0 100644
                  }
                  free(sock);
              }
-@@ -320,21 +320,25 @@ static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock)
+-        } else {
++        } else if ((sock->_flags & H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED) == 0) {
+             uint32_t events = 0;
+             int changed = 0;
+             if (h2o_socket_is_reading(&sock->super)) {
+@@ -220,6 +220,8 @@ int evloop_do_proceed(h2o_evloop_t *_loop, int32_t max_wait)
+     /* update readable flags, perform writes */
+     for (i = 0; i != nevents; ++i) {
+         struct st_h2o_evloop_socket_t *sock = events[i].data.ptr;
++        if ((sock->_flags & H2O_SOCKET_FLAG_BODY_WRITE_SUSPENDED) != 0)
++            continue;
+         int notified = 0;
+         /* When receiving HUP (indicating reset) while the socket is polled neither for read nor write, unregister the socket from
+          * epoll, otherwise epoll_wait() would continue raising the HUP event. This problem cannot be avoided by using edge trigger.
+@@ -320,21 +322,25 @@ static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock)
  static void evloop_do_dispose(h2o_evloop_t *_loop)
  {
      struct st_h2o_evloop_epoll_t *loop = (struct st_h2o_evloop_epoll_t *)_loop;
@@ -299,7 +881,7 @@ index ac55445..0ac8bd0 100644
      return &loop->super;
  }
 diff --git a/lib/common/socket/evloop/kqueue.c.h b/lib/common/socket/evloop/kqueue.c.h
-index c2d076f..103d122 100644
+index c2d076f09..103d12225 100644
 --- a/lib/common/socket/evloop/kqueue.c.h
 +++ b/lib/common/socket/evloop/kqueue.c.h
 @@ -181,14 +181,17 @@ static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock)
@@ -322,7 +904,7 @@ index c2d076f..103d122 100644
      return &loop->super;
  }
 diff --git a/lib/core/request.c b/lib/core/request.c
-index 773e117..af2667f 100644
+index 773e117d9..6cf08595e 100644
 --- a/lib/core/request.c
 +++ b/lib/core/request.c
 @@ -172,7 +172,20 @@ static void call_handlers(h2o_req_t *req, h2o_handler_t **handler)
@@ -347,8 +929,19 @@ index 773e117..af2667f 100644
              req->dispatched = 1;
              return;
          }
+@@ -299,6 +312,10 @@ void h2o_init_request(h2o_req_t *req, h2o_conn_t *conn, h2o_req_t *src)
+         req->input.scheme = src->input.scheme;
+         req->version = src->version;
+         req->entity = src->entity;
++#ifdef H2O_WITH_PHP
++        if (src->content_length_header.base != NULL)
++            req->content_length_header = h2o_strdup(&req->pool, src->content_length_header.base, src->content_length_header.len);
++#endif
+         req->http1_is_persistent = src->http1_is_persistent;
+         req->timestamps = src->timestamps;
+         if (src->upgrade.base != NULL) {
 diff --git a/lib/handler/configurator/proxy.c b/lib/handler/configurator/proxy.c
-index 4bd414b..2091627 100644
+index 4bd414bb8..20916273b 100644
 --- a/lib/handler/configurator/proxy.c
 +++ b/lib/handler/configurator/proxy.c
 @@ -29,6 +29,9 @@
@@ -381,10 +974,20 @@ index 4bd414b..2091627 100644
          h2o_cache_t *ssl_session_cache =
              create_ssl_session_cache(H2O_DEFAULT_PROXY_SSL_SESSION_CACHE_CAPACITY, H2O_DEFAULT_PROXY_SSL_SESSION_CACHE_DURATION);
 diff --git a/lib/handler/file.c b/lib/handler/file.c
-index 0c2aec2..651e675 100644
+index 0c2aec2e0..646608a56 100644
 --- a/lib/handler/file.c
 +++ b/lib/handler/file.c
-@@ -668,6 +668,13 @@ static int delegate_dynamic_request(h2o_req_t *req, h2o_iovec_t script_name, h2o
+@@ -85,6 +85,9 @@ struct st_h2o_file_handler_t {
+     h2o_mimemap_t *mimemap;
+     int flags;
+     size_t max_index_file_len;
++    h2o_file_static_access_check_cb static_access_check;
++    void *static_access_data;
++    void (*static_access_dispose)(void *);
+     h2o_iovec_t index_files[1];
+ };
+ 
+@@ -668,6 +671,13 @@ static int delegate_dynamic_request(h2o_req_t *req, h2o_iovec_t script_name, h2o
      assert(mime_type->data.dynamic.pathconf.handlers.size == 1);
      assert(mime_type->data.dynamic.pathconf._filters.size == 0);
      assert(mime_type->data.dynamic.pathconf._loggers.size == 0);
@@ -398,7 +1001,7 @@ index 0c2aec2..651e675 100644
  
      /* setup CGI attributes (e.g., PATH_INFO) */
      filereq = h2o_mem_alloc_pool(&req->pool, *filereq, 1);
-@@ -967,8 +974,11 @@ static int on_req(h2o_handler_t *_self, h2o_req_t *req)
+@@ -967,8 +977,11 @@ static int on_req(h2o_handler_t *_self, h2o_req_t *req)
      if (errno == ENFILE || errno == EMFILE) {
          h2o_send_error_503(req, "Service Unavailable", "please try again later", 0);
      } else {
@@ -412,7 +1015,37 @@ index 0c2aec2..651e675 100644
          if (errno == ENOENT || errno == ENOTDIR) {
              return -1;
          } else {
-@@ -1028,6 +1038,9 @@ h2o_file_handler_t *h2o_file_register(h2o_pathconf_t *pathconf, const char *real
+@@ -977,9 +990,17 @@ static int on_req(h2o_handler_t *_self, h2o_req_t *req)
+     }
+     return 0;
+ 
+-Opened:
+-    return serve_with_generator(generator, req, resolved_path, rpath, rpath_len,
+-                                h2o_mimemap_get_type_by_extension(self->mimemap, h2o_get_filext(rpath, rpath_len)));
++Opened:;
++    h2o_mimemap_type_t *mime_type = h2o_mimemap_get_type_by_extension(self->mimemap, h2o_get_filext(rpath, rpath_len));
++    /* Check the actual selected index/cache fd before static 304, HEAD, range
++     * or body handling. Explicit dynamic MIME/filereq delegation stays intact. */
++    if (mime_type->type == H2O_MIMEMAP_TYPE_MIMETYPE && self->static_access_check != NULL &&
++        !self->static_access_check(rpath, generator->file.ref->fd, self->static_access_data)) {
++        close_file(generator);
++        h2o_send_error_404(req, "Not Found", "File not found\n", 0);
++        return 0;
++    }
++    return serve_with_generator(generator, req, resolved_path, rpath, rpath_len, mime_type);
+ }
+ 
+ static void on_context_init(h2o_handler_t *_self, h2o_context_t *ctx)
+@@ -1003,6 +1024,8 @@ static void on_handler_dispose(h2o_handler_t *_self)
+ 
+     free(self->conf_path.base);
+     free(self->real_path.base);
++    if (self->static_access_dispose != NULL)
++        self->static_access_dispose(self->static_access_data);
+     h2o_mem_release_shared(self->mimemap);
+     for (i = 0; self->index_files[i].base != NULL; ++i)
+         free(self->index_files[i].base);
+@@ -1028,6 +1051,9 @@ h2o_file_handler_t *h2o_file_register(h2o_pathconf_t *pathconf, const char *real
      self->super.on_context_dispose = on_context_dispose;
      self->super.dispose = on_handler_dispose;
      self->super.on_req = on_req;
@@ -422,7 +1055,34 @@ index 0c2aec2..651e675 100644
  
      /* setup attributes */
      self->conf_path = h2o_strdup_slashed(NULL, pathconf->path.base, pathconf->path.len);
-@@ -1108,6 +1121,9 @@ h2o_handler_t *h2o_file_register_file(h2o_pathconf_t *pathconf, const char *real
+@@ -1039,6 +1065,9 @@ h2o_file_handler_t *h2o_file_register(h2o_pathconf_t *pathconf, const char *real
+         self->mimemap = h2o_mimemap_create();
+     }
+     self->flags = flags;
++    self->static_access_check = NULL;
++    self->static_access_data = NULL;
++    self->static_access_dispose = NULL;
+     for (i = 0; index_files[i] != NULL; ++i) {
+         self->index_files[i] = h2o_strdup(NULL, index_files[i], SIZE_MAX);
+         if (self->max_index_file_len < self->index_files[i].len)
+@@ -1048,6 +1077,16 @@ h2o_file_handler_t *h2o_file_register(h2o_pathconf_t *pathconf, const char *real
+     return self;
+ }
+ 
++void h2o_file_set_static_access_check(h2o_file_handler_t *handler, h2o_file_static_access_check_cb check,
++                                    void *data, void (*dispose)(void *))
++{
++    if (handler->static_access_dispose != NULL)
++        handler->static_access_dispose(handler->static_access_data);
++    handler->static_access_check = check;
++    handler->static_access_data = data;
++    handler->static_access_dispose = dispose;
++}
++
+ h2o_mimemap_t *h2o_file_get_mimemap(h2o_file_handler_t *handler)
+ {
+     return handler->mimemap;
+@@ -1108,6 +1147,9 @@ h2o_handler_t *h2o_file_register_file(h2o_pathconf_t *pathconf, const char *real
      self->super.on_context_dispose = specific_handler_on_context_dispose;
      self->super.dispose = specific_handler_on_dispose;
      self->super.on_req = specific_handler_on_req;
@@ -433,10 +1093,337 @@ index 0c2aec2..651e675 100644
      self->real_path = h2o_strdup(NULL, real_path, SIZE_MAX);
      h2o_mem_addref_shared(mime_type);
 diff --git a/lib/http1.c b/lib/http1.c
-index d277d55..f872555 100644
+index d277d5590..7bdbadc22 100644
 --- a/lib/http1.c
 +++ b/lib/http1.c
-@@ -1270,7 +1270,19 @@ static void initiate_graceful_shutdown(h2o_conn_t *_conn)
+@@ -64,6 +64,7 @@ struct st_h2o_http1_finalostream_t {
+ struct st_h2o_http1_conn_t {
+     h2o_conn_t super;
+     h2o_socket_t *sock;
++    h2o_http1_body_lease_t *_body_write_lease;
+     h2o_timer_t _timeout_entry;
+     h2o_timer_t _io_timeout_entry;
+     uint64_t _req_index;
+@@ -99,6 +100,9 @@ struct st_h2o_http1_chunked_entity_reader {
+     struct phr_chunked_decoder decoder;
+ };
+ 
++static const h2o_conn_callbacks_t h1_callbacks;
++static int body_lease_defer_close(struct st_h2o_http1_conn_t *conn, int close_socket);
++static uint64_t body_lease_io_remaining(h2o_http1_body_lease_t *lease);
+ static void finalostream_send(h2o_ostream_t *_self, h2o_req_t *req, h2o_sendvec_t *inbufs, size_t inbufcnt, h2o_send_state_t state);
+ static void finalostream_send_informational(h2o_ostream_t *_self, h2o_req_t *req);
+ static void reqread_on_read(h2o_socket_t *sock, const char *err);
+@@ -133,6 +137,11 @@ static void init_request(struct st_h2o_http1_conn_t *conn)
+ 
+ static void close_connection(struct st_h2o_http1_conn_t *conn, int close_socket)
+ {
++    /* Active caller storage and its socket descriptor must survive until the
++     * synchronous writer publishes that it has stopped touching I/O. */
++    if (body_lease_defer_close(conn, close_socket))
++        return;
++
+     if (conn->sock != NULL) {
+         H2O_PROBE_CONN0(H1_CLOSE, &conn->super);
+         H2O_LOG_CONN(h1_close, &conn->super, {});
+@@ -149,6 +158,7 @@ static void close_connection(struct st_h2o_http1_conn_t *conn, int close_socket)
+ 
+ static void cleanup_connection(struct st_h2o_http1_conn_t *conn)
+ {
++    assert(conn->_body_write_lease == NULL);
+     if (!conn->req.http1_is_persistent) {
+         /* TODO use lingering close */
+         close_connection(conn, 1);
+@@ -242,16 +252,31 @@ static void handle_one_body_fragment(struct st_h2o_http1_conn_t *conn, size_t fr
+     clear_timeouts(conn);
+     h2o_socket_read_stop(conn->sock);
+ 
+-    /* move data being read to req_body */
+-    if (!h2o_buffer_try_append(&conn->req_body, conn->sock->input->bytes, fragment_size)) {
+-        entity_read_send_error_502(conn, "Bad Gateway", "Bad Gateway");
+-        return;
++    /* Transfer a whole decoded fragment when the body buffer is empty. Both
++     * buffers stay on this event loop: proceed_request consumes req_body only
++     * after the handler has acknowledged its lease. Keep the copying path for
++     * accumulated bodies and input containing a pipelined request suffix. */
++    if (fragment_size != 0 && conn->req_body->size == 0 &&
++        fragment_size + extra_bytes == conn->sock->input->size) {
++        h2o_buffer_t *empty = conn->req_body;
++        conn->req_body = conn->sock->input;
++        conn->req_body->size = fragment_size; /* drop already-decoded framing */
++        conn->sock->input = empty;
++    } else {
++        if (!h2o_buffer_try_append(&conn->req_body, conn->sock->input->bytes, fragment_size)) {
++            entity_read_send_error_502(conn, "Bad Gateway", "Bad Gateway");
++            return;
++        }
++        h2o_buffer_consume(&conn->sock->input, fragment_size + extra_bytes);
+     }
+-    h2o_buffer_consume(&conn->sock->input, fragment_size + extra_bytes);
+     conn->req.req_body_bytes_received += fragment_size;
+ 
+     /* invoke action */
+     conn->req.entity = h2o_iovec_init(conn->req_body->bytes, conn->req_body->size);
++    /* EOF acknowledgement must not resume socket reads: a pipelined request
++     * can only be parsed after the current response has completed. */
++    if (complete)
++        conn->req.proceed_req = NULL;
+     if (conn->req.write_req.cb(conn->req.write_req.ctx, complete) != 0) {
+         entity_read_send_error_502(conn, "Bad Gateway", "Bad Gateway");
+         return;
+@@ -323,6 +348,64 @@ static void handle_content_length_entity_read(struct st_h2o_http1_conn_t *conn)
+     handle_one_body_fragment(conn, length, 0, complete);
+ }
+ 
++h2o_buffer_t *h2o_http1_take_request_body(h2o_req_t *req)
++{
++    if ((req->version != 0x100 && req->version != 0x101) || req->is_tunnel_req)
++        return NULL;
++    struct st_h2o_http1_conn_t *conn = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http1_conn_t, req, req);
++    if (conn->sock == NULL || conn->sock->ssl != NULL || conn->sock->input->size != 0 ||
++        conn->_req_entity_reader == NULL ||
++        conn->_req_entity_reader->handle_incoming_entity != handle_content_length_entity_read)
++        return NULL;
++    struct st_h2o_http1_content_length_entity_reader *reader = (void *)conn->_req_entity_reader;
++    h2o_buffer_t *body = conn->req_body;
++    if (req->req_body_bytes_received > reader->content_length || body == NULL || body->size == 0 ||
++        body->_prototype == NULL || body->_fd != -1 || body->bytes == NULL ||
++        req->entity.base != body->bytes || req->entity.len != body->size)
++        return NULL;
++
++    /* The Content-Length reader has finished touching this fragment before
++     * invoking write_req. Unlike the chunked reader it retains no decoder
++     * pointers into it. A nonfinal proceed_request consumes the empty
++     * replacement before resuming reads; received length remains cumulative.
++     * Transfer the allocation, not a borrowed entity pointer. The native host
++     * returns it to this allocating loop before H2O disposal/recycling. */
++    h2o_buffer_init(&conn->req_body, body->_prototype);
++    req->entity = h2o_iovec_init(NULL, 0);
++    return body;
++}
++
++int h2o_http1_restore_request_body(h2o_req_t *req, h2o_buffer_t **body)
++{
++    if ((req->version != 0x100 && req->version != 0x101) || req->is_tunnel_req)
++        return 0;
++    struct st_h2o_http1_conn_t *conn = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http1_conn_t, req, req);
++    if (conn->sock == NULL || conn->sock->ssl != NULL || conn->sock->input->size != 0 ||
++        conn->_req_entity_reader == NULL || req->proceed_req == NULL ||
++        conn->_req_entity_reader->handle_incoming_entity != handle_content_length_entity_read ||
++        conn->req_body == NULL || conn->req_body->size != 0 || req->entity.len != 0 || req->entity.base != NULL ||
++        *body == NULL || (*body)->_prototype == NULL || (*body)->_fd != -1 || (*body)->bytes == NULL)
++        return 0;
++    struct st_h2o_http1_content_length_entity_reader *reader = (void *)conn->_req_entity_reader;
++    if (req->req_body_bytes_received >= reader->content_length)
++        return 0;
++
++    /* No reads have resumed since the nonfinal take. Return the warm storage
++     * to the existing socket input before proceed_request acknowledges the
++     * empty req_body. No request-pool or detached-buffer cache is introduced. */
++    h2o_buffer_dispose(&conn->sock->input);
++    (*body)->size = 0;
++    (*body)->bytes = (*body)->_buf;
++    conn->sock->input = *body;
++#if !H2O_USE_LIBUV
++    /* Reuse this physical allocation for a fragment, without copying its full
++     * contents into a larger input merely to coalesce another TCP read. */
++    h2o_evloop_socket_read_current_buffer(conn->sock);
++#endif
++    *body = NULL;
++    return 1;
++}
++
+ static int create_content_length_entity_reader(struct st_h2o_http1_conn_t *conn, size_t content_length)
+ {
+     struct st_h2o_http1_content_length_entity_reader *reader = h2o_mem_alloc_pool(&conn->req.pool, *reader, 1);
+@@ -356,6 +439,9 @@ static int create_entity_reader(struct st_h2o_http1_conn_t *conn, const struct p
+             return -1;
+         }
+         conn->req.content_length = content_length;
++#ifdef H2O_WITH_PHP
++        conn->req.content_length_header = h2o_strdup(&conn->req.pool, entity_header->value, entity_header->value_len);
++#endif
+         return create_content_length_entity_reader(conn, (size_t)content_length);
+     }
+     /* failed */
+@@ -367,9 +453,9 @@ static const char *init_headers(h2o_mem_pool_t *pool, h2o_headers_t *headers, co
+                                 ssize_t *entity_header_index, int *force_close)
+ {
+     int has_content_length = 0, has_transfer_encoding = 0;
++    h2o_iovec_t first_content_length = {NULL, 0};
+     *entity_header_index = -1;
+     *expect_header_index = -1;
+-
+     assert(headers->size == 0);
+ 
+     /* setup */
+@@ -389,10 +475,19 @@ static const char *init_headers(h2o_mem_pool_t *pool, h2o_headers_t *headers, co
+             if ((name_token = h2o_lookup_token(src[i].name, src[i].name_len)) != NULL) {
+                 if (name_token->flags.is_init_header_special) {
+                     if (name_token == H2O_TOKEN_HOST) {
++                        if (host->base != NULL)
++                            return "multiple host headers";
+                         host->base = (char *)src[i].value;
+                         host->len = src[i].value_len;
+                     } else if (name_token == H2O_TOKEN_CONTENT_LENGTH) {
+-                        has_content_length = 1;
++                        if (has_content_length) {
++                            if (!h2o_memis(first_content_length.base, first_content_length.len, src[i].value, src[i].value_len))
++                                return "conflicting content-length headers";
++                        } else {
++                            has_content_length = 1;
++                            first_content_length.base = (char *)src[i].value;
++                            first_content_length.len = src[i].value_len;
++                        }
+                         if (*entity_header_index == -1)
+                             *entity_header_index = i;
+                     } else if (name_token == H2O_TOKEN_TRANSFER_ENCODING) {
+@@ -827,6 +922,13 @@ static void on_timeout(struct st_h2o_http1_conn_t *conn)
+ static void req_io_on_timeout(h2o_timer_t *entry)
+ {
+     struct st_h2o_http1_conn_t *conn = H2O_STRUCT_FROM_MEMBER(struct st_h2o_http1_conn_t, _io_timeout_entry, entry);
++    if (conn->_body_write_lease != NULL) {
++        uint64_t remaining = body_lease_io_remaining(conn->_body_write_lease);
++        if (remaining != 0) {
++            set_req_io_timeout(conn, remaining, req_io_on_timeout);
++            return;
++        }
++    }
+     conn->super.ctx->http1.events.request_io_timeouts++;
+     on_timeout(conn);
+ }
+@@ -1023,30 +1125,103 @@ static void setup_chunked(struct st_h2o_http1_finalostream_t *self, h2o_req_t *r
+     }
+ }
+ 
+-static void encode_chunked(h2o_sendvec_t *prefix, h2o_sendvec_t *suffix, h2o_send_state_t state, size_t chunk_size,
+-                           int send_trailers, char *buffer)
++#include "http1/chunked-encoder.c.h"
++#include "http1/body-lease.c.h"
++
++static uint64_t body_lease_io_remaining(h2o_http1_body_lease_t *lease)
+ {
+-    h2o_sendvec_init_raw(prefix, NULL, 0);
+-    h2o_sendvec_init_raw(suffix, NULL, 0);
++    if (lease->io_timeout_ns == 0)
++        return 0;
++    uint64_t end = body_lease_add_ns(atomic_load_explicit(&lease->last_progress_ns, memory_order_relaxed), lease->io_timeout_ns);
++    uint64_t now = body_lease_now();
++    return end > now ? (end - now + 999999) / 1000000 : 0;
++}
+ 
+-    /* create chunk header and output data */
+-    if (chunk_size != 0) {
+-        prefix->raw = buffer;
+-        prefix->len = sprintf(buffer, "%zx\r\n", chunk_size);
+-        if (state != H2O_SEND_STATE_ERROR) {
+-            suffix->raw = "\r\n0\r\n\r\n";
+-            suffix->len = state == H2O_SEND_STATE_FINAL ? (send_trailers ? 5 : 7) : 2;
+-        }
+-    } else if (state == H2O_SEND_STATE_FINAL) {
+-        suffix->raw = "0\r\n\r\n";
+-        suffix->len = send_trailers ? 3 : 5;
++/* Loop-only detachment: the acquire/release state is the lifetime pin. */
++static struct st_h2o_http1_conn_t *body_lease_detach(h2o_http1_body_lease_t *lease)
++{
++    assert(pthread_equal(lease->loop_thread, pthread_self()));
++    assert(atomic_load_explicit(&lease->state, memory_order_acquire) == BODY_LEASE_RETURNED);
++    struct st_h2o_http1_conn_t *conn = lease->conn;
++    if (conn == NULL)
++        return NULL;
++    assert(conn->_body_write_lease == lease);
++    conn->req.bytes_sent += atomic_load_explicit(&lease->payload_submitted, memory_order_relaxed);
++    conn->sock->bytes_written += atomic_load_explicit(&lease->wire_submitted, memory_order_relaxed);
++    conn->_body_write_lease = NULL;
++    lease->conn = NULL;
++    h2o_socket_plain_write_resume(conn->sock);
++    h2o_http1_body_lease_release(lease); /* Drop H1's reference. */
++    return conn;
++}
++
++static int body_lease_defer_close(struct st_h2o_http1_conn_t *conn, int close_socket)
++{
++    h2o_http1_body_lease_t *lease = conn->_body_write_lease;
++    if (lease == NULL)
++        return 0;
++    lease->close_requested = 1;
++    lease->close_socket |= close_socket;
++    if (!body_lease_revoke(lease, 0))
++        return 1;
++    body_lease_detach(lease);
++    return 0;
++}
++
++h2o_http1_body_lease_t *h2o_http1_body_lease_acquire(h2o_req_t *req, void (*notify)(void *), void *data)
++{
++    if (req->conn->callbacks != &h1_callbacks || req->is_tunnel_req ||
++        (req->version != 0x100 && req->version != 0x101) ||
++        req->proceed_req != NULL || req->_generator == NULL ||
++        (100 <= req->res.status && req->res.status <= 199) || req->res.status == 204 || req->res.status == 304 ||
++        h2o_memis(req->input.method.base, req->input.method.len, H2O_STRLIT("HEAD")))
++        return NULL;
++    struct st_h2o_http1_conn_t *conn = (void *)req->conn;
++    if (&conn->req != req || conn->_body_write_lease != NULL || conn->_req_entity_reader != NULL ||
++        conn->sock == NULL || conn->sock->ssl != NULL ||
++        req->_ostr_top != &conn->_ostr_final.super || conn->_ostr_final.state != OSTREAM_STATE_BODY ||
++        conn->_ostr_final.informational.write_inflight || conn->_ostr_final.informational.pending.size != 0 ||
++        conn->_ostr_final.informational.pending_final.inbufs != NULL)
++        return NULL;
++    h2o_http1_body_lease_t *lease = body_lease_new(h2o_socket_get_fd(conn->sock), conn->_ostr_final.chunked_buf != NULL,
++                                                conn->super.ctx->globalconf->http1.req_io_timeout, notify, data);
++    if (lease == NULL)
++        return NULL;
++    if (h2o_socket_plain_write_suspend(conn->sock) != 0) {
++        atomic_store_explicit(&lease->state, BODY_LEASE_RETURNED, memory_order_relaxed);
++        h2o_http1_body_lease_release(lease);
++        h2o_http1_body_lease_release(lease);
++        return NULL;
+     }
++    lease->conn = conn;
++    conn->_body_write_lease = lease;
++    return lease;
++}
+ 
+-    /* if state is error, send a broken chunk to pass the error down to the browser */
+-    if (state == H2O_SEND_STATE_ERROR) {
+-        suffix->raw = "\r\n1\r\n";
+-        suffix->len = 5;
++int h2o_http1_body_lease_return(h2o_http1_body_lease_t *lease)
++{
++    assert(pthread_equal(lease->loop_thread, pthread_self()));
++    if (lease->conn == NULL)
++        return 1;
++    unsigned state = atomic_load_explicit(&lease->state, memory_order_acquire);
++    for (;;) {
++        if (state == BODY_LEASE_RETURNED)
++            break;
++        if (state == BODY_LEASE_REVOKING || state == BODY_LEASE_RETURNING)
++            return 0;
++        unsigned next = state == BODY_LEASE_IDLE ? BODY_LEASE_RETURNED : BODY_LEASE_RETURNING;
++        if (atomic_compare_exchange_weak_explicit(&lease->state, &state, next, memory_order_acq_rel, memory_order_acquire)) {
++            if (next == BODY_LEASE_RETURNING)
++                return 0;
++            break;
++        }
+     }
++    int close_requested = lease->close_requested || atomic_load_explicit(&lease->error, memory_order_acquire) != 0;
++    int close_socket = lease->close_socket || close_requested;
++    struct st_h2o_http1_conn_t *conn = body_lease_detach(lease);
++    if (close_requested)
++        close_connection(conn, close_socket);
++    return 1;
+ }
+ 
+ void finalostream_send(h2o_ostream_t *_self, h2o_req_t *_req, h2o_sendvec_t *inbufs, size_t inbufcnt, h2o_send_state_t send_state)
+@@ -1058,6 +1233,7 @@ void finalostream_send(h2o_ostream_t *_self, h2o_req_t *_req, h2o_sendvec_t *inb
+ 
+     assert(&conn->req == _req);
+     assert(_self == &conn->_ostr_final.super);
++    assert(conn->_body_write_lease == NULL);
+ 
+     if (conn->_ostr_final.informational.write_inflight) {
+         conn->_ostr_final.informational.pending_final.inbufs = h2o_mem_alloc_pool(&conn->req.pool, h2o_sendvec_t, inbufcnt);
+@@ -1270,7 +1446,19 @@ static void initiate_graceful_shutdown(h2o_conn_t *_conn)
      /* note: nothing special needs to be done for handling graceful shutdown */
  }
  
@@ -456,8 +1443,16 @@ index d277d55..f872555 100644
      .get_sockname = get_sockname,
      .get_peername = get_peername,
      .get_ptls = get_ptls,
+@@ -1323,6 +1511,7 @@ void h2o_http1_accept(h2o_accept_ctx_t *ctx, h2o_socket_t *sock, struct timeval
+ 
+     /* init properties that need to be non-zero */
+     conn->sock = sock;
++    conn->_body_write_lease = NULL;
+     sock->data = conn;
+ 
+     H2O_PROBE_CONN(H1_ACCEPT, &conn->super, conn->sock, &conn->super, h2o_conn_get_uuid(&conn->super));
 diff --git a/lib/http2/connection.c b/lib/http2/connection.c
-index 33126a0..4d7ba65 100644
+index 33126a068..77e4d1257 100644
 --- a/lib/http2/connection.c
 +++ b/lib/http2/connection.c
 @@ -566,12 +566,25 @@ static void handle_request_body_chunk(h2o_http2_conn_t *conn, h2o_http2_stream_t
@@ -486,7 +1481,27 @@ index 33126a0..4d7ba65 100644
      /* update state */
      int req_queued = stream->req.proceed_req != NULL;
      if (is_end_stream) {
-@@ -1814,9 +1827,31 @@ static void on_dos_process_delay(h2o_timer_t *timer)
+@@ -636,12 +649,17 @@ static int handle_incoming_request(h2o_http2_conn_t *conn, h2o_http2_stream_t *s
+     int ret, header_exists_map = 0;
+     h2o_iovec_t expect = h2o_iovec_init(NULL, 0);
+ 
++    h2o_iovec_t *raw_content_length = NULL;
++#ifdef H2O_WITH_PHP
++    raw_content_length = &stream->req.content_length_header;
++#endif
++
+     assert(stream->state == H2O_HTTP2_STREAM_STATE_RECV_HEADERS);
+ 
+-    if ((ret = h2o_hpack_parse_request(&stream->req.pool, h2o_hpack_decode_header, &conn->_input_header_table,
++    if ((ret = h2o_hpack_parse_request_ex(&stream->req.pool, h2o_hpack_decode_header, &conn->_input_header_table,
+                                        &stream->req.input.method, &stream->req.input.scheme, &stream->req.input.authority,
+                                        &stream->req.input.path, &stream->req.upgrade, &stream->req.headers, &header_exists_map,
+-                                       &stream->req.content_length, &expect, NULL, src, len, err_desc)) != 0) {
++                                       &stream->req.content_length, &expect, NULL, src, len, err_desc, raw_content_length)) != 0) {
+         /* all errors except invalid-header-char are connection errors */
+         if (ret != H2O_HTTP2_ERROR_INVALID_HEADER_CHAR)
+             return ret;
+@@ -1814,9 +1832,31 @@ static void on_dos_process_delay(h2o_timer_t *timer)
      run_pending_requests(conn);
  }
  
@@ -518,11 +1533,151 @@ index 33126a0..4d7ba65 100644
          .get_sockname = get_sockname,
          .get_peername = get_peername,
          .get_ptls = get_ptls,
+diff --git a/lib/http2/hpack.c b/lib/http2/hpack.c
+index cd890539f..371ca5d30 100644
+--- a/lib/http2/hpack.c
++++ b/lib/http2/hpack.c
+@@ -19,6 +19,7 @@
+  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+  * IN THE SOFTWARE.
+  */
++#include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -503,10 +504,23 @@ int h2o_hpack_parse_request(h2o_mem_pool_t *pool, h2o_hpack_decode_header_cb dec
+                             const h2o_url_scheme_t **scheme, h2o_iovec_t *authority, h2o_iovec_t *path, h2o_iovec_t *protocol,
+                             h2o_headers_t *headers, int *pseudo_header_exists_map, size_t *content_length, h2o_iovec_t *expect,
+                             h2o_iovec_t *datagram_flow_id, const uint8_t *src, size_t len, const char **err_desc)
++{
++    return h2o_hpack_parse_request_ex(pool, decode_cb, decode_ctx, method, scheme, authority, path, protocol, headers,
++                                      pseudo_header_exists_map, content_length, expect, datagram_flow_id, src, len, err_desc, NULL);
++}
++
++int h2o_hpack_parse_request_ex(h2o_mem_pool_t *pool, h2o_hpack_decode_header_cb decode_cb, void *decode_ctx, h2o_iovec_t *method,
++                               const h2o_url_scheme_t **scheme, h2o_iovec_t *authority, h2o_iovec_t *path, h2o_iovec_t *protocol,
++                               h2o_headers_t *headers, int *pseudo_header_exists_map, size_t *content_length, h2o_iovec_t *expect,
++                               h2o_iovec_t *datagram_flow_id, const uint8_t *src, size_t len, const char **err_desc,
++                               h2o_iovec_t *raw_content_length)
+ {
+     const uint8_t *src_end = src + len;
+     size_t num_headers_decoded = 0;
+-
++    bool host_seen = false;
++    h2o_iovec_t parsed_content_length = {NULL, 0};
++    if (raw_content_length != NULL)
++        *raw_content_length = parsed_content_length;
+     *content_length = SIZE_MAX;
+ 
+     while (src != src_end) {
+@@ -589,16 +603,30 @@ int h2o_hpack_parse_request(h2o_mem_pool_t *pool, h2o_hpack_decode_header_cb dec
+                 h2o_token_t *token = H2O_STRUCT_FROM_MEMBER(h2o_token_t, buf, name);
+                 if (token->flags.is_hpack_special) {
+                     if (token == H2O_TOKEN_CONTENT_LENGTH) {
++                        if (*content_length != SIZE_MAX) {
++                            /* a duplicate content-length header is only permitted when identical */
++                            if (h2o_strtosize(value.base, value.len) != *content_length) {
++                                *err_desc = h2o_hpack_err_invalid_content_length_header;
++                                return H2O_HTTP2_ERROR_PROTOCOL;
++                            }
++                            goto Next;
++                        }
+                         if ((*content_length = h2o_strtosize(value.base, value.len)) == SIZE_MAX) {
+                             *err_desc = h2o_hpack_err_invalid_content_length_header;
+                             return H2O_HTTP2_ERROR_PROTOCOL;
+                         }
++                        parsed_content_length = value;
+                         goto Next;
+                     } else if (token == H2O_TOKEN_EXPECT) {
+                         *expect = value;
+                         goto Next;
+                     } else if (token == H2O_TOKEN_HOST && authority != NULL) {
+-                        /* HTTP2 allows the use of host header (in place of :authority) */
++                        /* HTTP2 allows the use of host header (in place of :authority), but not more than one */
++                        if (host_seen) {
++                            *err_desc = h2o_hpack_err_invalid_pseudo_header;
++                            return H2O_HTTP2_ERROR_PROTOCOL;
++                        }
++                        host_seen = true;
+                         if (authority->base == NULL)
+                             *authority = value;
+                         goto Next;
+@@ -632,6 +660,8 @@ int h2o_hpack_parse_request(h2o_mem_pool_t *pool, h2o_hpack_decode_header_cb dec
+ 
+     if (*err_desc != NULL)
+         return H2O_HTTP2_ERROR_INVALID_HEADER_CHAR;
++    if (raw_content_length != NULL && parsed_content_length.base != NULL)
++        *raw_content_length = h2o_strdup(pool, parsed_content_length.base, parsed_content_length.len);
+     return 0;
+ }
+ 
+diff --git a/lib/http3/qpack.c b/lib/http3/qpack.c
+index 40bc22a8a..4c44fc923 100644
+--- a/lib/http3/qpack.c
++++ b/lib/http3/qpack.c
+@@ -837,11 +837,26 @@ int h2o_qpack_parse_request(h2o_mem_pool_t *pool, h2o_qpack_decoder_t *qpack, in
+                             h2o_iovec_t *datagram_flow_id, uint64_t num_blocked, uint64_t *blocked_ref,
+                             h2o_qpack_section_stats_t *stats_updated, uint8_t *outbuf, size_t *outbufsize, const uint8_t *_src,
+                             size_t len, const char **err_desc)
++{
++    return h2o_qpack_parse_request_ex(pool, qpack, stream_id, method, scheme, authority, path, protocol, headers,
++                                      pseudo_header_exists_map, content_length, expect, datagram_flow_id, num_blocked, blocked_ref,
++                                      stats_updated, outbuf, outbufsize, _src, len, err_desc, NULL);
++}
++
++int h2o_qpack_parse_request_ex(h2o_mem_pool_t *pool, h2o_qpack_decoder_t *qpack, int64_t stream_id, h2o_iovec_t *method,
++                               const h2o_url_scheme_t **scheme, h2o_iovec_t *authority, h2o_iovec_t *path, h2o_iovec_t *protocol,
++                               h2o_headers_t *headers, int *pseudo_header_exists_map, size_t *content_length, h2o_iovec_t *expect,
++                               h2o_iovec_t *datagram_flow_id, uint64_t num_blocked, uint64_t *blocked_ref,
++                               h2o_qpack_section_stats_t *stats_updated, uint8_t *outbuf, size_t *outbufsize, const uint8_t *_src,
++                               size_t len, const char **err_desc, h2o_iovec_t *raw_content_length)
+ {
+     struct st_h2o_qpack_decode_header_ctx_t ctx;
+     const uint8_t *src = _src, *src_end = src + len;
+     int ret;
+ 
++    if (raw_content_length != NULL)
++        *raw_content_length = h2o_iovec_init(NULL, 0);
++
+     if ((ret = parse_decode_context(qpack, &ctx, &src, src_end)) != 0)
+         return ret;
+     if ((ret = check_decode_context_blocked(qpack, &ctx, num_blocked, blocked_ref)) != 0)
+@@ -849,9 +864,9 @@ int h2o_qpack_parse_request(h2o_mem_pool_t *pool, h2o_qpack_decoder_t *qpack, in
+     if (blocked_ref != NULL && *blocked_ref != 0)
+         return 0;
+     ctx.stats = stats_updated;
+-    if ((ret = h2o_hpack_parse_request(pool, decode_header, &ctx, method, scheme, authority, path, protocol, headers,
++    if ((ret = h2o_hpack_parse_request_ex(pool, decode_header, &ctx, method, scheme, authority, path, protocol, headers,
+                                        pseudo_header_exists_map, content_length, expect, datagram_flow_id, src, src_end - src,
+-                                       err_desc)) != 0) {
++                                       err_desc, raw_content_length)) != 0) {
+         /* bail out if the error is a hard error, otherwise build header ack then return */
+         if (ret != H2O_HTTP2_ERROR_INVALID_HEADER_CHAR)
+             return normalize_error_code(ret);
 diff --git a/lib/http3/server.c b/lib/http3/server.c
-index 1add643..1023142 100644
+index 1add643a9..1930e3316 100644
 --- a/lib/http3/server.c
 +++ b/lib/http3/server.c
-@@ -2333,11 +2333,23 @@ void h2o_http3_server_init_context(h2o_context_t *h2o, h2o_quic_ctx_t *ctx, h2o_
+@@ -1536,12 +1536,16 @@ static quicly_error_t handle_input_expect_headers(struct st_h2o_http3_server_str
+ 
+     /* parse the headers */
+     stream->stats.req.headers_frame_bytes += frame.length;
+-    if ((ret = h2o_qpack_parse_request(&stream->req.pool, get_conn(stream)->h3.qpack.dec, stream->quic->stream_id,
++    h2o_iovec_t *raw_content_length = NULL;
++#ifdef H2O_WITH_PHP
++    raw_content_length = &stream->req.content_length_header;
++#endif
++    if ((ret = h2o_qpack_parse_request_ex(&stream->req.pool, get_conn(stream)->h3.qpack.dec, stream->quic->stream_id,
+                                        &stream->req.input.method, &stream->req.input.scheme, &stream->req.input.authority,
+                                        &stream->req.input.path, &stream->req.upgrade, &stream->req.headers, &header_exists_map,
+                                        &stream->req.content_length, &expect, &datagram_flow_id_field, conn->num_qpack_blocked,
+                                        &stream->qpack_blocked_ref, &stream->stats.req.qpack, header_ack, &header_ack_len,
+-                                       frame.payload, frame.length, err_desc)) != 0 &&
++                                       frame.payload, frame.length, err_desc, raw_content_length)) != 0 &&
+         ret != H2O_HTTP2_ERROR_INVALID_HEADER_CHAR) {
+         return ret;
+     }
+@@ -2333,11 +2337,23 @@ void h2o_http3_server_init_context(h2o_context_t *h2o, h2o_quic_ctx_t *ctx, h2o_
                                   &h2o->quic_stats);
  }
  
@@ -547,10 +1702,10 @@ index 1add643..1023142 100644
          .get_peername = get_peername,
          .get_ptls = get_ptls,
 diff --git a/src/main.c b/src/main.c
-index 826599c..7ccd7cb 100644
+index 826599c9b..235f6d9f0 100644
 --- a/src/main.c
 +++ b/src/main.c
-@@ -99,6 +99,13 @@
+@@ -99,6 +99,14 @@
  #include "h2o/io_uring.h"
  #endif
  #include "standalone.h"
@@ -559,12 +1714,13 @@ index 826599c..7ccd7cb 100644
 +#include "../../../src/runtime/ocsp.h"
 +#include "../../../src/runtime/host_fds.h"
 +#include "../../../src/runtime/master.h"
++#include "../../../src/runtime/lifecycle.h"
 +#include "../../../src/runtime/assets.h"
 +static char *hp_executable_path;
  #include "../lib/probes_.h"
  
  #if defined(__linux__)
-@@ -106,6 +113,37 @@
+@@ -106,6 +114,37 @@
  #define ASYNC_NB_USE_EVENTFD 1
  #endif
  
@@ -602,7 +1758,52 @@ index 826599c..7ccd7cb 100644
  #ifdef TCP_FASTOPEN
  #define H2O_DEFAULT_LENGTH_TCP_FASTOPEN_QUEUE 4096
  #else
-@@ -362,7 +400,7 @@ static struct {
+@@ -202,8 +241,33 @@ struct listener_ssl_config_t {
+     } cc;
+ };
+ 
++/**
++ * ACL (file mode and ownership) to be applied to a unix listener socket. `mode` is UINT_MAX and the `*_set` flags are zero when
++ * the corresponding element is not configured.
++ */
++struct unix_listener_acl_t {
++    unsigned mode;
++    uid_t uid;
++    gid_t gid;
++    unsigned uid_set : 1;
++    unsigned gid_set : 1;
++};
++
++/* One owner turn's live sockets share an epoch. All references are released on
++ * the accepting loop; retiring an epoch detaches it from the next owner's quota. */
++struct accept_quota_t {
++    struct listener_config_t *listener;
++    size_t count;
++};
++
+ struct listener_config_t {
+     H2O_VECTOR(int) fds;
++    /* Only duplicate descriptors of one stream endpoint share an accept turn.
++     * Independent reuseport endpoints and QUIC retain their existing readers. */
++    size_t accept_owner;
++    /* Only the current owner accesses this pointer, transferred by owner release/acquire. */
++    struct accept_quota_t *accept_quota;
++    unsigned shared_accept : 1;
+     struct sockaddr_storage addr;
+     socklen_t addrlen;
+     h2o_hostconf_t **hosts;
+@@ -233,6 +297,10 @@ struct listener_config_t {
+     unsigned sndbuf, rcvbuf;
+     int proxy_protocol;
+     h2o_iovec_t tcp_congestion_controller; /* default CC for this address */
++    /**
++     * ACL applied to the socket file; used only when `addr` is AF_UNIX
++     */
++    struct unix_listener_acl_t unix_acl;
+ };
+ 
+ struct listener_ctx_t {
+@@ -362,7 +430,7 @@ static struct {
      .threads = NULL,
      .shutdown_requested = 0,
      .state = {{0}},
@@ -611,7 +1812,7 @@ index 826599c..7ccd7cb 100644
      .crash_handler_wait_pipe_close = 0,
      .tcp_reuseport = 0,
      .ssl_zerocopy = 0,
-@@ -620,11 +658,11 @@ static void spawn_acme_loader(void)
+@@ -620,11 +688,11 @@ static void spawn_acme_loader(void)
  
      /* launch the helper, that exits itself when STDIN is closed */
      int fds[2];
@@ -625,7 +1826,7 @@ index 826599c..7ccd7cb 100644
  
      free(helper_argv[4]);
      free(helper_argv);
-@@ -651,7 +689,7 @@ static void close_acme_loader_pipe(void)
+@@ -651,7 +719,7 @@ static void close_acme_loader_pipe(void)
      if (sscanf(fdstr, "%d", &fd) != 1)
          h2o_fatal("failed to parse H2O_ACME_LOADER_FD:%s", fdstr);
  
@@ -634,7 +1835,7 @@ index 826599c..7ccd7cb 100644
      unsetenv("H2O_ACME_LOADER_FD");
  }
  
-@@ -837,7 +875,7 @@ static void async_nb_do_async_transaction(ASYNC_JOB *job, neverbleed_iobuf_t *bu
+@@ -837,7 +905,7 @@ static void async_nb_do_async_transaction(ASYNC_JOB *job, neverbleed_iobuf_t *bu
  
      /* setup fd to notify OpenSSL; eventfd is used if available, as it is lightweight and uses only one file descriptor */
  #if ASYNC_NB_USE_EVENTFD
@@ -643,7 +1844,7 @@ index 826599c..7ccd7cb 100644
          char errbuf[256];
          h2o_fatal("eventfd:%s", h2o_strerror_r(errno, errbuf, sizeof(errbuf)));
      }
-@@ -874,9 +912,9 @@ static void async_nb_do_async_transaction(ASYNC_JOB *job, neverbleed_iobuf_t *bu
+@@ -874,9 +942,9 @@ static void async_nb_do_async_transaction(ASYNC_JOB *job, neverbleed_iobuf_t *bu
  
      /* close the notification file descriptors used for notification */
  #if !ASYNC_NB_USE_EVENTFD
@@ -655,7 +1856,7 @@ index 826599c..7ccd7cb 100644
  }
  
  #endif
-@@ -1365,7 +1403,9 @@ static void build_ssl_dynamic_data(struct listener_ssl_identity_t *identity, h2o
+@@ -1365,7 +1433,9 @@ static void build_ssl_dynamic_data(struct listener_ssl_identity_t *identity, h2o
  
  static int get_ocsp_response(const char *cmd, h2o_iovec_t cert_chain_pem, h2o_buffer_t **resp)
  {
@@ -666,7 +1867,7 @@ index 826599c..7ccd7cb 100644
      int child_status, ret;
  
      if (h2o_read_command(cmd_fullpath, argv, cert_chain_pem, resp, &child_status) != 0) {
-@@ -2299,7 +2339,7 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
+@@ -2299,7 +2369,7 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
      *ocsp_stapling = (struct listener_ssl_ocsp_stapling_t){
          .interval = 4 * 60 * 60, /* default update interval of 4 hours */
          .max_failures = 3,       /* by default, permit 3 consecutive failures before temporary disabling OCSP stapling */
@@ -675,7 +1876,7 @@ index 826599c..7ccd7cb 100644
      };
      if (ocsp_update_cmd != NULL)
          ocsp_stapling->cmd = h2o_strdup(NULL, (*ocsp_update_cmd)->data.scalar, SIZE_MAX).base;
-@@ -2310,8 +2350,12 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
+@@ -2310,8 +2380,12 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
      if (ocsp_update_interval_node != NULL) {
          if (h2o_configurator_scanf(cmd, *ocsp_update_interval_node, "%" SCNu64, &ocsp_stapling->interval) != 0)
              goto Error;
@@ -689,7 +1890,7 @@ index 826599c..7ccd7cb 100644
      }
  
      /* add the host to the existing SSL config, if the certificate file is already registered */
-@@ -2323,6 +2367,11 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
+@@ -2323,6 +2397,11 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
                  continue;
              /* matched! add host */
              listener_setup_ssl_add_host(ssl_config, ctx->hostconf->authority.hostport);
@@ -701,7 +1902,95 @@ index 826599c..7ccd7cb 100644
              return 0;
          }
      }
-@@ -2745,7 +2794,7 @@ static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, str
+@@ -2649,6 +2728,7 @@ static struct listener_config_t *add_listener(int fd, struct sockaddr *addr, soc
+     listener->tcp_congestion_controller = h2o_iovec_init(NULL, 0);
+     listener->sndbuf = sndbuf;
+     listener->rcvbuf = rcvbuf;
++    listener->unix_acl.mode = UINT_MAX;
+ 
+     conf.listeners = h2o_mem_realloc(conf.listeners, sizeof(*conf.listeners) * (conf.num_listeners + 1));
+     conf.listeners[conf.num_listeners++] = listener;
+@@ -2694,29 +2774,33 @@ Found:
+     return conf.server_starter.fds[i];
+ }
+ 
+-static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, struct sockaddr_un *sa, yoml_t **owner_node,
+-                              yoml_t **group_node, yoml_t **permission_node)
++/**
++ * Resolves the `owner`/`group`/`permission` elements of a unix `listen` directive into an ACL. Returns -1 if the elements are
++ * invalid, in which case an error message has been emitted.
++ */
++static int resolve_unix_listener_acl(h2o_configurator_command_t *cmd, yoml_t **owner_node, yoml_t **group_node,
++                                     yoml_t **permission_node, struct unix_listener_acl_t *acl)
+ {
+-    struct stat st;
+-    int fd = -1;
+     struct passwd *owner = NULL, pwbuf;
+     char pwbuf_buf[65536];
+-    gid_t owner_gid = -1;
+-    unsigned mode = UINT_MAX;
+ 
+-    /* obtain owner and permission */
++    memset(acl, 0, sizeof(*acl));
++    acl->mode = UINT_MAX;
++
+     if (owner_node == NULL && group_node != NULL) {
+         h2o_configurator_errprintf(cmd, *group_node, "`group` cannot be used without `owner`");
+-        goto ErrorExit;
++        return -1;
+     }
+     if (owner_node != NULL) {
+         int r = getpwnam_r((*owner_node)->data.scalar, &pwbuf, pwbuf_buf, sizeof(pwbuf_buf), &owner);
+         if (r != 0 || owner == NULL) {
+             h2o_configurator_errprintf(cmd, *owner_node, "failed to obtain uid of user:%s: %s", (*owner_node)->data.scalar,
+                                        (r == 0 ? "Not found" : strerror(r)));
+-            goto ErrorExit;
++            return -1;
+         }
+-        owner_gid = owner->pw_gid;
++        acl->uid = owner->pw_uid;
++        acl->uid_set = 1;
++        acl->gid = owner->pw_gid;
+         if (group_node != NULL) {
+             struct group *group = NULL, grbuf;
+             char grbuf_buf[65536];
+@@ -2724,16 +2808,31 @@ static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, str
+             if (r != 0 || group == NULL) {
+                 h2o_configurator_errprintf(cmd, *group_node, "failed to obtain gid of group:%s: %s", (*group_node)->data.scalar,
+                                            (r == 0 ? "Not found" : strerror(r)));
+-                goto ErrorExit;
++                return -1;
+             }
+-            owner_gid = group->gr_gid;
++            acl->gid = group->gr_gid;
+         }
++        acl->gid_set = 1;
+     }
+-    if (permission_node != NULL && h2o_configurator_scanf(cmd, *permission_node, "%o", &mode) != 0) {
++    if (permission_node != NULL && h2o_configurator_scanf(cmd, *permission_node, "%o", &acl->mode) != 0) {
+         h2o_configurator_errprintf(cmd, *permission_node, "`permission` must be an octal number");
+-        goto ErrorExit;
++        return -1;
+     }
+ 
++    return 0;
++}
++
++static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, struct sockaddr_un *sa, yoml_t **owner_node,
++                              yoml_t **group_node, yoml_t **permission_node)
++{
++    struct stat st;
++    int fd = -1;
++    struct unix_listener_acl_t acl;
++
++    /* obtain owner and permission */
++    if (resolve_unix_listener_acl(cmd, owner_node, group_node, permission_node, &acl) != 0)
++        goto ErrorExit;
++
+     /* remove existing socket file as suggested in #45 */
+     if (lstat(sa->sun_path, &st) == 0) {
+         if (S_ISSOCK(st.st_mode)) {
+@@ -2745,20 +2844,20 @@ static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, str
      }
  
      /* add new listener */
@@ -710,7 +1999,25 @@ index 826599c..7ccd7cb 100644
          h2o_configurator_errprintf(NULL, node, "failed to listen to socket:%s: %s", sa->sun_path, strerror(errno));
          goto ErrorExit;
      }
-@@ -2766,7 +2815,7 @@ static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, str
+     set_cloexec(fd);
+ 
+     /* set file owner and permission */
+-    if (owner != NULL && chown(sa->sun_path, owner->pw_uid, owner_gid) != 0) {
+-        h2o_configurator_errprintf(NULL, node, "failed to chown socket:%s to %s (gid %u): %s", sa->sun_path, owner->pw_name,
+-                                   (unsigned)owner_gid, strerror(errno));
++    if (acl.uid_set && chown(sa->sun_path, acl.uid, acl.gid) != 0) {
++        h2o_configurator_errprintf(NULL, node, "failed to chown socket:%s to %s (gid %u): %s", sa->sun_path,
++                                   (*owner_node)->data.scalar, (unsigned)acl.gid, strerror(errno));
+         goto ErrorExit;
+     }
+-    if (mode != UINT_MAX && chmod(sa->sun_path, mode) != 0) {
+-        h2o_configurator_errprintf(NULL, node, "failed to chmod socket:%s to %o: %s", sa->sun_path, mode, strerror(errno));
++    if (acl.mode != UINT_MAX && chmod(sa->sun_path, acl.mode) != 0) {
++        h2o_configurator_errprintf(NULL, node, "failed to chmod socket:%s to %o: %s", sa->sun_path, acl.mode, strerror(errno));
+         goto ErrorExit;
+     }
+ 
+@@ -2766,7 +2865,7 @@ static int open_unix_listener(h2o_configurator_command_t *cmd, yoml_t *node, str
  
  ErrorExit:
      if (fd != -1)
@@ -719,7 +2026,7 @@ index 826599c..7ccd7cb 100644
      return -1;
  }
  
-@@ -2786,7 +2835,7 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
+@@ -2786,7 +2885,7 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
  {
      int fd;
  
@@ -728,7 +2035,7 @@ index 826599c..7ccd7cb 100644
          goto Error;
      set_cloexec(fd);
  
-@@ -2869,7 +2918,7 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
+@@ -2869,7 +2968,7 @@ static int open_listener(int domain, int type, int protocol, struct sockaddr *ad
  
  Error:
      if (fd != -1)
@@ -737,7 +2044,7 @@ index 826599c..7ccd7cb 100644
      return -1;
  }
  
-@@ -2959,7 +3008,7 @@ static struct addrinfo *resolve_address(h2o_configurator_command_t *cmd, yoml_t
+@@ -2959,7 +3058,7 @@ static struct addrinfo *resolve_address(h2o_configurator_command_t *cmd, yoml_t
          hints.ai_flags &= ~AI_ADDRCONFIG;
          int fd;
  #define IS_SUPPORTED(af)                                                                                                           \
@@ -746,7 +2053,16 @@ index 826599c..7ccd7cb 100644
          int has_v4 = IS_SUPPORTED(AF_INET), has_v6 = IS_SUPPORTED(AF_INET6);
  #undef IS_SUPPORTED
          if (has_v4 != has_v6)
-@@ -3859,7 +3908,7 @@ static int configure_quic_forward_node(h2o_configurator_command_t *cmd, struct s
+@@ -3283,6 +3382,8 @@ static int on_config_listen_element(h2o_configurator_command_t *cmd, h2o_configu
+             listener = add_listener(fd, (struct sockaddr *)&sa, sizeof(sa), ctx->hostconf == NULL, proxy_protocol, stream_sndbuf,
+                                     stream_rcvbuf);
+             listener_is_new = 1;
++            if (resolve_unix_listener_acl(cmd, owner_node, group_node, permission_node, &listener->unix_acl) != 0)
++                return -1;
+         } else if (listener->proxy_protocol != proxy_protocol) {
+             goto ProxyConflict;
+         }
+@@ -3859,7 +3960,7 @@ static int configure_quic_forward_node(h2o_configurator_command_t *cmd, struct s
          goto Exit;
  
      /* open connected socket */
@@ -755,7 +2071,7 @@ index 826599c..7ccd7cb 100644
          connect(target->fd, ai->ai_addr, ai->ai_addrlen) != 0) {
          h2o_configurator_errprintf(cmd, input->value, "failed to connect to %s:%s", input->value->data.scalar, strerror(errno));
          goto Exit;
-@@ -3870,7 +3919,7 @@ Exit:
+@@ -3870,7 +3971,7 @@ Exit:
      if (ai != NULL)
          freeaddrinfo(ai);
      if (!success && target->fd != -1)
@@ -764,7 +2080,7 @@ index 826599c..7ccd7cb 100644
      return success ? 0 : -1;
  }
  
-@@ -4186,11 +4235,13 @@ static void on_sigterm_set_flag_notify_threads(int signo)
+@@ -4186,11 +4287,13 @@ static void on_sigterm_set_flag_notify_threads(int signo)
  
  static int popen_crash_handler(void)
  {
@@ -779,7 +2095,7 @@ index 826599c..7ccd7cb 100644
          perror("pipe failed");
          return -1;
      }
-@@ -4204,12 +4255,12 @@ static int popen_crash_handler(void)
+@@ -4204,12 +4307,12 @@ static int popen_crash_handler(void)
                          -1};
      if (h2o_spawnp(cmd_fullpath, argv, mapped_fds, 0) == -1) {
          /* silently ignore error */
@@ -795,7 +2111,7 @@ index 826599c..7ccd7cb 100644
      return pipefds[1];
  }
  
-@@ -4225,7 +4276,7 @@ static void on_sigfatal(int signo)
+@@ -4225,7 +4328,7 @@ static void on_sigfatal(int signo)
      int framecnt = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
      backtrace_symbols_fd(frames, framecnt, crash_handler_fd);
  
@@ -804,7 +2120,164 @@ index 826599c..7ccd7cb 100644
          struct pollfd pfd[1];
          pfd[0].fd = crash_handler_fd;
          pfd[0].events = POLLERR | POLLHUP;
-@@ -4806,7 +4857,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+@@ -4510,6 +4613,17 @@ static void forwarded_quic_socket_on_read(h2o_socket_t *sock, const char *err)
+ 
+ static void on_socketclose(void *data)
+ {
++    struct accept_quota_t *quota = data;
++    if (quota != NULL) {
++        assert(quota->count != 0);
++        if (--quota->count == 0) {
++            if (quota->listener != NULL) {
++                assert(quota->listener->accept_quota == quota);
++                quota->listener->accept_quota = NULL;
++            }
++            free(quota);
++        }
++    }
+     num_connections(-1);
+ }
+ 
+@@ -4522,16 +4636,40 @@ static void close_idle_connections(h2o_context_t *ctx)
+     }
+ }
+ 
++static void accept_socket(struct listener_ctx_t *ctx, h2o_socket_t *sock)
++{
++    struct listener_config_t *listener_config = conf.listeners[ctx->listener_index];
++    if (listener_config->sndbuf != 0 && setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_SNDBUF, &listener_config->sndbuf,
++                                                   sizeof(listener_config->sndbuf)) != 0)
++        h2o_perror("failed to set SO_SNDBUF");
++    if (listener_config->rcvbuf != 0 && setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_RCVBUF, &listener_config->rcvbuf,
++                                                   sizeof(listener_config->rcvbuf)) != 0)
++        h2o_perror("failed to set SO_RCVBUF");
++    set_tcp_congestion_controller(sock, listener_config->tcp_congestion_controller);
++
++    h2o_accept(&ctx->accept_ctx, sock);
++}
++
+ static void on_accept(h2o_socket_t *listener, const char *err)
+ {
+     struct listener_ctx_t *ctx = listener->data;
++    struct listener_config_t *listener_config = conf.listeners[ctx->listener_index];
+ 
+     /* TLS Handshakes take about 1ms, this effectively limits the latency induced by TLS handshakes to 10ms per event loop. */
+-    size_t num_accepts = 10;
++    h2o_socket_t *accepted[10];
++    size_t num_accepts = 0, remaining = PTLS_ELEMENTSOF(accepted);
++    int capacity_exhausted = 0;
+ 
+-    if (err != NULL) {
++    if (conf.shutdown_requested ||
++        (listener_config->shared_accept &&
++         __atomic_load_n(&listener_config->accept_owner, __ATOMIC_ACQUIRE) != thread_index))
+         return;
++    if (listener_config->shared_accept && listener_config->accept_quota != NULL) {
++        assert(listener_config->accept_quota->count < remaining);
++        remaining -= listener_config->accept_quota->count;
+     }
++    if (err != NULL)
++        goto Handoff;
+ 
+     do {
+         h2o_socket_t *sock;
+@@ -4543,6 +4681,7 @@ static void on_accept(h2o_socket_t *listener, const char *err)
+              * server does not check if the number of connections has exceeded _after_ epoll notifies of a new connection _but_
+              * _before_ calling `accept`.  In other words t/40max-connections.t may fail. */
+             num_connections(-1);
++            capacity_exhausted = 1;
+             break;
+         }
+         if ((sock = h2o_evloop_socket_accept(listener)) == NULL) {
+@@ -4552,20 +4691,45 @@ static void on_accept(h2o_socket_t *listener, const char *err)
+         num_sessions(1);
+ 
+         sock->on_close.cb = on_socketclose;
+-        sock->on_close.data = ctx->accept_ctx.ctx;
++        sock->on_close.data = NULL;
+ 
+-        struct listener_config_t *listener_config = conf.listeners[ctx->listener_index];
+-        if (listener_config->sndbuf != 0 && setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_SNDBUF, &listener_config->sndbuf,
+-                                                       sizeof(listener_config->sndbuf)) != 0)
+-            h2o_perror("failed to set SO_SNDBUF");
+-        if (listener_config->rcvbuf != 0 && setsockopt(h2o_socket_get_fd(sock), SOL_SOCKET, SO_RCVBUF, &listener_config->rcvbuf,
+-                                                       sizeof(listener_config->rcvbuf)) != 0)
+-            h2o_perror("failed to set SO_RCVBUF");
+-        set_tcp_congestion_controller(sock, listener_config->tcp_congestion_controller);
++        if (listener_config->shared_accept) {
++            if (listener_config->accept_quota == NULL) {
++                listener_config->accept_quota = h2o_mem_alloc(sizeof(*listener_config->accept_quota));
++                *listener_config->accept_quota = (struct accept_quota_t){listener_config, 0};
++            }
++            ++listener_config->accept_quota->count;
++            sock->on_close.data = listener_config->accept_quota;
++            accepted[num_accepts++] = sock;
++        } else {
++            accept_socket(ctx, sock);
++        }
+ 
+-        h2o_accept(&ctx->accept_ctx, sock);
++    } while (--remaining != 0);
+ 
+-    } while (--num_accepts != 0);
++Handoff:
++    if (listener_config->shared_accept) {
++        /* Closed sockets refund only their own epoch. A short callback keeps
++         * its live resource quota; EAGAIN needs no retry or synthetic wake. */
++        if (err == NULL && remaining != 0 && !(capacity_exhausted && num_accepts != 0))
++            goto Dispatch;
++        /* Yield before TLS / protocol work when this callback fills its entry
++         * quota, or uses the available global capacity. The latter preserves
++         * backlog fairness even when max-connections is below ten. Old socket
++         * closes can release their detached epoch, never the new owner's quota. */
++        if (listener_config->accept_quota != NULL) {
++            listener_config->accept_quota->listener = NULL;
++            listener_config->accept_quota = NULL;
++        }
++        size_t next = (thread_index + 1) % conf.thread_map.size;
++        h2o_socket_read_stop(listener);
++        __atomic_store_n(&listener_config->accept_owner, next, __ATOMIC_RELEASE);
++        if (!conf.shutdown_requested)
++            h2o_multithread_send_message(&conf.threads[next].server_notifications, NULL);
++    }
++Dispatch:
++    for (size_t i = 0; i != num_accepts; ++i)
++        accept_socket(ctx, accepted[i]);
+ }
+ 
+ static int validate_token(h2o_http3_server_ctx_t *ctx, struct sockaddr *remote, ptls_iovec_t client_cid, ptls_iovec_t server_cid,
+@@ -4702,18 +4866,19 @@ ExitNoDecrements:
+ 
+ static void update_listener_state(struct listener_ctx_t *listeners)
+ {
+-    size_t i;
++    int has_capacity = num_connections(0) < conf.max_connections;
+ 
+-    if (num_connections(0) < conf.max_connections) {
+-        for (i = 0; i != conf.num_listeners; ++i) {
+-            if (conf.listeners[i]->quic.ctx == NULL && !h2o_socket_is_reading(listeners[i].sock))
+-                h2o_socket_read_start(listeners[i].sock, on_accept);
+-        }
+-    } else {
+-        for (i = 0; i != conf.num_listeners; ++i) {
+-            if (conf.listeners[i]->quic.ctx == NULL && h2o_socket_is_reading(listeners[i].sock))
+-                h2o_socket_read_stop(listeners[i].sock);
+-        }
++    for (size_t i = 0; i != conf.num_listeners; ++i) {
++        struct listener_config_t *config = conf.listeners[i];
++        if (config->quic.ctx != NULL)
++            continue;
++        int should_read = has_capacity &&
++                          (!config->shared_accept ||
++                           __atomic_load_n(&config->accept_owner, __ATOMIC_ACQUIRE) == thread_index);
++        if (should_read && !h2o_socket_is_reading(listeners[i].sock))
++            h2o_socket_read_start(listeners[i].sock, on_accept);
++        else if (!should_read && h2o_socket_is_reading(listeners[i].sock))
++            h2o_socket_read_stop(listeners[i].sock);
+     }
+ }
+ 
+@@ -4806,7 +4971,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
              listeners[i].http3.ctx.qpack = listener_config->quic.qpack;
              int fds[2];
              /* TODO switch to using named socket in temporary directory to forward packets between server generations */
@@ -813,7 +2286,7 @@ index 826599c..7ccd7cb 100644
                  char buf[256];
                  h2o_fatal("socketpair(AF_UNIX, SOCK_DGRAM) failed: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
              }
-@@ -4829,7 +4880,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+@@ -4829,7 +4994,7 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
  
      /* now that all worker threads are ready, in main thread, set signal handler for graceful shutdown / or exit immediately */
      if (thread_index == 0) {
@@ -822,7 +2295,7 @@ index 826599c..7ccd7cb 100644
          if (conf.shutdown_requested)
              exit(0);
          fprintf(stderr, "h2o server (pid:%d) is ready to serve requests with %zu threads\n", (int)getpid(), conf.thread_map.size);
-@@ -4837,6 +4888,8 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+@@ -4837,6 +5002,8 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
  
      /* let all worker threads start accepting connections */
      h2o_barrier_wait(&conf.startup_sync_barrier_post);
@@ -831,7 +2304,7 @@ index 826599c..7ccd7cb 100644
  
      /* the main loop */
      while (!conf.shutdown_requested) {
-@@ -4863,18 +4916,43 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
+@@ -4863,18 +5030,43 @@ H2O_NORETURN static void *run_loop(void *_thread_index)
              listeners[i].http3.ctx.super.acceptor = NULL;
          }
      }
@@ -879,7 +2352,45 @@ index 826599c..7ccd7cb 100644
      /* remove the pid file */
      if (conf.pid_file != NULL)
          unlink(conf.pid_file);
-@@ -4963,9 +5041,7 @@ static int run_using_server_starter(const char *h2o_cmd, const char *config_file
+@@ -4916,7 +5108,7 @@ static char **build_server_starter_argv(const char *h2o_cmd, const char *config_
+     }
+ 
+     for (i = 0; i != conf.num_listeners; ++i) {
+-        char *newarg;
++        char *newarg, *aclarg = NULL;
+         switch (conf.listeners[i]->addr.ss_family) {
+         default: {
+             char host[NI_MAXHOST], serv[NI_MAXSERV + 1];
+@@ -4941,12 +5133,27 @@ static char **build_server_starter_argv(const char *h2o_cmd, const char *config_
+         } break;
+         case AF_UNIX: {
+             struct sockaddr_un *sa = (void *)&conf.listeners[i]->addr;
++            struct listener_config_t *listener = conf.listeners[i];
+             newarg = h2o_mem_alloc(sizeof("--path=") + strlen(sa->sun_path));
+             sprintf(newarg, "--path=%s", sa->sun_path);
++            if (listener->unix_acl.mode != UINT_MAX || listener->unix_acl.uid_set || listener->unix_acl.gid_set) {
++                aclarg = h2o_mem_alloc(sizeof("--path-acl=") + 3 * sizeof("-9223372036854775808"));
++                char *p = aclarg;
++                p += sprintf(p, "--path-acl=");
++                if (listener->unix_acl.mode != UINT_MAX) {
++                    p += sprintf(p, "%o", listener->unix_acl.mode);
++                } else {
++                    p += sprintf(p, "-1");
++                }
++                p += sprintf(p, ",%ld", listener->unix_acl.uid_set ? (long)listener->unix_acl.uid : -1L);
++                p += sprintf(p, ",%ld", listener->unix_acl.gid_set ? (long)listener->unix_acl.gid : -1L);
++            }
+         } break;
+         }
+-        h2o_vector_reserve(NULL, &args, args.size + 1);
++        h2o_vector_reserve(NULL, &args, args.size + 2);
+         args.entries[args.size++] = newarg;
++        if (aclarg != NULL)
++            args.entries[args.size++] = aclarg;
+     }
+ 
+     h2o_vector_reserve(NULL, &args, args.size + 5);
+@@ -4963,9 +5170,7 @@ static int run_using_server_starter(const char *h2o_cmd, const char *config_file
  {
      char **args = build_server_starter_argv(h2o_cmd, config_file);
      setenv("H2O_VIA_MASTER", "", 1);
@@ -890,7 +2401,7 @@ index 826599c..7ccd7cb 100644
  }
  
  /* make jemalloc linkage optional by marking the functions as 'weak',
-@@ -5193,6 +5269,7 @@ static void setup_configurators(void)
+@@ -5193,6 +5398,7 @@ static void setup_configurators(void)
      h2o_errordoc_register_configurator(&conf.globalconf);
      h2o_fastcgi_register_configurator(&conf.globalconf);
      h2o_file_register_configurator(&conf.globalconf);
@@ -898,16 +2409,45 @@ index 826599c..7ccd7cb 100644
      h2o_throttle_resp_register_configurator(&conf.globalconf);
      h2o_headers_register_configurator(&conf.globalconf);
      h2o_proxy_register_configurator(&conf.globalconf);
-@@ -5250,7 +5327,7 @@ static int dup_listener(struct listener_config_t *config)
+@@ -5224,6 +5430,13 @@ static int dup_listener(struct listener_config_t *config)
+     assert(reuseportlen == sizeof(reuseport));
+ #endif
+ 
++    /* Threads outside the QUIC budget do not read UDP. Keep their socket
++     * wrappers on an existing endpoint; a new reuseport endpoint would receive
++     * datagrams with no reader and silently blackhole those connections. The
++     * QUIC thread count has already been resolved and capped before this call. */
++    if (config->quic.ctx != NULL && config->fds.size >= conf.quic.num_threads)
++        reuseport = 0;
++
+     int fd = -1;
+ #if H2O_USE_REUSEPORT
+     if (reuseport) {
+@@ -5250,9 +5463,13 @@ static int dup_listener(struct listener_config_t *config)
          }
      }
  #endif
 -    if (!reuseport && (fd = dup(config->fds.entries[0])) == -1) {
-+    if (!reuseport && (fd = hp_main_dup(config->fds.entries[0])) == -1) {
-         char buf[256];
-         h2o_fatal("failed to dup listening socket: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
+-        char buf[256];
+-        h2o_fatal("failed to dup listening socket: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
++    if (!reuseport) {
++        if ((fd = hp_main_dup(config->fds.entries[0])) == -1) {
++            char buf[256];
++            h2o_fatal("failed to dup listening socket: %s", h2o_strerror_r(errno, buf, sizeof(buf)));
++        }
++        if (config->quic.ctx == NULL)
++            config->shared_accept = 1;
      }
-@@ -5272,6 +5349,39 @@ static void create_per_thread_listeners(void)
+     set_cloexec(fd);
+     return fd;
+@@ -5267,11 +5484,49 @@ static void create_per_thread_listeners(void)
+             int fd = dup_listener(listener_config);
+             listener_config->fds.entries[listener_config->fds.size++] = fd;
+         }
++        listener_config->accept_owner = i % conf.thread_map.size;
++        listener_config->accept_quota = NULL;
+     }
+ }
  
  int main(int argc, char **argv)
  {
@@ -918,6 +2458,9 @@ index 826599c..7ccd7cb 100644
 +    }
 +    if (argc > 1 && strcmp(argv[1], "--internal-fetch-ocsp-response") == 0)
 +        return hp_native_ocsp_main(argc - 1, argv + 1);
++    int lifecycle_status = hp_lifecycle_command(argc, argv);
++    if (lifecycle_status >= 0)
++        return lifecycle_status;
 +    if (hp_php_cli_should_dispatch(argc, argv))
 +        return hp_php_cli_main(argc, argv);
 +    if (argc > 1 && strcmp(argv[1], "php-cli") == 0) {
@@ -947,7 +2490,7 @@ index 826599c..7ccd7cb 100644
      close_acme_loader_pipe();
  
      cmd_argc = argc;
-@@ -5342,6 +5452,9 @@ int main(int argc, char **argv)
+@@ -5342,6 +5597,9 @@ int main(int argc, char **argv)
                  break;
              case 'v':
                  printf("h2o version " H2O_VERSION "\n");
@@ -957,11 +2500,14 @@ index 826599c..7ccd7cb 100644
                  printf("OpenSSL: %s\n", OpenSSL_version(OPENSSL_VERSION));
  #if H2O_USE_MRUBY
                  printf(
-@@ -5386,7 +5499,10 @@ int main(int argc, char **argv)
+@@ -5386,7 +5644,13 @@ int main(int argc, char **argv)
                  printf("h2o version " H2O_VERSION "\n"
                         "\n"
                         "Usage:\n"
 -                       "  h2o [OPTION]...\n"
++                       "  h2o-php run --config FILE [--address unix//PATH]\n"
++                       "  h2o-php reload --config FILE [--address unix//PATH] [--force]\n"
++                       "  h2o-php stop [--address unix//PATH]\n"
 +                       "  h2o-php [serve] [OPTION]...\n"
 +                       "  h2o-php php-cli [PHP OPTION]... [FILE] [ARG]...\n"
 +                       "  h2o-php php-server [--root DIR] [--listen HOST:PORT]...\n"
@@ -969,7 +2515,7 @@ index 826599c..7ccd7cb 100644
                         "\n"
                         "Options:\n"
                         "  -c, --conf FILE    configuration file (default: %s)\n"
-@@ -5397,8 +5513,8 @@ int main(int argc, char **argv)
+@@ -5397,8 +5661,8 @@ int main(int argc, char **argv)
                         "                               must be configured when using this mode, as all\n"
                         "                               the errors are logged to the file instead of\n"
                         "                               being emitted to STDERR\n"
@@ -980,18 +2526,27 @@ index 826599c..7ccd7cb 100644
                         "                               a worker process for handling incoming\n"
                         "                               connections. Users may send SIGHUP to the master\n"
                         "                               process to reconfigure or upgrade the server.\n"
-@@ -5456,6 +5572,10 @@ int main(int argc, char **argv)
+@@ -5454,8 +5718,19 @@ int main(int argc, char **argv)
+         };
+         if ((conf.yoml = load_config(&parse_args, NULL)) == NULL)
              exit(EX_CONFIG);
++        char *lifecycle_yaml = NULL;
++        if (getenv("H2O_PHP_CONFIG_PROBE_FD") != NULL &&
++            (lifecycle_yaml = hp_lifecycle_resolve_yaml(conf.yoml)) == NULL)
++            return EX_CONFIG;
          if (h2o_configurator_apply(&conf.globalconf, conf.yoml, conf.run_mode != RUN_MODE_WORKER) != 0)
              exit(EX_CONFIG);
 +        if (hp_runtime_config_prepare() != 0)
 +            exit(EX_CONFIG);
++        if (getenv("H2O_PHP_CONFIG_PROBE_FD") != NULL)
++            return hp_lifecycle_write_probe(build_server_starter_argv(cmd, opt_config_file),
++                                             hp_config.startup_timeout_ms, hp_config.shutdown_timeout_ms, lifecycle_yaml);
 +        if (hp_config_command_wants_dump())
 +            return hp_config_command_dump(&conf.globalconf, stdout);
          dispose_resolve_tag_arg(&resolve_tag_arg);
          yoml_free(conf.yoml, NULL);
          conf.yoml = NULL;
-@@ -5468,7 +5588,7 @@ int main(int argc, char **argv)
+@@ -5468,7 +5743,7 @@ int main(int argc, char **argv)
                      h2o_socket_buffer_mmap_settings.fn_template, strerror(errno));
              return EX_CONFIG;
          }
@@ -1000,7 +2555,7 @@ index 826599c..7ccd7cb 100644
      }
  
      /* ACME: spawn the helper program that issues and rewnews the certificates */
-@@ -5700,13 +5820,13 @@ int main(int argc, char **argv)
+@@ -5700,13 +5975,13 @@ int main(int argc, char **argv)
      /* replace STDIN to an closed pipe */
      {
          int fds[2];
@@ -1017,7 +2572,7 @@ index 826599c..7ccd7cb 100644
      }
  
      /* redirect STDOUT and STDERR to error_log (if specified) */
-@@ -5715,10 +5835,21 @@ int main(int argc, char **argv)
+@@ -5715,10 +5990,22 @@ int main(int argc, char **argv)
              perror("dup(2) failed");
              return EX_OSERR;
          }
@@ -1032,6 +2587,7 @@ index 826599c..7ccd7cb 100644
 +        for (size_t j = 0; j != conf.listeners[i]->fds.size; ++j)
 +            hp_host_fd_register_locked(conf.listeners[i]->fds.entries[j]);
 +    hp_host_fds_end();
++    h2o_http1_body_lease_startup();
 +    if (hp_runtime_start() != 0) {
 +        fprintf(stderr, "failed to initialize embedded PHP runtime\n");
 +        return EX_SOFTWARE;
@@ -1040,3 +2596,1565 @@ index 826599c..7ccd7cb 100644
      /* start the threads */
      conf.threads = h2o_mem_alloc(sizeof(conf.threads[0]) * conf.thread_map.size);
      for (size_t i = 1; i != conf.thread_map.size; ++i) {
+diff --git a/t/00unit/lib/common/socket.c b/t/00unit/lib/common/socket.c
+index 777f21608..717e1f6c3 100644
+--- a/t/00unit/lib/common/socket.c
++++ b/t/00unit/lib/common/socket.c
+@@ -20,8 +20,325 @@
+  * IN THE SOFTWARE.
+  */
+ #include <stdlib.h>
++#include <sys/ioctl.h>
+ #include "../../test.h"
++
++#if !H2O_USE_LIBUV && defined(FIONREAD)
++static h2o_iovec_t observe_read_reserve(h2o_buffer_t **input, size_t min_guarantee);
++static int observe_read_ioctl(int fd, unsigned long request, void *argument);
++#define h2o_buffer_try_reserve observe_read_reserve
++#define ioctl observe_read_ioctl
++#endif
+ #include "../../../../lib/common/socket.c"
++#if !H2O_USE_LIBUV && defined(FIONREAD)
++#undef h2o_buffer_try_reserve
++#undef ioctl
++
++static struct {
++    int enabled;
++    int ioctl_mode; /* 0: real, 1: unsupported, 2: zero, 3: negative */
++    size_t queries;
++    size_t growths;
++    size_t growth_bytes;
++    int script_fd;
++    size_t script_size;
++} read_observer;
++
++static h2o_iovec_t observe_read_reserve(h2o_buffer_t **input, size_t min_guarantee)
++{
++    size_t old_size = (*input)->size, old_capacity = (*input)->capacity;
++    int allocated = (*input)->bytes != NULL;
++    h2o_iovec_t result = h2o_buffer_try_reserve(input, min_guarantee);
++    if (read_observer.enabled && allocated && (*input)->capacity > old_capacity) {
++        ++read_observer.growths;
++        read_observer.growth_bytes += old_size;
++    }
++    return result;
++}
++
++static int observe_read_ioctl(int fd, unsigned long request, void *argument)
++{
++    if (read_observer.script_size != 0 && fd == read_observer.script_fd) {
++        ++read_observer.queries;
++        *(int *)argument = read_observer.script_size - lseek(fd, 0, SEEK_CUR);
++        return 0;
++    }
++    if (read_observer.enabled) {
++        ++read_observer.queries;
++        switch (read_observer.ioctl_mode) {
++        case 1:
++            errno = ENOTTY;
++            return -1;
++        case 2:
++            *(int *)argument = 0;
++            return 0;
++        case 3:
++            *(int *)argument = -1;
++            return 0;
++        }
++    }
++    return ioctl(fd, request, argument);
++}
++
++static void test_read_growth(void)
++{
++    char payload[65536];
++    for (size_t i = 0; i != sizeof(payload); ++i)
++        payload[i] = (char)i;
++
++    for (int mode = 0; mode != 4; ++mode) {
++        int fds[2];
++        h2o_buffer_t *input;
++        h2o_buffer_init(&input, &h2o_socket_buffer_prototype);
++        size_t initial_capacity = h2o_buffer_reserve(&input, 4096).len;
++        h2o_buffer_dispose(&input);
++        h2o_buffer_init(&input, &h2o_socket_buffer_prototype);
++        ok(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
++        ok(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
++        ok(write(fds[1], payload, sizeof(payload)) == sizeof(payload));
++        ok(shutdown(fds[1], SHUT_WR) == 0);
++        memset(&read_observer, 0, sizeof(read_observer));
++        read_observer.enabled = 1;
++        read_observer.ioctl_mode = mode;
++
++        ok(on_read_core(fds[0], &input, sizeof(payload)) == NULL);
++        if (mode == 2) {
++            /* A zero hint after a full read must not cause speculative growth.
++             * Bytes arriving after that snapshot remain for the next read. */
++            ok(input->size == initial_capacity);
++            ok(read_observer.growths == 0);
++            read_observer.ioctl_mode = 0;
++            ok(on_read_core(fds[0], &input, sizeof(payload) - input->size) == NULL);
++        }
++        ok(input->size == sizeof(payload));
++        ok(memcmp(input->bytes, payload, sizeof(payload)) == 0);
++        if (mode == 0) {
++            ok(read_observer.queries == 1);
++            ok(read_observer.growths == 1);
++            ok(read_observer.growth_bytes == initial_capacity);
++        } else if (mode == 1 || mode == 3) {
++            /* Unsupported or invalid hints retain geometric growth. */
++            ok(read_observer.growths > 1);
++            ok(read_observer.growth_bytes > initial_capacity);
++        }
++        ok(on_read_core(fds[0], &input, sizeof(payload)) == h2o_socket_error_closed);
++        read_observer.enabled = 0;
++        h2o_buffer_dispose(&input);
++        close(fds[0]);
++        close(fds[1]);
++    }
++}
++
++/* Only FIONREAD is scripted. A finite temporary file supplies exact read
++ * lengths to the production read, reserve, memcpy, recycle and dispatch paths,
++ * independent of socket send-buffer capacity or scheduler timing. */
++static size_t warm_callbacks;
++static const char *warm_error;
++static void observe_warm_callback(h2o_socket_t *sock, const char *error)
++{
++    (void)sock;
++    ++warm_callbacks;
++    warm_error = error;
++}
++static FILE *warm_read_file(const char *payload, size_t length)
++{
++    FILE *file = tmpfile();
++    assert(file != NULL && fwrite(payload, 1, length, file) == length && fflush(file) == 0);
++    rewind(file);
++    return file;
++}
++static void test_restored_input_read_bound(void)
++{
++    const size_t length = 1024 * 1024;
++    char *payload = h2o_mem_alloc(length);
++    for (size_t i = 0; i != length; ++i) payload[i] = (char)i;
++    size_t control_copy = 0, warm_capacity = 0;
++    for (unsigned bounded = 0; bounded != 2; ++bounded) {
++        FILE *file = warm_read_file(payload, length);
++        struct st_h2o_evloop_socket_t sock = {.fd = fileno(file), .max_read_size = length};
++        h2o_buffer_init(&sock.super.input, &h2o_socket_buffer_prototype);
++        h2o_buffer_reserve(&sock.super.input, 256 * 1024);
++        h2o_buffer_t *warm = sock.super.input;
++        warm_capacity = warm->capacity;
++        sock.super._cb.read = observe_warm_callback;
++        memset(&read_observer, 0, sizeof(read_observer));
++        read_observer.enabled = 1;
++        read_observer.script_fd = sock.fd;
++        read_observer.script_size = length;
++        warm_callbacks = 0; warm_error = NULL;
++        if (bounded) h2o_evloop_socket_read_current_buffer(&sock.super);
++        read_on_ready(&sock);
++        ok(warm_callbacks == 1 && warm_error == NULL);
++        ok(sock.max_read_size == length && !sock.read_current_buffer);
++        if (!bounded) {
++            /* Old restore behavior: the second read grows the input and copies
++             * the whole just-filled warm allocation before H1 sees any data. */
++            ok(sock.super.input->size == length && sock.super.input != warm);
++            ok(read_observer.growths == 1 && read_observer.growth_bytes == warm_capacity);
++            control_copy = read_observer.growth_bytes;
++        } else {
++            ok(sock.super.input == warm && warm->size == warm_capacity);
++            ok(read_observer.growths == 0 && read_observer.growth_bytes == 0);
++            ok(memcmp(warm->bytes, payload, warm_capacity) == 0);
++            /* Model origin-loop return after consumption. Every subsequent
++             * bounded read reuses this exact allocation without growth. */
++            size_t received = warm_capacity;
++            while (received != length) {
++                warm->size = 0; warm->bytes = warm->_buf;
++                h2o_evloop_socket_read_current_buffer(&sock.super);
++                read_on_ready(&sock);
++                ok(sock.super.input == warm && warm_error == NULL);
++                ok(memcmp(warm->bytes, payload + received, warm->size) == 0);
++                received += warm->size;
++            }
++            ok(read_observer.growths == 0 && read_observer.growth_bytes == 0);
++            /* An exact-full read delivers data before EOF is reported on the
++             * following callback. No synthetic EOF accompanies the fragment. */
++            ok(ftruncate(sock.fd, warm_capacity) == 0 && lseek(sock.fd, 0, SEEK_SET) == 0);
++            read_observer.script_size = warm_capacity;
++            warm->size = 0; warm->bytes = warm->_buf;
++            h2o_evloop_socket_read_current_buffer(&sock.super);
++            read_on_ready(&sock);
++            ok(!sock.read_current_buffer && warm_error == NULL && warm->size == warm_capacity);
++            warm->size = 0; warm->bytes = warm->_buf;
++            read_on_ready(&sock);
++            ok(warm_error == h2o_socket_error_closed);
++        }
++        read_observer.enabled = 0;
++        h2o_buffer_dispose(&sock.super.input);
++        fclose(file);
++    }
++    fprintf(stderr, "HP_WARM_READ_BOUND capacity=%zu control_copy_bytes=%zu bounded_copy_bytes=0\n", warm_capacity, control_copy);
++
++    /* Ordinary concrete small and partial inputs never opt in. They keep the
++     * existing FIONREAD coalescing and growth behavior for large uploads. */
++    for (unsigned partial = 0; partial != 2; ++partial) {
++        FILE *file = warm_read_file(payload, length);
++        struct st_h2o_evloop_socket_t sock = {.fd = fileno(file), .max_read_size = length};
++        h2o_buffer_init(&sock.super.input, &h2o_socket_buffer_prototype);
++        h2o_buffer_reserve(&sock.super.input, 4096);
++        if (partial) {
++            memcpy(sock.super.input->bytes, payload, 17); sock.super.input->size = 17;
++            assert(lseek(sock.fd, 17, SEEK_SET) == 17);
++        }
++        sock.super._cb.read = observe_warm_callback;
++        memset(&read_observer, 0, sizeof(read_observer));
++        read_observer.enabled = 1; read_observer.script_fd = sock.fd; read_observer.script_size = length;
++        read_on_ready(&sock);
++        ok(sock.super.input->size == length && warm_error == NULL);
++        ok(read_observer.growths == 1 && read_observer.growth_bytes != 0);
++        ok(memcmp(sock.super.input->bytes, payload, length) == 0);
++        read_observer.enabled = 0; h2o_buffer_dispose(&sock.super.input); fclose(file);
++    }
++    /* Real nonblocking socket: an empty readiness attempt preserves the bound
++     * until a positive read, without changing the configured callback limit. */
++    int pair[2];
++    ok(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
++    ok(fcntl(pair[0], F_SETFL, O_NONBLOCK) == 0);
++    struct st_h2o_evloop_socket_t sock = {.fd = pair[0], .max_read_size = length};
++    h2o_buffer_init(&sock.super.input, &h2o_socket_buffer_prototype);
++    h2o_buffer_reserve(&sock.super.input, 4096);
++    sock.super._cb.read = observe_warm_callback;
++    h2o_evloop_socket_read_current_buffer(&sock.super);
++    read_on_ready(&sock);
++    ok(sock.read_current_buffer && warm_error == NULL && sock.super.input->size == 0);
++    ok(write(pair[1], payload, 1) == 1);
++    read_on_ready(&sock);
++    ok(!sock.read_current_buffer && warm_error == NULL && sock.super.input->size == 1);
++    ok(sock.max_read_size == length && sock.super.input->bytes[0] == payload[0]);
++    h2o_buffer_dispose(&sock.super.input); close(pair[0]); close(pair[1]);
++    free(payload);
++}
++
++static void test_read_budget_and_small_read(void)
++{
++    char payload[65536];
++    memset(payload, 'x', sizeof(payload));
++    int fds[2];
++    h2o_buffer_t *input;
++    h2o_buffer_init(&input, &h2o_socket_buffer_prototype);
++    ok(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
++    ok(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
++    memset(&read_observer, 0, sizeof(read_observer));
++    read_observer.enabled = 1;
++    ok(write(fds[1], payload, 1) == 1);
++    ok(on_read_core(fds[0], &input, sizeof(payload)) == NULL);
++    ok(input->size == 1);
++    ok(read_observer.queries == 0);
++    h2o_buffer_consume(&input, input->size);
++
++    ok(write(fds[1], payload, sizeof(payload)) == sizeof(payload));
++    ok(on_read_core(fds[0], &input, 8193) == NULL);
++    ok(input->size == 8193);
++    int queued = -1;
++    ok(ioctl(fds[0], FIONREAD, &queued) == 0);
++    ok(queued == sizeof(payload) - 8193);
++    ok(on_read_core(fds[0], &input, 4097) == NULL);
++    ok(input->size == 8193 + 4097);
++    ok(memcmp(input->bytes, payload, input->size) == 0);
++    read_observer.enabled = 0;
++    h2o_buffer_dispose(&input);
++    close(fds[0]);
++    close(fds[1]);
++}
++
++struct read_later_arrival_state {
++    size_t bytes;
++    int closed;
++};
++
++static void read_later_arrival(h2o_socket_t *sock, const char *err)
++{
++    struct read_later_arrival_state *state = sock->data;
++    if (err != NULL) {
++        state->closed = err == h2o_socket_error_closed ? 1 : -1;
++        h2o_socket_read_stop(sock);
++        return;
++    }
++    state->bytes += sock->input->size;
++    h2o_buffer_consume(&sock->input, sock->input->size);
++}
++
++static void test_read_zero_hint_later_arrival_and_eof(void)
++{
++    int fds[2];
++    struct read_later_arrival_state state = {0};
++    h2o_buffer_t *input;
++    h2o_buffer_init(&input, &h2o_socket_buffer_prototype);
++    size_t initial_capacity = h2o_buffer_reserve(&input, 4096).len;
++    char *payload = h2o_mem_alloc(initial_capacity);
++    memset(payload, 'x', initial_capacity);
++    h2o_buffer_dispose(&input);
++    ok(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
++    ok(fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0);
++    h2o_evloop_t *loop = h2o_evloop_create();
++    h2o_socket_t *sock = h2o_evloop_socket_create(loop, fds[0], 0);
++    sock->data = &state;
++    h2o_socket_read_start(sock, read_later_arrival);
++    memset(&read_observer, 0, sizeof(read_observer));
++    read_observer.enabled = 1;
++    ok(write(fds[1], payload, initial_capacity) == initial_capacity);
++    for (int i = 0; i != 100 && state.bytes == 0; ++i)
++        h2o_evloop_run(loop, 0);
++    ok(state.bytes == initial_capacity);
++    ok(read_observer.queries == 1);
++    ok(read_observer.growths == 0);
++    ok(write(fds[1], payload, 1) == 1);
++    for (int i = 0; i != 100 && state.bytes == initial_capacity; ++i)
++        h2o_evloop_run(loop, 0);
++    ok(state.bytes == initial_capacity + 1);
++    ok(shutdown(fds[1], SHUT_WR) == 0);
++    for (int i = 0; i != 100 && state.closed == 0; ++i)
++        h2o_evloop_run(loop, 0);
++    ok(state.closed == 1);
++    read_observer.enabled = 0;
++    h2o_socket_close(sock);
++    h2o_evloop_run(loop, 0);
++    h2o_evloop_destroy(loop);
++    close(fds[1]);
++    free(payload);
++}
++#endif
+ 
+ static void test_on_alpn_select(void)
+ {
+@@ -238,6 +555,12 @@ static void test_zerocopy_buffers_random(void)
+ 
+ void test_lib__common__socket_c(void)
+ {
++#if !H2O_USE_LIBUV && defined(FIONREAD)
++    subtest("restored_input_read_bound", test_restored_input_read_bound);
++    subtest("read_growth", test_read_growth);
++    subtest("read_budget_and_small_read", test_read_budget_and_small_read);
++    subtest("read_zero_hint_later_arrival_and_eof", test_read_zero_hint_later_arrival_and_eof);
++#endif
+     subtest("on_alpn_select", test_on_alpn_select);
+     subtest("sliding_counter", test_sliding_counter);
+     subtest("prepare_for_latency_optimization", test_prepare_for_latency_optimization);
+diff --git a/t/00unit/test.c b/t/00unit/test.c
+index 112a17f5a..09347612f 100644
+--- a/t/00unit/test.c
++++ b/t/00unit/test.c
+@@ -162,6 +162,7 @@ int main(int argc, char **argv)
+         subtest("lib/common/httpclient.c", test_lib__common__httpclient_c);
+         subtest("lib/common/serverutil.c", test_lib__common__serverutil_c);
+         subtest("lib/common/socket.c", test_lib__common__socket_c);
++        subtest("lib/http1/body-lease", test_lib__http1_body_lease);
+         subtest("lib/common/string.c", test_lib__common__string_c);
+         subtest("lib/common/rand.c", test_lib__common__rand_c);
+         subtest("lib/common/url.c", test_lib__common__url_c);
+diff --git a/t/00unit/test.h b/t/00unit/test.h
+index edb937d9e..2ec74cc82 100644
+--- a/t/00unit/test.h
++++ b/t/00unit/test.h
+@@ -56,6 +56,7 @@ void test_lib__common__httpclient_c(void);
+ void test_lib__common__multithread_c(void);
+ void test_lib__common__serverutil_c(void);
+ void test_lib__common__socket_c(void);
++void test_lib__http1_body_lease(void);
+ void test_lib__common__socketpool_c(void);
+ void test_lib__common__string_c(void);
+ void test_lib__common__rand_c(void);
+diff --git a/lib/http1/body-lease.c.h b/lib/http1/body-lease.c.h
+new file mode 100644
+index 000000000..0b6dc1bea
+--- /dev/null
++++ b/lib/http1/body-lease.c.h
+@@ -0,0 +1,553 @@
++/* Private synchronous plain-H1 writer. This file also builds in the focused C
++ * harness; its worker half deliberately has no access to H2O object storage. */
++#include <errno.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#ifdef __linux__
++#include <sys/eventfd.h>
++#include <sched.h>
++#include <fcntl.h>
++#endif
++#include <sys/socket.h>
++#include <time.h>
++#include <unistd.h>
++
++#ifndef H2O_BODY_LEASE_SENDMSG
++#define H2O_BODY_LEASE_SENDMSG sendmsg
++#endif
++#ifndef H2O_BODY_LEASE_POLL
++#define H2O_BODY_LEASE_POLL poll
++#endif
++
++/* Process-local kernel-copy admission, independent of PHP execution. Startup
++ * discovers the inherited allowed physical cores before any loop is pinned.
++ * Missing topology leaves the original unrestricted transport path intact. */
++struct body_send_waiter {
++    struct body_send_waiter *prev, *next;
++    pthread_cond_t *ready;
++};
++static struct {
++    pthread_mutex_t mutex;
++    pthread_condattr_t condattr;
++    struct body_send_waiter *head, *tail;
++    size_t waiting;
++    unsigned active, limit, physical;
++    int enabled, pressured;
++} body_send_gate = {.mutex = PTHREAD_MUTEX_INITIALIZER};
++static pthread_once_t body_send_once = PTHREAD_ONCE_INIT;
++
++#if defined(__linux__) && !H2O_USE_LIBUV
++struct body_core_id { int package, core; };
++static int body_core_compare(const void *a, const void *b)
++{
++    const struct body_core_id *x = a, *y = b;
++    if (x->package != y->package)
++        return x->package < y->package ? -1 : 1;
++    return x->core < y->core ? -1 : x->core != y->core;
++}
++
++static int body_core_read(unsigned cpu, const char *name, int *value)
++{
++    char path[128], text[64];
++    int n = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/topology/%s", cpu, name);
++    if (n < 0 || (size_t)n >= sizeof(path))
++        return -1;
++    int fd = open(path, O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        return -1;
++    ssize_t got;
++    do { got = read(fd, text, sizeof(text) - 1); } while (got < 0 && errno == EINTR);
++    close(fd);
++    if (got <= 0 || got == sizeof(text) - 1)
++        return -1;
++    text[got] = 0;
++    char *end;
++    errno = 0;
++    long parsed = strtol(text, &end, 10);
++    if (errno != 0 || end == text || parsed < 0 || parsed > INT_MAX ||
++        (*end != 0 && !(*end == '\n' && end[1] == 0)))
++        return -1;
++    *value = (int)parsed;
++    return 0;
++}
++
++static unsigned body_allowed_physical_cores(void)
++{
++#if defined(CPU_ALLOC) && defined(CPU_ALLOC_SIZE) && defined(CPU_FREE) && defined(CPU_ZERO_S) && defined(CPU_COUNT_S)
++    /* Dynamic affinity masks also cover hosts with CPU indices > CPU_SETSIZE.
++     * The Linux affinity ABI supports at most 65536 bits in this discovery. */
++    size_t bits = CPU_SETSIZE;
++    const size_t max_bits = 65536;
++    if (bits == 0 || bits > max_bits)
++        return 0;
++    cpu_set_t *mask;
++    size_t bytes;
++    for (;;) {
++        bytes = CPU_ALLOC_SIZE(bits);
++        mask = CPU_ALLOC(bits);
++        if (mask == NULL)
++            return 0;
++        CPU_ZERO_S(bytes, mask);
++        if (sched_getaffinity(0, bytes, mask) == 0)
++            break;
++        int error = errno;
++        CPU_FREE(mask);
++        if (error != EINVAL || bits == max_bits)
++            return 0;
++        bits = bits > max_bits / 2 ? max_bits : bits * 2;
++    }
++    int count = CPU_COUNT_S(bytes, mask);
++    struct body_core_id *cores = count > 0 ? calloc((size_t)count, sizeof(*cores)) : NULL;
++    unsigned used = 0, physical = 0;
++    if (cores != NULL) {
++        for (size_t cpu = 0; cpu != bits; ++cpu) {
++            if (!CPU_ISSET_S(cpu, bytes, mask))
++                continue;
++            if (body_core_read((unsigned)cpu, "physical_package_id", &cores[used].package) != 0 ||
++                body_core_read((unsigned)cpu, "core_id", &cores[used].core) != 0)
++                goto Exit;
++            ++used;
++        }
++        qsort(cores, used, sizeof(*cores), body_core_compare);
++        for (unsigned i = 0; i != used; ++i)
++            if (i == 0 || body_core_compare(cores + i - 1, cores + i) != 0)
++                ++physical;
++    }
++Exit:
++    free(cores);
++    CPU_FREE(mask);
++    return used == (unsigned)count ? physical : 0;
++#else
++    return 0;
++#endif
++}
++
++static void body_send_fork_prepare(void) { pthread_mutex_lock(&body_send_gate.mutex); }
++static void body_send_fork_parent(void) { pthread_mutex_unlock(&body_send_gate.mutex); }
++static void body_send_fork_child(void)
++{
++    /* No waiter thread survives. Never retain a permit or a stack waiter from
++     * the parent's host graph; child transport is disabled by the host too. */
++    body_send_gate.enabled = 0;
++    body_send_gate.active = 0;
++    body_send_gate.waiting = 0;
++    body_send_gate.pressured = 0;
++    body_send_gate.head = body_send_gate.tail = NULL;
++    pthread_mutex_unlock(&body_send_gate.mutex);
++}
++#endif
++
++static void body_send_init(void)
++{
++#if defined(__linux__) && !H2O_USE_LIBUV
++    unsigned physical = body_allowed_physical_cores();
++    if (physical == 0 || pthread_condattr_init(&body_send_gate.condattr) != 0)
++        return;
++    if (pthread_condattr_setclock(&body_send_gate.condattr, CLOCK_MONOTONIC) != 0) {
++        pthread_condattr_destroy(&body_send_gate.condattr);
++        return;
++    }
++    if (pthread_atfork(body_send_fork_prepare, body_send_fork_parent, body_send_fork_child) != 0) {
++        pthread_condattr_destroy(&body_send_gate.condattr);
++        return;
++    }
++    /* Oversubscribed copy demand leaves one physical core of headroom. A
++     * single-core host still needs one slot to make transport progress. */
++    body_send_gate.limit = physical > 1 ? physical - 1 : 1;
++    body_send_gate.physical = physical;
++    body_send_gate.enabled = 1;
++#endif
++}
++
++void h2o_http1_body_lease_startup(void)
++{
++    (void)pthread_once(&body_send_once, body_send_init);
++}
++
++enum { BODY_LEASE_IDLE, BODY_LEASE_WRITING, BODY_LEASE_RETURNING, BODY_LEASE_REVOKING, BODY_LEASE_RETURNED };
++struct st_h2o_http1_body_lease_t {
++    atomic_uint refs, state;
++    atomic_int error;
++    atomic_uint_fast64_t last_progress_ns, payload_submitted, wire_submitted;
++    int fd, cancel_fd, chunked;
++    uint64_t io_timeout_ns;
++    pthread_t loop_thread, writer_thread;
++    int writer_set;
++    pthread_cond_t send_ready;
++    int send_ready_initialized;
++    void (*notify)(void *);
++    void *notify_data;
++    /* Owning-loop fields. The worker never reads or writes these. */
++    struct st_h2o_http1_conn_t *conn;
++    int close_requested, close_socket;
++};
++
++static uint64_t body_lease_now(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
++}
++
++static uint64_t body_lease_add_ns(uint64_t a, uint64_t b)
++{
++    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
++}
++
++size_t h2o_http1_body_lease_charge(void)
++{
++    return sizeof(h2o_http1_body_lease_t);
++}
++
++void h2o_http1_body_lease_release(h2o_http1_body_lease_t *lease)
++{
++    if (atomic_fetch_sub_explicit(&lease->refs, 1, memory_order_acq_rel) != 1)
++        return;
++    assert(atomic_load_explicit(&lease->state, memory_order_acquire) == BODY_LEASE_RETURNED);
++    if (lease->send_ready_initialized)
++        pthread_cond_destroy(&lease->send_ready);
++    H2O_HOST_FD_CLOSE(lease->cancel_fd);
++    free(lease);
++}
++
++static h2o_http1_body_lease_t *body_lease_new(int fd, int chunked, uint64_t io_timeout_ms,
++                                           void (*notify)(void *), void *data)
++{
++#if defined(__linux__) && !H2O_USE_LIBUV
++    h2o_http1_body_lease_t *lease = calloc(1, sizeof(*lease));
++    if (lease == NULL)
++        return NULL;
++    if (body_send_gate.enabled) {
++        if (pthread_cond_init(&lease->send_ready, &body_send_gate.condattr) != 0) {
++            free(lease);
++            return NULL;
++        }
++        lease->send_ready_initialized = 1;
++    }
++    H2O_HOST_FDS_BEGIN();
++    lease->cancel_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++    if (lease->cancel_fd >= 0)
++        H2O_HOST_FD_REGISTER(lease->cancel_fd);
++    H2O_HOST_FDS_END();
++    if (lease->cancel_fd < 0) {
++        if (lease->send_ready_initialized)
++            pthread_cond_destroy(&lease->send_ready);
++        free(lease);
++        return NULL;
++    }
++    atomic_init(&lease->refs, 2); /* H1 and the external caller. */
++    atomic_init(&lease->state, BODY_LEASE_IDLE);
++    atomic_init(&lease->error, 0);
++    atomic_init(&lease->last_progress_ns, body_lease_now());
++    atomic_init(&lease->payload_submitted, 0);
++    atomic_init(&lease->wire_submitted, 0);
++    lease->fd = fd;
++    lease->chunked = chunked;
++    lease->io_timeout_ns = io_timeout_ms > UINT64_MAX / 1000000 ? UINT64_MAX : io_timeout_ms * 1000000;
++    lease->loop_thread = pthread_self();
++    lease->notify = notify;
++    lease->notify_data = data;
++    return lease;
++#else
++    return NULL;
++#endif
++}
++
++/* The immutable lease and WRITING/RETURNING pin are the call generation:
++ * tokens are never recycled, and no other call can enter until writer_exit.
++ * Gate waiters retain that pin and the writer reference, without R/B locks. */
++static int body_send_terminal(h2o_http1_body_lease_t *lease, uint64_t deadline_ns)
++{
++    unsigned state = atomic_load_explicit(&lease->state, memory_order_acquire);
++    int error = atomic_load_explicit(&lease->error, memory_order_acquire);
++    if (error != 0)
++        return error;
++    if (state != BODY_LEASE_WRITING && state != BODY_LEASE_RETURNING)
++        return ECANCELED;
++    return body_lease_now() >= deadline_ns ? ETIMEDOUT : 0;
++}
++
++/* Demand consists only of actual send attempts: active sends, FIFO waiters,
++ * and an arriving attempt not yet queued. Demand that fits physical cores can
++ * progress independently until oversubscription retains the original one-core
++ * headroom for this entire busy period. Only no active sends and no waiters
++ * restore the higher capacity. Previously admitted sends drain on a pressure
++ * increase; the hard bound is always physical cores. All fields and decisions
++ * here use the gate mutex. */
++static unsigned body_send_capacity(unsigned arriving)
++{
++    assert(body_send_gate.active <= body_send_gate.physical);
++    if (body_send_gate.active == 0 && body_send_gate.waiting == 0)
++        body_send_gate.pressured = 0;
++    size_t available = body_send_gate.physical - body_send_gate.active;
++    if (arriving > available || body_send_gate.waiting > available - arriving)
++        body_send_gate.pressured = 1;
++    return body_send_gate.pressured ? body_send_gate.limit : body_send_gate.physical;
++}
++
++static void body_send_signal_head(void)
++{
++    unsigned capacity = body_send_capacity(0);
++    if (body_send_gate.head != NULL && body_send_gate.active < capacity)
++        pthread_cond_signal(body_send_gate.head->ready);
++}
++
++static int body_send_enter(h2o_http1_body_lease_t *lease, uint64_t deadline_ns)
++{
++    if (!body_send_gate.enabled)
++        return 0;
++    struct body_send_waiter waiter = {.ready = &lease->send_ready};
++    pthread_mutex_lock(&body_send_gate.mutex);
++    unsigned capacity = body_send_capacity(1);
++    int queued = body_send_gate.head != NULL || body_send_gate.active >= capacity;
++    if (queued) {
++        waiter.prev = body_send_gate.tail;
++        if (waiter.prev != NULL)
++            waiter.prev->next = &waiter;
++        else
++            body_send_gate.head = &waiter;
++        body_send_gate.tail = &waiter;
++        ++body_send_gate.waiting;
++    }
++    int error;
++    for (;;) {
++        if ((error = body_send_terminal(lease, deadline_ns)) != 0)
++            break;
++        if ((!queued || body_send_gate.head == &waiter) && body_send_gate.active < body_send_capacity(!queued))
++            break;
++        struct timespec until = {.tv_sec = deadline_ns / 1000000000, .tv_nsec = deadline_ns % 1000000000};
++        int ret = pthread_cond_timedwait(&lease->send_ready, &body_send_gate.mutex, &until);
++        if (ret != 0 && ret != ETIMEDOUT) {
++            error = ret;
++            break;
++        }
++    }
++    if (queued) {
++        if (waiter.prev != NULL)
++            waiter.prev->next = waiter.next;
++        else
++            body_send_gate.head = waiter.next;
++        if (waiter.next != NULL)
++            waiter.next->prev = waiter.prev;
++        else
++            body_send_gate.tail = waiter.prev;
++        assert(body_send_gate.waiting != 0);
++        --body_send_gate.waiting;
++    }
++    if (error == 0)
++        ++body_send_gate.active;
++    body_send_signal_head();
++    pthread_mutex_unlock(&body_send_gate.mutex);
++    return error;
++}
++
++static void body_send_leave(void)
++{
++    if (!body_send_gate.enabled)
++        return;
++    pthread_mutex_lock(&body_send_gate.mutex);
++    assert(body_send_gate.active != 0);
++    --body_send_gate.active;
++    body_send_signal_head();
++    pthread_mutex_unlock(&body_send_gate.mutex);
++}
++
++static void body_send_cancel(h2o_http1_body_lease_t *lease)
++{
++    if (!body_send_gate.enabled)
++        return;
++    /* Publish terminal state before this lock; the waiter checks under it
++     * before cond_wait, so revocation cannot miss the enqueue-to-wait edge. */
++    pthread_mutex_lock(&body_send_gate.mutex);
++    pthread_cond_signal(&lease->send_ready);
++    pthread_mutex_unlock(&body_send_gate.mutex);
++}
++
++static void body_lease_set_error(h2o_http1_body_lease_t *lease, int error)
++{
++    int expected = 0;
++    atomic_compare_exchange_strong_explicit(&lease->error, &expected, error, memory_order_release, memory_order_relaxed);
++}
++
++static void body_lease_wake(h2o_http1_body_lease_t *lease)
++{
++    uint64_t one = 1;
++    ssize_t ret;
++    do {
++        ret = write(lease->cancel_fd, &one, sizeof(one));
++    } while (ret < 0 && errno == EINTR);
++    /* A full nonblocking eventfd is already a wake. It is never drained during
++     * a lease: revocation is terminal, and no new writer may enter afterward. */
++    assert(ret == sizeof(one) || (ret < 0 && errno == EAGAIN));
++}
++
++/* Returns true if no writer may touch the descriptor. */
++static int body_lease_revoke(h2o_http1_body_lease_t *lease, int notify_idle)
++{
++    body_lease_set_error(lease, ECANCELED);
++    unsigned state = atomic_load_explicit(&lease->state, memory_order_acquire);
++    for (;;) {
++        if (state == BODY_LEASE_RETURNED)
++            return 1;
++        if (state == BODY_LEASE_REVOKING)
++            return 0;
++        unsigned next = state == BODY_LEASE_IDLE ? BODY_LEASE_RETURNED : BODY_LEASE_REVOKING;
++        if (atomic_compare_exchange_weak_explicit(&lease->state, &state, next, memory_order_acq_rel, memory_order_acquire)) {
++            if (next == BODY_LEASE_REVOKING) {
++                body_send_cancel(lease);
++                body_lease_wake(lease);
++            } else if (notify_idle && lease->notify != NULL)
++                lease->notify(lease->notify_data);
++            return next == BODY_LEASE_RETURNED;
++        }
++    }
++}
++
++void h2o_http1_body_lease_revoke(h2o_http1_body_lease_t *lease)
++{
++    body_lease_revoke(lease, 1);
++}
++
++static void body_lease_writer_exit(h2o_http1_body_lease_t *lease, int failed)
++{
++    unsigned expected = BODY_LEASE_WRITING;
++    if (!failed && atomic_compare_exchange_strong_explicit(&lease->state, &expected, BODY_LEASE_IDLE,
++                                                           memory_order_release, memory_order_acquire))
++        return;
++    /* RETURNING lets the current frame finish; REVOKING and failure terminate.
++     * Release-publish all accounting before the loop can close or resume I/O. */
++    atomic_store_explicit(&lease->state, BODY_LEASE_RETURNED, memory_order_release);
++    if (lease->notify != NULL)
++        lease->notify(lease->notify_data);
++}
++
++int h2o_http1_body_lease_write(h2o_http1_body_lease_t *lease, const void *data, size_t len, uint64_t deadline_ns,
++                             h2o_http1_body_lease_result_t *result)
++{
++    *result = (h2o_http1_body_lease_result_t){0};
++#if !defined(__linux__) || H2O_USE_LIBUV
++    result->error = ENOTSUP;
++    return 1;
++#else
++    unsigned expected = BODY_LEASE_IDLE;
++    if (!atomic_compare_exchange_strong_explicit(&lease->state, &expected, BODY_LEASE_WRITING,
++                                                 memory_order_acquire, memory_order_relaxed))
++        return 1;
++    atomic_fetch_add_explicit(&lease->refs, 1, memory_order_relaxed); /* Through notify. */
++    if (lease->writer_set && !pthread_equal(lease->writer_thread, pthread_self())) {
++        body_lease_writer_exit(lease, 0);
++        h2o_http1_body_lease_release(lease);
++        return 1;
++    }
++    lease->writer_thread = pthread_self();
++    lease->writer_set = 1;
++    if (len == 0) {
++        body_lease_writer_exit(lease, 0);
++        h2o_http1_body_lease_release(lease);
++        return 0;
++    }
++
++    /* H1 framing remains H2O-owned. Only local vector cursors and the caller's
++     * buffer are used; every nonterminal chunk ends before this API returns. */
++    char prefix_buf[sizeof(size_t) * 2 + 3];
++    h2o_sendvec_t prefix, suffix;
++    if (lease->chunked)
++        encode_chunked(&prefix, &suffix, H2O_SEND_STATE_IN_PROGRESS, len, 0, prefix_buf);
++    else {
++        h2o_sendvec_init_raw(&prefix, NULL, 0);
++        h2o_sendvec_init_raw(&suffix, NULL, 0);
++    }
++    struct iovec iov[3] = {{prefix.raw, prefix.len}, {(void *)data, len}, {suffix.raw, suffix.len}};
++    const size_t prefix_len = prefix.len;
++    atomic_fetch_add_explicit(&lease->payload_submitted, len, memory_order_relaxed);
++    atomic_fetch_add_explicit(&lease->wire_submitted, prefix.len + len + suffix.len, memory_order_relaxed);
++    size_t index = 0;
++    int error = 0;
++    while (index != 3) {
++        while (index != 3 && iov[index].iov_len == 0)
++            ++index;
++        if (index == 3)
++            break;
++        if (atomic_load_explicit(&lease->state, memory_order_acquire) == BODY_LEASE_REVOKING ||
++            (error = atomic_load_explicit(&lease->error, memory_order_acquire)) != 0) {
++            if (error == 0)
++                error = ECANCELED;
++            break;
++        }
++        uint64_t now = body_lease_now(), next_deadline = deadline_ns;
++        if (lease->io_timeout_ns != 0) {
++            uint64_t idle_deadline = body_lease_add_ns(atomic_load_explicit(&lease->last_progress_ns, memory_order_relaxed),
++                                                       lease->io_timeout_ns);
++            if (idle_deadline < next_deadline)
++                next_deadline = idle_deadline;
++        }
++        if (now >= next_deadline) {
++            error = ETIMEDOUT;
++            break;
++        }
++        struct msghdr msg = {.msg_iov = iov + index, .msg_iovlen = 3 - index};
++        if ((error = body_send_enter(lease, next_deadline)) != 0)
++            break;
++        /* Admission can wait. Revalidate this still-pinned call immediately
++         * before kernel I/O, including an expiry or revoke while queued. */
++        if ((error = body_send_terminal(lease, next_deadline)) != 0) {
++            body_send_leave();
++            break;
++        }
++        ssize_t ret = H2O_BODY_LEASE_SENDMSG(lease->fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
++        int send_errno = errno;
++        body_send_leave(); /* No permit during accounting, poll or callbacks. */
++        errno = send_errno;
++        if (ret > 0) {
++            result->wire_bytes += ret;
++            size_t body_end = result->wire_bytes > prefix_len ? result->wire_bytes - prefix_len : 0;
++            result->payload_bytes = body_end < len ? body_end : len;
++            atomic_store_explicit(&lease->last_progress_ns, body_lease_now(), memory_order_relaxed);
++            size_t left = ret;
++            while (index != 3 && left >= iov[index].iov_len) {
++                left -= iov[index].iov_len;
++                ++index;
++            }
++            if (index != 3 && left != 0) {
++                iov[index].iov_base = (char *)iov[index].iov_base + left;
++                iov[index].iov_len -= left;
++            }
++            continue;
++        }
++        if (ret < 0 && errno == EINTR)
++            continue;
++        if (ret == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
++            error = ret == 0 ? EPIPE : errno;
++            break;
++        }
++        uint64_t remaining = next_deadline - now;
++        int timeout = remaining / 1000000 >= INT_MAX ? INT_MAX : (int)((remaining + 999999) / 1000000);
++        struct pollfd fds[2] = {{lease->fd, POLLOUT, 0}, {lease->cancel_fd, POLLIN, 0}};
++        int ready = H2O_BODY_LEASE_POLL(fds, 2, timeout);
++        if (ready < 0 && errno != EINTR) {
++            error = errno;
++            break;
++        }
++        if (ready > 0 && fds[1].revents != 0) {
++            error = ECANCELED;
++            break;
++        }
++        if (ready > 0 && (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
++            error = EPIPE;
++            break;
++        }
++    }
++    if (error != 0)
++        body_lease_set_error(lease, error);
++    result->error = error;
++    body_lease_writer_exit(lease, error != 0);
++    h2o_http1_body_lease_release(lease);
++    return error != 0 ? -1 : 0;
++#endif
++}
+diff --git a/lib/http1/chunked-encoder.c.h b/lib/http1/chunked-encoder.c.h
+new file mode 100644
+index 000000000..d785da05d
+--- /dev/null
++++ b/lib/http1/chunked-encoder.c.h
+@@ -0,0 +1,26 @@
++static void encode_chunked(h2o_sendvec_t *prefix, h2o_sendvec_t *suffix, h2o_send_state_t state, size_t chunk_size,
++                           int send_trailers, char *buffer)
++{
++    h2o_sendvec_init_raw(prefix, NULL, 0);
++    h2o_sendvec_init_raw(suffix, NULL, 0);
++
++    /* create chunk header and output data */
++    if (chunk_size != 0) {
++        prefix->raw = buffer;
++        prefix->len = sprintf(buffer, "%zx\r\n", chunk_size);
++        if (state != H2O_SEND_STATE_ERROR) {
++            suffix->raw = "\r\n0\r\n\r\n";
++            suffix->len = state == H2O_SEND_STATE_FINAL ? (send_trailers ? 5 : 7) : 2;
++        }
++    } else if (state == H2O_SEND_STATE_FINAL) {
++        suffix->raw = "0\r\n\r\n";
++        suffix->len = send_trailers ? 3 : 5;
++    }
++
++    /* if state is error, send a broken chunk to pass the error down to the browser */
++    if (state == H2O_SEND_STATE_ERROR) {
++        suffix->raw = "\r\n1\r\n";
++        suffix->len = 5;
++    }
++}
++
+diff --git a/t/00unit/lib/http1.c b/t/00unit/lib/http1.c
+new file mode 100644
+index 000000000..1da9b9693
+--- /dev/null
++++ b/t/00unit/lib/http1.c
+@@ -0,0 +1,598 @@
++/* Exercises the actual H1 state machine, suspended native socket and worker
++ * writer. Deterministic syscall clipping makes partial framing and EAGAIN
++ * independent of kernel send-buffer sizing. No HTTP codec is mocked. */
++#include "../test.h"
++#include <stdatomic.h>
++#include <pthread.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/socket.h>
++#if defined(__linux__) && !H2O_USE_LIBUV
++static ssize_t lease_test_sendmsg(int fd, const struct msghdr *msg, int flags);
++static int lease_test_poll(struct pollfd *fds, nfds_t count, int timeout);
++#define H2O_BODY_LEASE_SENDMSG lease_test_sendmsg
++#define H2O_BODY_LEASE_POLL lease_test_poll
++#endif
++#include "../../../lib/http1.c"
++
++#if defined(__linux__) && !H2O_USE_LIBUV
++struct lease_fixture;
++struct lease_test_generator {
++    h2o_generator_t super;
++    struct lease_fixture *fixture;
++};
++struct lease_fixture {
++    h2o_globalconf_t conf;
++    h2o_context_t ctx;
++    h2o_loop_t *loop;
++    struct st_h2o_http1_conn_t *conn;
++    h2o_http1_body_lease_t *lease;
++    struct lease_test_generator generator;
++    int peer, fd;
++    unsigned closed, stopped, ready, next_requests;
++    atomic_uint notifications;
++    pthread_t origin;
++};
++static struct {
++    pthread_mutex_t mutex;
++    pthread_cond_t cond;
++    size_t cap;
++    unsigned calls, eagain_once;
++    int force_eagain, poll_entered, pause_after_send, send_paused, resume_send;
++    pthread_t writer;
++} lease_hook = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
++
++static void lease_hook_reset(void)
++{
++    pthread_mutex_lock(&lease_hook.mutex);
++    lease_hook.cap = SIZE_MAX;
++    lease_hook.calls = lease_hook.eagain_once = 0;
++    lease_hook.force_eagain = lease_hook.poll_entered = lease_hook.pause_after_send = lease_hook.send_paused =
++        lease_hook.resume_send = 0;
++    pthread_mutex_unlock(&lease_hook.mutex);
++}
++
++static ssize_t lease_test_sendmsg(int fd, const struct msghdr *msg, int flags)
++{
++    lease_hook.writer = pthread_self();
++    ++lease_hook.calls;
++    if (lease_hook.force_eagain || (lease_hook.eagain_once && lease_hook.calls == 2)) {
++        errno = EAGAIN;
++        return -1;
++    }
++    struct iovec iov[3];
++    assert(msg->msg_iovlen <= PTLS_ELEMENTSOF(iov));
++    size_t remaining = lease_hook.cap;
++    for (size_t i = 0; i != msg->msg_iovlen; ++i) {
++        iov[i] = msg->msg_iov[i];
++        if (iov[i].iov_len > remaining)
++            iov[i].iov_len = remaining;
++        remaining -= iov[i].iov_len;
++    }
++    struct msghdr clipped = *msg;
++    clipped.msg_iov = iov;
++    ssize_t ret = sendmsg(fd, &clipped, flags);
++    if (lease_hook.pause_after_send && lease_hook.calls == 1) {
++        pthread_mutex_lock(&lease_hook.mutex);
++        lease_hook.send_paused = 1;
++        pthread_cond_broadcast(&lease_hook.cond);
++        while (!lease_hook.resume_send)
++            pthread_cond_wait(&lease_hook.cond, &lease_hook.mutex);
++        pthread_mutex_unlock(&lease_hook.mutex);
++    }
++    return ret;
++}
++
++static int lease_test_poll(struct pollfd *fds, nfds_t count, int timeout)
++{
++    assert(count == 2);
++    pthread_mutex_lock(&lease_hook.mutex);
++    lease_hook.poll_entered = 1;
++    pthread_cond_broadcast(&lease_hook.cond);
++    pthread_mutex_unlock(&lease_hook.mutex);
++    if (lease_hook.force_eagain) {
++        /* Simulate genuine socket backpressure, preserving a real blocking
++         * poll on the lease's cancellation FD and its absolute deadline. */
++        struct pollfd only_cancel = fds[1];
++        int ret = poll(&only_cancel, 1, timeout);
++        fds[0].revents = 0;
++        fds[1].revents = only_cancel.revents;
++        return ret;
++    }
++    return poll(fds, count, timeout);
++}
++
++static void lease_notify(void *p)
++{
++    struct lease_fixture *f = p;
++    atomic_fetch_add_explicit(&f->notifications, 1, memory_order_release);
++}
++static void lease_closed(void *p)
++{
++    struct lease_fixture *f = p;
++    assert(pthread_equal(pthread_self(), f->origin));
++    if (f->lease != NULL) {
++        unsigned state = atomic_load_explicit(&f->lease->state, memory_order_acquire);
++        assert(state != BODY_LEASE_WRITING && state != BODY_LEASE_RETURNING && state != BODY_LEASE_REVOKING);
++    }
++    ++f->closed;
++    f->conn = NULL;
++}
++static void lease_proceed(h2o_generator_t *g, h2o_req_t *req)
++{
++    struct lease_test_generator *generator = (void *)g;
++    ++generator->fixture->ready;
++}
++static void lease_stop(h2o_generator_t *g, h2o_req_t *req)
++{
++    struct lease_test_generator *generator = (void *)g;
++    assert(pthread_equal(pthread_self(), generator->fixture->origin));
++    ++generator->fixture->stopped;
++}
++static int lease_next_request(h2o_handler_t *handler, h2o_req_t *req)
++{
++    struct lease_fixture *f = req->conn->ctx->storage.entries[0].data;
++    ++f->next_requests;
++    req->res.status = 200;
++    req->res.reason = "OK";
++    h2o_send_inline(req, H2O_STRLIT("next"));
++    return 0;
++}
++static void lease_fixture_init(struct lease_fixture *f)
++{
++    memset(f, 0, sizeof(*f));
++    atomic_init(&f->notifications, 0);
++    f->origin = pthread_self();
++    lease_hook_reset();
++    f->loop = h2o_evloop_create();
++    h2o_config_init(&f->conf);
++    f->conf.http1.req_io_timeout = 1000;
++    h2o_hostconf_t *host = h2o_config_register_host(&f->conf, h2o_iovec_init(H2O_STRLIT("default")), 65535);
++    h2o_pathconf_t *path = h2o_config_register_path(host, "/", 0);
++    h2o_handler_t *handler = h2o_create_handler(path, sizeof(*handler));
++    handler->on_req = lease_next_request;
++    h2o_context_init(&f->ctx, f->loop, &f->conf);
++    /* Test handler's fixture lookup uses the real context storage API. */
++    h2o_vector_reserve(NULL, &f->ctx.storage, 1);
++    f->ctx.storage.size = 1;
++    f->ctx.storage.entries[0] = (h2o_context_storage_item_t){.data = f};
++    int pair[2];
++    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
++    f->fd = pair[0];
++    f->peer = pair[1];
++    h2o_socket_t *sock = h2o_evloop_socket_create(f->loop, pair[0], 0);
++    sock->on_close.cb = lease_closed;
++    sock->on_close.data = f;
++    f->conn = (void *)h2o_create_connection(sizeof(*f->conn), &f->ctx, f->conf.hosts, (struct timeval){0}, &h1_callbacks);
++    memset((char *)f->conn + sizeof(f->conn->super), 0, offsetof(struct st_h2o_http1_conn_t, req) - sizeof(f->conn->super));
++    f->conn->sock = sock;
++    sock->data = f->conn;
++    init_request(f->conn);
++    h2o_req_t *req = &f->conn->req;
++    req->version = 0x101;
++    req->input.method = req->method = h2o_iovec_init(H2O_STRLIT("GET"));
++    req->input.path = req->path = h2o_iovec_init(H2O_STRLIT("/"));
++    req->input.authority = req->authority = h2o_iovec_init(H2O_STRLIT("default"));
++    req->input.scheme = req->scheme = &H2O_URL_SCHEME_HTTP;
++    req->http1_is_persistent = 1;
++    req->res.status = 200;
++    req->res.reason = "OK";
++    req->res.content_length = SIZE_MAX;
++    h2o_req_bind_conf(req, host, path);
++    f->generator.super.proceed = lease_proceed;
++    f->generator.super.stop = lease_stop;
++    f->generator.fixture = f;
++    h2o_start_response(req, &f->generator.super);
++}
++static size_t lease_read_peer(struct lease_fixture *f, char *dst, size_t capacity)
++{
++    size_t len = 0;
++    ssize_t ret;
++    while (len != capacity && (ret = recv(f->peer, dst + len, capacity - len, MSG_DONTWAIT)) > 0)
++        len += ret;
++    return len;
++}
++static void lease_flush_headers(struct lease_fixture *f)
++{
++    h2o_send(&f->conn->req, NULL, 0, H2O_SEND_STATE_IN_PROGRESS);
++    ok(h2o_http1_body_lease_acquire(&f->conn->req, lease_notify, f) == NULL);
++    for (unsigned i = 0; f->ready == 0 && i != 8; ++i)
++        h2o_evloop_run(f->loop, 0);
++    ok(f->ready == 1);
++    char headers[4096];
++    ok(lease_read_peer(f, headers, sizeof(headers)) != 0);
++}
++static void lease_grant(struct lease_fixture *f)
++{
++    lease_flush_headers(f);
++    f->lease = h2o_http1_body_lease_acquire(&f->conn->req, lease_notify, f);
++    ok(f->lease != NULL);
++}
++static void lease_fixture_dispose(struct lease_fixture *f)
++{
++    if (f->lease != NULL) {
++        assert(h2o_http1_body_lease_return(f->lease) == 1);
++        h2o_http1_body_lease_release(f->lease);
++        f->lease = NULL;
++    }
++    if (f->conn != NULL)
++        close_connection(f->conn, 1);
++    h2o_evloop_run(f->loop, 0);
++    if (f->peer >= 0)
++        close(f->peer);
++    h2o_context_dispose(&f->ctx);
++    h2o_config_dispose(&f->conf);
++    h2o_evloop_destroy(f->loop);
++}
++struct lease_job {
++    h2o_http1_body_lease_t *lease;
++    const char *bytes;
++    size_t len;
++    uint64_t deadline;
++    int twice, ret;
++    h2o_http1_body_lease_result_t result;
++};
++static void *lease_worker(void *p)
++{
++    struct lease_job *job = p;
++    job->ret = h2o_http1_body_lease_write(job->lease, job->bytes, job->len, job->deadline, &job->result);
++    if (job->twice) {
++        assert(job->ret == 0);
++        char second[] = "xy";
++        job->ret = h2o_http1_body_lease_write(job->lease, second, 2, job->deadline, &job->result);
++        memset(second, '!', 2); /* No borrowed byte survives the write return. */
++    }
++    return NULL;
++}
++static pthread_t lease_start_worker(struct lease_job *job)
++{
++    pthread_t thread;
++    assert(pthread_create(&thread, NULL, lease_worker, job) == 0);
++    return thread;
++}
++static void lease_wait_hook(int *flag)
++{
++    pthread_mutex_lock(&lease_hook.mutex);
++    struct timespec until;
++    clock_gettime(CLOCK_REALTIME, &until);
++    until.tv_sec += 2;
++    while (!*flag)
++        assert(pthread_cond_timedwait(&lease_hook.cond, &lease_hook.mutex, &until) == 0);
++    pthread_mutex_unlock(&lease_hook.mutex);
++}
++
++static void lease_test_eligibility(void)
++{
++    struct lease_fixture f;
++    lease_fixture_init(&f);
++    ok(h2o_http1_body_lease_acquire(&f.conn->req, lease_notify, &f) == NULL); /* Headers unflushed. */
++    lease_flush_headers(&f);
++    h2o_req_t *req = &f.conn->req;
++    req->version = 0x200;
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    req->version = 0x101;
++    req->is_tunnel_req = 1;
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    req->is_tunnel_req = 0;
++    req->proceed_req = (void *)1;
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    req->proceed_req = NULL;
++    f.conn->_req_entity_reader = (void *)1;
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    f.conn->_req_entity_reader = NULL;
++    req->input.method = h2o_iovec_init(H2O_STRLIT("HEAD"));
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    req->input.method = req->method;
++    h2o_ostream_t filter = {0};
++    req->_ostr_top = &filter;
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    req->_ostr_top = &f.conn->_ostr_final.super;
++    f.conn->sock->ssl = (void *)1;
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    f.conn->sock->ssl = NULL;
++    f.conn->_ostr_final.informational.write_inflight = 1;
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    f.conn->_ostr_final.informational.write_inflight = 0;
++    f.lease = h2o_http1_body_lease_acquire(req, lease_notify, &f);
++    ok(f.lease != NULL);
++    ok(h2o_http1_body_lease_acquire(req, lease_notify, &f) == NULL);
++    lease_fixture_dispose(&f);
++}
++static void lease_test_partial_and_owner(void)
++{
++    struct lease_fixture f;
++    lease_fixture_init(&f);
++    lease_grant(&f);
++    lease_hook.cap = 1;
++    lease_hook.eagain_once = 1;
++    char first[] = "abcdef";
++    struct lease_job job = {.lease = f.lease, .bytes = first, .len = 6, .deadline = UINT64_MAX, .twice = 1};
++    pthread_t thread = lease_start_worker(&job);
++    assert(pthread_join(thread, NULL) == 0);
++    ok(job.ret == 0 && job.result.payload_bytes == 2);
++    ok(!pthread_equal(lease_hook.writer, f.origin)); /* Kernel send ran on worker. */
++    ok(lease_hook.calls > 10 && lease_hook.poll_entered);
++    ok(atomic_load(&f.notifications) == 0); /* No normal-write actor handoff. */
++    memset(first, '!', 6);
++    h2o_http1_body_lease_result_t refused;
++    ok(h2o_http1_body_lease_write(f.lease, "wrong", 5, UINT64_MAX, &refused) == 1);
++    ok(refused.wire_bytes == 0);
++    char wire[128];
++    size_t len = lease_read_peer(&f, wire, sizeof(wire));
++    ok(h2o_memis(wire, len, H2O_STRLIT("6\r\nabcdef\r\n2\r\nxy\r\n")));
++    ok(h2o_http1_body_lease_return(f.lease) == 1);
++    ok(f.conn->req.bytes_sent == 8);
++    lease_fixture_dispose(&f);
++}
++static void lease_test_active_close(int kind)
++{
++    struct lease_fixture f;
++    lease_fixture_init(&f);
++    lease_grant(&f);
++    lease_hook.force_eagain = 1;
++    struct lease_job job = {.lease = f.lease, .bytes = "body", .len = 4, .deadline = UINT64_MAX};
++    pthread_t thread = lease_start_worker(&job);
++    lease_wait_hook(&lease_hook.poll_entered);
++    if (kind == 0)
++        close_connection(f.conn, 1);
++    else if (kind == 1)
++        close_idle_connection(&f.conn->super); /* Stop/forced context close. */
++    else
++        reqread_on_timeout(&f.conn->_timeout_entry);
++    ok(f.conn != NULL && f.closed == 0 && f.stopped == 0);
++    ok(fcntl(f.fd, F_GETFD) != -1); /* Descriptor and request remain alive. */
++    assert(pthread_join(thread, NULL) == 0);
++    ok(job.ret == -1 && job.result.error == ECANCELED);
++    ok(atomic_load(&f.notifications) == 1);
++    ok(h2o_http1_body_lease_return(f.lease) == 1);
++    ok(f.conn == NULL && f.closed == 1 && f.stopped == 1);
++    ok(fcntl(f.fd, F_GETFD) == -1 && errno == EBADF);
++    ok(h2o_http1_body_lease_return(f.lease) == 1); /* Safe after request destruction. */
++    lease_fixture_dispose(&f);
++}
++static void lease_test_orderly_return(void)
++{
++    struct lease_fixture f;
++    lease_fixture_init(&f);
++    lease_grant(&f);
++    lease_hook.cap = 1;
++    lease_hook.pause_after_send = 1;
++    struct lease_job job = {.lease = f.lease, .bytes = "body", .len = 4, .deadline = UINT64_MAX};
++    pthread_t thread = lease_start_worker(&job);
++    lease_wait_hook(&lease_hook.send_paused);
++    ok(h2o_http1_body_lease_return(f.lease) == 0);
++    ok(f.conn != NULL && f.closed == 0 && f.stopped == 0);
++    pthread_mutex_lock(&lease_hook.mutex);
++    lease_hook.resume_send = 1;
++    pthread_cond_broadcast(&lease_hook.cond);
++    pthread_mutex_unlock(&lease_hook.mutex);
++    assert(pthread_join(thread, NULL) == 0);
++    ok(job.ret == 0 && job.result.payload_bytes == 4);
++    ok(atomic_load(&f.notifications) == 1);
++    ok(h2o_http1_body_lease_return(f.lease) == 1);
++    ok(f.conn != NULL && f.closed == 0);
++    char wire[128];
++    ok(h2o_memis(wire, lease_read_peer(&f, wire, sizeof(wire)), H2O_STRLIT("4\r\nbody\r\n")));
++    lease_fixture_dispose(&f);
++}
++static void lease_test_timeout_and_peer(void)
++{
++    for (unsigned peer = 0; peer != 2; ++peer) {
++        struct lease_fixture f;
++        lease_fixture_init(&f);
++        lease_grant(&f);
++        if (peer) {
++            close(f.peer);
++            f.peer = -1;
++        } else {
++            lease_hook.force_eagain = 1;
++        }
++        struct lease_job job = {.lease = f.lease, .bytes = "body", .len = 4,
++                               .deadline = peer ? UINT64_MAX : body_lease_now() + 20000000};
++        pthread_t thread = lease_start_worker(&job);
++        assert(pthread_join(thread, NULL) == 0);
++        ok(job.ret == -1 && job.result.error == (peer ? EPIPE : ETIMEDOUT));
++        ok(atomic_load(&f.notifications) == 1);
++        ok(f.conn != NULL && f.closed == 0);
++        ok(h2o_http1_body_lease_return(f.lease) == 1);
++        ok(f.conn == NULL && f.closed == 1 && f.stopped == 1);
++        lease_fixture_dispose(&f);
++    }
++}
++static void lease_test_idle_revoke(void)
++{
++    struct lease_fixture f;
++    lease_fixture_init(&f);
++    lease_grant(&f);
++    h2o_http1_body_lease_revoke(f.lease);
++    h2o_http1_body_lease_revoke(f.lease);
++    ok(atomic_load(&f.notifications) == 1);
++    ok(h2o_http1_body_lease_return(f.lease) == 1);
++    ok(f.closed == 1 && f.stopped == 1);
++    lease_fixture_dispose(&f);
++}
++static void lease_test_pipeline(void)
++{
++    struct lease_fixture f;
++    lease_fixture_init(&f);
++    lease_grant(&f);
++    const char next[] = "GET /next HTTP/1.1\r\nHost: default\r\nConnection: close\r\n\r\n";
++    ssize_t next_sent = send(f.peer, next, sizeof(next) - 1, MSG_NOSIGNAL);
++    if (next_sent != sizeof(next) - 1)
++        fprintf(stderr, "pipeline send: fd=%d peer=%d ret=%zd errno=%d closed=%u\n", f.fd, f.peer, next_sent, errno, f.closed);
++    assert(next_sent == sizeof(next) - 1);
++    for (unsigned i = 0; i != 3; ++i)
++        h2o_evloop_run(f.loop, 0);
++    ok(f.next_requests == 0 && f.conn->sock->input->size == 0);
++    struct lease_job job = {.lease = f.lease, .bytes = "body", .len = 4, .deadline = UINT64_MAX};
++    pthread_t thread = lease_start_worker(&job);
++    assert(pthread_join(thread, NULL) == 0);
++    ok(job.ret == 0);
++    ok(h2o_http1_body_lease_return(f.lease) == 1);
++    h2o_send(&f.conn->req, NULL, 0, H2O_SEND_STATE_FINAL); /* H2O owns the terminal chunk. */
++    for (unsigned i = 0; f.closed == 0 && i != 16; ++i)
++        h2o_evloop_run(f.loop, 0);
++    ok(f.next_requests == 1 && f.closed == 1);
++    char wire[4096];
++    size_t len = lease_read_peer(&f, wire, sizeof(wire));
++    ok(len > 32 && memcmp(wire, "4\r\nbody\r\n0\r\n\r\nHTTP/1.1 200", sizeof("4\r\nbody\r\n0\r\n\r\nHTTP/1.1 200") - 1) == 0);
++    lease_fixture_dispose(&f);
++}
++
++struct input_take_case {
++    struct lease_fixture *fixture;
++    h2o_buffer_t *held[3];
++    size_t lengths[3];
++    unsigned calls, suffix;
++};
++static int input_take_fragment(void *p, int complete)
++{
++    struct input_take_case *test = p;
++    struct st_h2o_http1_conn_t *conn = test->fixture->conn;
++    h2o_req_t *req = &conn->req;
++    unsigned index = test->calls++;
++    ok(index < PTLS_ELEMENTSOF(test->held));
++    test->lengths[index] = req->entity.len;
++    /* EOF is cleared before entering the callback, including when a final
++     * suffix must wait for this response. Nonfinal proceed stays installed. */
++    ok(complete ? req->proceed_req == NULL : req->proceed_req == proceed_request);
++    h2o_buffer_t *body = conn->req_body;
++    test->held[index] = h2o_http1_take_request_body(req);
++    if (complete && test->suffix) {
++        ok(test->held[index] == NULL && conn->req_body == body);
++    } else {
++        ok(test->held[index] == body && req->entity.len == 0 && req->entity.base == NULL);
++        ok(conn->req_body != body && conn->req_body->size == 0);
++    }
++    if (!complete)
++        req->proceed_req(req, NULL); /* acknowledges only the empty replacement */
++    return 0;
++}
++static void input_test_nonfinal_take(void)
++{
++    const size_t prefix = 256 * 1024;
++    char *bytes = h2o_mem_alloc(prefix);
++    memset(bytes, 'P', prefix);
++    for (unsigned suffix = 0; suffix != 2; ++suffix) {
++        struct lease_fixture f;
++        lease_fixture_init(&f);
++        struct input_take_case test = {.fixture = &f, .suffix = suffix};
++        h2o_req_t *req = &f.conn->req;
++        create_content_length_entity_reader(f.conn, prefix * 2 + 17);
++        h2o_buffer_init(&f.conn->req_body, &h2o_socket_buffer_prototype);
++        req->write_req.cb = input_take_fragment;
++        req->write_req.ctx = &test;
++        req->proceed_req = proceed_request;
++        for (unsigned i = 0; i != 2; ++i) {
++            h2o_buffer_append(&f.conn->sock->input, bytes, prefix);
++            handle_content_length_entity_read(f.conn);
++            ok(test.calls == i + 1 && test.lengths[i] == prefix);
++            ok(req->req_body_bytes_received == prefix * (i + 1));
++            ok(req->proceed_req == proceed_request && f.conn->_req_entity_reader != NULL);
++            ok(test.held[i]->size == prefix && test.held[i]->bytes[0] == 'P');
++        }
++        h2o_buffer_append(&f.conn->sock->input, H2O_STRLIT("final-body-prefix"));
++        if (suffix)
++            h2o_buffer_append(&f.conn->sock->input, H2O_STRLIT("GET /next HTTP/1.1\r\nHost: default\r\n\r\n"));
++        handle_content_length_entity_read(f.conn);
++        ok(test.calls == 3 && test.lengths[2] == 17);
++        ok(req->req_body_bytes_received == prefix * 2 + 17);
++        ok(req->proceed_req == NULL && f.conn->_req_entity_reader == NULL);
++        ok(f.next_requests == 0 && f.conn->sock->input->size == (suffix ? 37 : 0));
++        /* Detached prefixes remain readable even after another fragment and
++         * connection disposal; only the original loop returns their storage. */
++        lease_fixture_dispose(&f);
++        for (unsigned i = 0; i != 3; ++i) {
++            if (test.held[i] == NULL)
++                continue;
++            ok(test.held[i]->size == test.lengths[i]);
++            ok(memcmp(test.held[i]->bytes, i == 2 ? "final-body-prefix" : bytes, test.lengths[i]) == 0);
++            h2o_buffer_dispose(&test.held[i]);
++        }
++    }
++    free(bytes);
++}
++
++struct input_restore_case {
++    h2o_req_t *req;
++    h2o_buffer_t *held;
++    unsigned calls;
++    int complete;
++};
++static int input_hold_fragment(void *p, int complete)
++{
++    struct input_restore_case *test = p;
++    ++test->calls;
++    test->complete = complete;
++    test->held = h2o_http1_take_request_body(test->req);
++    ok(test->held != NULL);
++    return 0; /* consumption and proceed are deliberately deferred */
++}
++static void input_test_nonfinal_restore(void)
++{
++    const size_t prefix = 256 * 1024;
++    char *bytes = h2o_mem_alloc(prefix);
++    memset(bytes, 'R', prefix);
++    struct lease_fixture f;
++    lease_fixture_init(&f);
++    h2o_req_t *req = &f.conn->req;
++    struct input_restore_case test = {.req = req};
++    create_content_length_entity_reader(f.conn, prefix * 2 + 17);
++    h2o_buffer_init(&f.conn->req_body, &h2o_socket_buffer_prototype);
++    req->write_req.cb = input_hold_fragment;
++    req->write_req.ctx = &test;
++    req->proceed_req = proceed_request;
++    h2o_buffer_t *warm = NULL;
++    size_t capacity = 0;
++    for (unsigned i = 0; i != 2; ++i) {
++        h2o_buffer_append(&f.conn->sock->input, bytes, prefix);
++        if (i == 0) {
++            warm = f.conn->sock->input;
++            capacity = warm->capacity;
++        }
++        ok(f.conn->sock->input == warm);
++        handle_content_length_entity_read(f.conn);
++        ok(test.calls == i + 1 && !test.complete && test.held == warm);
++        ok(req->proceed_req == proceed_request && req->entity.len == 0 && req->entity.base == NULL);
++        ok(test.held->size == prefix && memcmp(test.held->bytes, bytes, prefix) == 0);
++        ok(f.conn->sock->input != warm && f.conn->sock->input->size == 0);
++        /* An unexpected occupied input must refuse without taking ownership. */
++        h2o_buffer_append(&f.conn->sock->input, H2O_STRLIT("x"));
++        ok(!h2o_http1_restore_request_body(req, &test.held) && test.held == warm);
++        h2o_buffer_consume(&f.conn->sock->input, 1);
++        ok(h2o_http1_restore_request_body(req, &test.held));
++        ok(test.held == NULL && f.conn->sock->input == warm);
++        ok(warm->capacity == capacity && warm->size == 0 && warm->bytes == warm->_buf);
++        req->proceed_req(req, NULL);
++        ok(f.conn->sock->input == warm && warm->size == 0);
++    }
++    h2o_buffer_append(&f.conn->sock->input, H2O_STRLIT("final-body-prefix"));
++    ok(f.conn->sock->input == warm);
++    handle_content_length_entity_read(f.conn);
++    ok(test.calls == 3 && test.complete && test.held == warm);
++    ok(req->proceed_req == NULL && f.conn->_req_entity_reader == NULL);
++    ok(!h2o_http1_restore_request_body(req, &test.held) && test.held == warm);
++    lease_fixture_dispose(&f);
++    /* A final or orphaned return is disposed independently of the old pool. */
++    ok(test.held->size == 17 && memcmp(test.held->bytes, "final-body-prefix", 17) == 0);
++    h2o_buffer_dispose(&test.held);
++    free(bytes);
++}
++#endif
++
++void test_lib__http1_body_lease(void)
++{
++#if defined(__linux__) && !H2O_USE_LIBUV
++    subtest("input/nonfinal-take/EOF/suffix/lifetime", input_test_nonfinal_take);
++    subtest("input/nonfinal-restore/same-allocation/deferred-proceed", input_test_nonfinal_restore);
++    subtest("eligibility", lease_test_eligibility);
++    subtest("partial/EAGAIN/worker/caller-lifetime", lease_test_partial_and_owner);
++    lease_test_active_close(0);
++    lease_test_active_close(1);
++    lease_test_active_close(2);
++    subtest("orderly-return", lease_test_orderly_return);
++    subtest("timeout/peer-close", lease_test_timeout_and_peer);
++    subtest("idle-revoke", lease_test_idle_revoke);
++    subtest("pipeline/final-framing", lease_test_pipeline);
++#endif
++}

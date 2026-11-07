@@ -321,7 +321,8 @@ int hp_config_command_dump(const h2o_globalconf_t *global, FILE *out)
     fprintf(out, "\"num_threads\":%u,\"num_threads_explicit\":%s,\"max_threads\":", hp_config.threads, hp_config.threads_explicit ? "true" : "false");
     if (hp_config.max_threads_auto) quote(out, "auto"); else fprintf(out, "%u", hp_config.max_threads);
     fprintf(out, ",\"automatic_cap_pending_php_memory_limit\":%s,\"worker_minimum\":%" PRIu64 ",\"total_minimum\":%" PRIu64 ",\"max_wait_time_ms\":%" PRIu64 ",\"max_idle_time_ms\":%" PRIu64 ",\"max_requests\":%u,\"queue_limit\":%u,\"queue_limit_unlimited\":%s,\"max_buffered_body\":%zu,\"max_buffered_response\":%zu,\"max_buffered_global\":%zu,\"request_timeout_ms\":%" PRIu64 ",\"startup_timeout_ms\":%" PRIu64 ",\"shutdown_timeout_ms\":%" PRIu64 ",\"php_ini\":", hp_config.max_threads_auto ? "true" : "false", snapshot.minimum, snapshot.minimum + hp_config.threads, hp_config.max_wait_ms, hp_config.max_idle_ms, hp_config.max_requests, hp_config.queue_limit, hp_config.queue_limit == 0 ? "true" : "false", hp_config.max_buffered_body, hp_config.max_buffered_response, hp_config.max_buffered_global, hp_config.request_timeout_ms, hp_config.startup_timeout_ms, hp_config.shutdown_timeout_ms);
-    quote(out, hp_config.ini_entries); fputs(",\"log\":", out); quote(out, hp_config.log_path);
+    quote(out, hp_config.ini_entries);
+    fprintf(out, ",\"collect_metrics\":%s,\"log\":", hp_config.collect_metrics ? "true" : "false"); quote(out, hp_config.log_path);
     fputs(",\"cpu_budget\":", out); fputs(cpu_budget, out);
     fputs("},\"worker_pools\":[", out); hp_runtime_each_worker(dump_worker, &snapshot);
     fputs("],\"hosts\":[", out);

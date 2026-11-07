@@ -5,8 +5,10 @@ After=network.target
 [Service]
 Type=simple
 Environment=H2O_ROOT=/usr/local
-ExecStart=/usr/local/bin/h2o-php -m master -c /etc/h2o-php/h2o.conf
-ExecReload=/bin/kill -HUP $MAINPID
+RuntimeDirectory=h2o-php
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/h2o-php run --config /etc/h2o-php/h2o.conf --address unix//run/h2o-php/control.sock
+ExecReload=/usr/local/bin/h2o-php reload --config /etc/h2o-php/h2o.conf --address unix//run/h2o-php/control.sock
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=35

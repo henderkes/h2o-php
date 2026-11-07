@@ -10,7 +10,8 @@ bool hp_php_cli_should_dispatch(int argc, char **argv)
 {
     const char *base = strrchr(argv[0], '/'); base = base ? base + 1 : argv[0];
     if (argc > 1 && (!strcmp(argv[1], "php-cli") || !strcmp(argv[1], "php-server") ||
-                     !strcmp(argv[1], "serve") || !strcmp(argv[1], "effective-config"))) return false;
+                     !strcmp(argv[1], "serve") || !strcmp(argv[1], "effective-config") ||
+                     !strcmp(argv[1], "run") || !strcmp(argv[1], "reload") || !strcmp(argv[1], "stop"))) return false;
     if (!strcmp(base, "php") || !strcmp(base, "php-zts") || !strcmp(base, "h2o-php-cli")) return true;
     /* PHP_BINARY contains this executable. Preserve CLI recursion, including
      * ambiguous -v/-m/-c flags, without changing PHP's own constant or argv. */

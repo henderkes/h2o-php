@@ -12,8 +12,25 @@
 typedef struct hp_request hp_request_t;
 typedef struct hp_worker_group hp_worker_group_t;
 typedef struct hp_header { char *name, *value; struct hp_header *next; } hp_header_t;
-typedef struct hp_chunk { struct hp_chunk *next; size_t len, offset; char data[]; } hp_chunk_t;
+typedef struct hp_chunk_allocation hp_chunk_allocation_t;
+typedef struct hp_chunk {
+    struct hp_chunk *next;
+    size_t len, offset;
+    size_t capacity; /* Owned input capacity; shared output slabs use allocation. */
+    char *data;
+    hp_chunk_allocation_t *allocation; /* NULL for independently owned input. */
+} hp_chunk_t;
 typedef struct hp_info { struct hp_info *next; int status; hp_header_t *headers; } hp_info_t;
+/* The bridge knows only an opaque synchronous transport lease. H2O owns all
+ * framing, socket state, cancellation descriptors and token destruction.
+ * write: 0 complete, 1 refused before any I/O (owned fallback is safe),
+ * -1 terminal (owned fallback is forbidden). No caller bytes are retained. */
+typedef struct hp_response_lease_ops {
+    size_t charge;
+    int (*write)(void *, const void *, size_t, uint64_t, size_t *, int *);
+    void (*revoke)(void *);
+    void (*release)(void *);
+} hp_response_lease_ops_t;
 typedef enum { HP_CREATED, HP_QUEUED, HP_RUNNING, HP_RESPONDING, HP_COMPLETED, HP_CANCELLED, HP_TIMED_OUT, HP_FAILED } hp_request_state_t;
 typedef enum { HP_WORKER_STARTING, HP_WORKER_BOOTSTRAPPING, HP_WORKER_READY, HP_WORKER_BUSY, HP_WORKER_DRAINING, HP_WORKER_RESTARTING, HP_WORKER_FAILED, HP_WORKER_STOPPED } hp_worker_state_t;
 typedef enum { HP_THREAD_HEALTHY, HP_THREAD_UNHEALTHY } hp_thread_health_t;
@@ -31,6 +48,7 @@ typedef struct hp_runtime_config {
     uint64_t max_wait_ms, request_timeout_ms, shutdown_timeout_ms, max_idle_ms, startup_timeout_ms;
     char *ini_entries, *log_path;
     bool threads_explicit, max_threads_explicit, max_threads_auto;
+    bool collect_metrics; /* Optional PHP/Prometheus collector; native accounting is unconditional. */
 } hp_runtime_config_t;
 typedef struct hp_worker_config {
     char *file, *name, *root;
@@ -60,18 +78,41 @@ struct hp_request {
     hp_worker_group_t *group;
     hp_chunk_t *body_head, *body_tail, *output_head, *output_tail;
     /* output_bytes is queued payload plus producer reservations, NOT just
-     * linked-list bytes. output_inflight is detached batch payload. Both are
+     * linked-list bytes. output_inflight is detached payload plus retained slab credit. Both are
      * request-mutex protected and their sum may not exceed output_limit. */
     size_t body_bytes, output_bytes, output_inflight, body_limit, output_limit;
     bool body_eof, body_producer_blocked, cancelled, response_finished, headers_ready, headers_taken;
+    /* SAPI-private logical read: its bytes are consumed, but the native
+     * allocation remains pinned through the unlocked PHP stream write. */
+    hp_chunk_t *body_read_pin;
+    bool body_read_pin_detached;
     bool document_uri_set, document_uri_owned;
+    /* Request mutex: hp_response_finish has published its one terminal wake. */
+    bool response_finish_published;
     /* Request mutex: owning loop has a detached output batch and must pop
      * again from proceed (or cancel/finish); false is published by empty pop. */
     bool output_consumer_active;
     /* Request mutex: explicit SAPI flush intent, monotonic for this request. */
     bool output_flush_requested;
+    /* Request mutex: token metadata and the entire borrowed PHP CALL span
+     * remain included in output_inflight/global credit until released. A
+     * missed initial handshake is irreversible for this request generation. */
+    const hp_response_lease_ops_t *response_lease_ops;
+    void *response_lease;
+    pthread_t response_lease_owner;
+    uint64_t response_lease_timeout_ns;
+    size_t response_lease_charge, response_lease_borrowed;
+    bool response_lease_attempted, response_lease_requested;
+    bool response_lease_owner_set, response_lease_call_active, response_lease_return;
+    bool response_lease_fallback_active;
     int status;
     hp_header_t *response_headers;
+    /* Internal SAPI system buffer, owned by this exact request. Acceptance
+     * freezes the final snapshot; publication transfers it to response_headers.
+     * Request mutex protects both states, including auxiliary output. */
+    hp_header_t *sapi_response_headers;
+    int sapi_response_status;
+    bool sapi_headers_accepted, sapi_headers_published;
     hp_info_t *info_head, *info_tail;
     void (*notify)(hp_request_t *);
     void *network_data, *notify_data;
@@ -90,17 +131,56 @@ void hp_request_cancel(hp_request_t *);
 void hp_request_notify(hp_request_t *);
 /* network thread pushes input without blocking; -1 means buffer saturation */
 int hp_request_body_push(hp_request_t *, const void *, size_t, bool eof);
+/* Try to adopt detached storage. 1 transfers owner (also on finished/discard),
+ * 0 leaves it with the caller for the copying fallback, -1 rejects input.
+ * release receives the still-charged capacity; it may defer release until the
+ * origin loop has disposed/recycled the storage. A zero charge means the
+ * response already finished and ownership was accepted only for discard. */
+int hp_request_body_push_owned(hp_request_t *, void *owner, char *data, size_t len,
+                               size_t capacity, void (*release)(void *, size_t), bool eof);
+/* Complete a deferred owned-input release after the storage is gone/recycled. */
+void hp_request_body_release_owned_capacity(size_t capacity);
 /* Owning loop atomically arms a single refill wake above the body low-water
  * mark. False means it must retry now (or observe EOF/cancellation). */
 bool hp_request_body_pause(hp_request_t *);
 ssize_t hp_request_body_read(hp_request_t *, void *, size_t);
+/* SAPI-private try-only read view. Borrow exactly max bytes from one head, or
+ * a shorter sole final head at EOF; otherwise leave input unchanged and use
+ * the ordinary reader. The request is retained, with no mutex held across
+ * the caller's PHP stream write. Bytes/low-water credit are consumed at borrow;
+ * release returns the pinned allocation after a write, failure or Zend bailout.
+ * Ordinary/recursive reads keep progressing while one view is active. */
+typedef struct hp_sapi_body_view {
+    hp_request_t *request;
+    hp_chunk_t *chunk;
+    const char *data;
+    size_t len;
+} hp_sapi_body_view_t;
+bool hp_sapi_request_body_borrow(hp_request_t *, size_t max, hp_sapi_body_view_t *);
+void hp_sapi_request_body_release(hp_sapi_body_view_t *);
 /* PHP thread writes with bounded backpressure. */
 ssize_t hp_response_write(hp_request_t *, const void *, size_t);
 /* Flush never waits for more bytes. An active loop consumer already owns
  * the next send/proceed continuation; idle consumers are woken. */
 void hp_response_flush_notify(hp_request_t *);
 int hp_response_headers(hp_request_t *, int status, const hp_header_t *, bool informational);
+/* SAPI-private final-header acceptance; consumes the owned list on all paths.
+ * Public hp_response_headers remains immediate. Publish never waits for body;
+ * write compounds only an immediately admitted first chunk of at most 16KiB,
+ * and otherwise publishes before the ordinary write can wait. */
+int hp_sapi_response_headers(hp_request_t *, int status, hp_header_t *, bool defer);
+int hp_sapi_response_publish(hp_request_t *);
+ssize_t hp_sapi_response_write(hp_request_t *, const void *, size_t);
 void hp_response_finish(hp_request_t *);
+/* Owning-loop adapters. acquire executes under the request mutex, excluding
+ * cancellation/timeout from publishing a late grant. It must not call back
+ * into the bridge. The token's notify callback may only enqueue loop work. */
+bool hp_response_lease_requested(hp_request_t *);
+void hp_response_lease_acquire(hp_request_t *, void *(*acquire)(void *), void *);
+void *hp_response_lease_get(hp_request_t *, bool *return_requested, bool *call_active);
+/* Call only after H2O return==1 (also after protocol close detached it). */
+void hp_response_lease_returned(hp_request_t *, void *);
+void hp_response_lease_yield(hp_request_t *);
 /* Legacy diagnostic pop releases per-request queue credit immediately and
  * returns one chunk for hp_chunk_free. HTTP generators use the batch API. */
 hp_chunk_t *hp_response_pop(hp_request_t *);
@@ -146,6 +226,8 @@ void hp_runtime_fork_child(void);
 void hp_runtime_set_cpu_sampler(double (*sample)(uint64_t, void *), void *data);
 void hp_metrics_json(char *, size_t);
 size_t hp_bridge_buffered_bytes(void);
+/* Engine shutdown: discard recycled input capacity and disable further reuse. */
+void hp_bridge_cleanup(void);
 void hp_sapi_interrupt_request(hp_request_t *);
 /* Stable scheduler token identifies one PHP pthread, including bootstrap. */
 void hp_sapi_set_worker_token(void *);
