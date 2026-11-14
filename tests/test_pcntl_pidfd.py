@@ -323,52 +323,16 @@ function cached_foreign(string $token): array {
     $wait = edge_wait($fd, WEXITED | WNOWAIT); unset($rights);
     return compact('child', 'descriptor', 'identity', 'wait');
 }
-function pin_fork_case(string $token): array {
-    $child = null; $process = null; $pipes = []; $rights = [];
-    try {
-        [$child, $process, $pipes] = own_child($token, 'fork');
-        [$fd, $rights] = receive_pidfd($token, $child['pid']);
-        $runtime = new parallel\Runtime();
-        $future = $runtime->run(static function (int $target, int $applicationFd, string $base, string $token): array {
-            $end = microtime(true) + 3; $matches = [];
-            do {
-                $matches = [];
-                foreach (glob('/proc/self/fdinfo/[0-9]*') as $path) {
-                    $raw = @file_get_contents($path);
-                    if ($raw !== false && preg_match('/^Pid:\s+(\d+)$/m', $raw, $m) && (int)$m[1] === $target) $matches[] = (int)basename($path);
-                }
-                if (count($matches) === 3) break;
-                usleep(1000);
-            } while (microtime(true) < $end);
-            if (count($matches) !== 3) throw new RuntimeException('main owner never entered pinned wait');
-            file_put_contents($base.'/pidfd-'.$token.'-pin-present.json', json_encode($matches, JSON_THROW_ON_ERROR));
-            $forked = pcntl_fork();
-            if ($forked < 0) throw new RuntimeException('parallel same-owner fork failed');
-            if ($forked === 0) {
-                $inherited = [];
-                foreach (glob('/proc/self/fdinfo/[0-9]*') as $path) {
-                    $raw = @file_get_contents($path);
-                    if ($raw !== false && preg_match('/^Pid:\s+(\d+)$/m', $raw, $m) && (int)$m[1] === $target) $inherited[] = (int)basename($path);
-                }
-                sort($inherited);
-                file_put_contents($base.'/pidfd-'.$token.'-fork-child.json', json_encode([
-                    'pid' => getmypid(), 'inherited_pidfds' => $inherited, 'expected_application_fd' => $applicationFd], JSON_THROW_ON_ERROR));
-                exit($inherited === [$applicationFd] ? 17 : 97);
-            }
-            $status = 0; $got = pcntl_waitpid($forked, $status, 0);
-            touch($base.'/pidfd-'.$token.'-child-release');
-            return ['pid' => $forked, 'wait' => $got, 'exit' => $got > 0 && pcntl_wifexited($status) ? pcntl_wexitstatus($status) : null];
-        }, [$child['pid'], $fd, __DIR__, $token]);
-        $wait = edge_wait($fd, WEXITED);
-        $auxiliary = $future->value(); $runtime->close();
-        return compact('child', 'wait', 'auxiliary');
-    } finally {
-        unset($rights);
-        if ($child) cleanup_owned($token, $child['pid'], $process, $pipes);
-    }
+function fork_in_task(): array {
+    $runtime = new parallel\Runtime();
+    $future = $runtime->run(static function (): array {
+        $forked = pcntl_fork();
+        return ['forked' => $forked, 'errno' => $forked < 0 ? pcntl_get_last_error() : 0];
+    });
+    $result = $future->value(); $runtime->close();
+    return $result;
 }
 '''
-
 
 @unittest.skipUnless(sys.platform == 'linux' and hasattr(os, 'pidfd_open'), 'Linux pidfd_open required')
 class PCNTLPidfdTest(unittest.TestCase):
@@ -383,7 +347,7 @@ class PCNTLPidfdTest(unittest.TestCase):
         (self.base / 'foreign.php').write_text(FOREIGN)
         (self.base / 'edge.php').write_text("<?php require __DIR__.'/pidfd-helper.php'; header('Content-Type: application/json'); echo json_encode(edge_case($_GET['token'], $_GET['mode']), JSON_THROW_ON_ERROR);\n")
         (self.base / 'cached-foreign.php').write_text("<?php require __DIR__.'/pidfd-helper.php'; header('Content-Type: application/json'); echo json_encode(cached_foreign($_GET['token']), JSON_THROW_ON_ERROR);\n")
-        (self.base / 'pin-fork.php').write_text("<?php require __DIR__.'/pidfd-helper.php'; header('Content-Type: application/json'); echo json_encode(pin_fork_case($_GET['token']), JSON_THROW_ON_ERROR);\n")
+        (self.base / 'fork-in-task.php').write_text("<?php require __DIR__.'/pidfd-helper.php'; header('Content-Type: application/json'); echo json_encode(fork_in_task(), JSON_THROW_ON_ERROR);\n")
         (self.base / 'pidfd-child.php').write_text("<?php require __DIR__.'/pidfd-helper.php'; private_child($argv[1]);\n")
         config = self.server.config.read_text().replace('      /:\n        php.worker:', '      /worker:\n        php.worker:')
         self.server.config.write_text(config + '      /:\n        php_server: ON\n')
@@ -532,20 +496,11 @@ class PCNTLPidfdTest(unittest.TestCase):
                 self.assert_edges(value)
         self.finish_metrics(before, 2)
 
-    def test_same_owner_parallel_fork_closes_main_wait_pin(self):
-        before = self.server.metrics(); token = uuid.uuid4().hex
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(self.server.json, f'/pin-fork.php?token={token}')
-            try:
-                self.transfer(token, future=future)
-                value = future.result(timeout=7)
-            finally:
-                self.release(token)
-        self.assert_exit23(value['wait'], value['child'])
-        self.assertEqual(value['auxiliary']['wait'], value['auxiliary']['pid'], value)
-        self.assertEqual(value['auxiliary']['exit'], 17, value)
-        child = self.wait(token, 'fork-child.json')
-        self.assertEqual(child['inherited_pidfds'], [child['expected_application_fd']], child)
+    def test_fork_inside_parallel_task_is_refused(self):
+        before = self.server.metrics()
+        value = self.server.json('/fork-in-task.php')
+        self.assertEqual(value['forked'], -1, value)
+        self.assertEqual(value['errno'], errno.EPERM, value)
         self.finish_metrics(before, 1)
 
 

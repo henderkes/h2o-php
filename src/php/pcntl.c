@@ -337,16 +337,6 @@ void hp_pcntl_context_enter(void) {
     c->id = next_context_id++; c->next = contexts; contexts = c; local_context = c;
     pthread_mutex_unlock(&signal_lock);
 }
-void hp_pcntl_spawn_prepare(sigset_t *previous) {
-    sigset_t managed; sigemptyset(&managed);
-    pthread_mutex_lock(&signal_lock);
-    for (int sig = 1; sig < NSIG; ++sig) if (installed_actions[sig]) sigaddset(&managed, sig);
-    pthread_mutex_unlock(&signal_lock);
-    pthread_sigmask(SIG_BLOCK, &managed, previous);
-}
-void hp_pcntl_spawn_restore(const sigset_t *previous) {
-    pthread_sigmask(SIG_SETMASK, previous, NULL);
-}
 void hp_pcntl_context_leave(void) {
     pcntl_context_t *c = local_context;
     if (!c || fork_child) return;
@@ -501,6 +491,13 @@ static PHP_FUNCTION(hp_fork) {
     ZEND_PARSE_PARAMETERS_NONE();
     hp_pcntl_context_enter();
     if (!local_context) { errno = EINVAL; RETURN_LONG(-1); }
+    if (hp_sapi_auxiliary_thread()) {
+        /* Forking inside a parallel worker thread is not supported with stock
+         * ext-parallel: the child would inherit dead parent pthread state. */
+        errno = EPERM;
+        local_context->globals->last_error = EPERM;
+        RETURN_LONG(-1);
+    }
     child_record_t *record = calloc(1, sizeof(*record));
     if (!record) { local_context->globals->last_error = ENOMEM; RETURN_LONG(-1); }
 #ifdef __linux__

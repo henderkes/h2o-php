@@ -84,8 +84,6 @@ The HTTP SAPI identifies as `frankenphp`; the real CLI identifies as `cli` and l
 ./build/release/h2o-php php-cli /srv/app/bin/console --help
 ```
 
-Build the shared `parallel` extension with `scripts/build-parallel.sh` and enable its resulting module in PHP INI.
-
-The HTTP SAPI requires that patched module when `parallel` is enabled. A distribution's unpatched `parallel` module is rejected at startup. Use the same PHP profile for `run` and its replacement generations.
+Use the distribution `parallel` extension (e.g. `php-zts-parallel`, parallel 1.2.15+ exporting `php_parallel_is_parallel_worker_thread`) enabled in the PHP ZTS INI like any other module; no patch or custom build is needed. Parallel worker threads inherit the creating request through the SAPI's `SG(server_context)` lease. Forking inside a parallel worker thread is not supported: `pcntl_fork()` fails with `EPERM` there. Use the same PHP profile for `run` and its replacement generations.
 
 More examples are in [examples/frameworks](examples/frameworks/README.md).

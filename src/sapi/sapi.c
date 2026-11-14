@@ -5,7 +5,6 @@
  * Zend execution and bailout recovery remain entirely inside this C unit. */
 #include "h2o_php.h"
 #include "environment.h"
-#include "parallel_host.h"
 #include "../observability/log.h"
 #include <php.h>
 #include <SAPI.h>
@@ -60,14 +59,10 @@ typedef struct hp_php_owner {
 typedef struct hp_php_lease {
     uint64_t magic;
     atomic_uint refs;
-    atomic_bool child_attached;
-    atomic_bool spawn_pending;
     hp_php_owner_t *owner;
     hp_request_t *request;
     hp_header_t *env;
     char *script, *root;
-    sigset_t parent_mask;
-    bool have_parent_mask;
 } hp_php_lease_t;
 static _Thread_local hp_php_owner_t *local_owner;
 static _Thread_local hp_php_lease_t *local_lease;
@@ -98,7 +93,6 @@ static hp_php_slot_t *slots;
 static _Thread_local hp_php_slot_t local_slot;
 static bool auxiliary_fork_gate;
 static pthread_t auxiliary_fork_owner;
-static unsigned pending_spawns;
 
 static void wait_auxiliary_gate(void)
 {
@@ -151,7 +145,7 @@ static void publish_request(hp_request_t *request)
 static void initialize_opcache_scalars(void);
 static void frankenphp_reset_super_globals(void);
 static void install_context(hp_request_t *);
-static void register_parallel_hooks(void);
+static void init_parallel_support(void);
 static void unregister_slot(void);
 
 static hp_php_owner_t *owner_new(void)
@@ -178,34 +172,24 @@ static void lease_release(void *opaque)
     hp_headers_free(lease->env); free(lease->script); free(lease->root);
     owner_release(lease->owner); free(lease);
 }
-static void *lease_capture(void)
+/* One lease per request, stored in SG(server_context). Stock ext-parallel
+ * propagates SG(server_context) from a Runtime's creator into every worker
+ * thread (runtime->parent.server), so worker threads bind this lease in
+ * activate() without any extension patch. */
+static hp_php_lease_t *lease_new(hp_request_t *request)
 {
-    if (hp_process_is_fork_child()) return NULL;
-    pthread_mutex_lock(&slots_mutex);
-    if (!(local_auxiliary && local_slot.busy)) wait_auxiliary_gate();
-    pthread_mutex_unlock(&slots_mutex);
-    if (!local_owner) local_owner = owner_new();
     hp_php_lease_t *lease = calloc(1, sizeof(*lease));
-    if (!lease) zend_error_noreturn(E_ERROR, "Cannot allocate parallel request lease");
-    lease->magic = HP_LEASE_MAGIC; atomic_init(&lease->refs, 1); atomic_init(&lease->child_attached, false); atomic_init(&lease->spawn_pending, false);
+    if (!lease) zend_error_noreturn(E_ERROR, "Cannot allocate PHP request lease");
+    lease->magic = HP_LEASE_MAGIC; atomic_init(&lease->refs, 1);
     lease->owner = local_owner; owner_retain(lease->owner);
-    if (current_request && current_request != &dummy_request) {
-        lease->request = current_request; hp_request_retain(lease->request);
-    }
+    if (request && request != &dummy_request) { lease->request = request; hp_request_retain(request); }
     /* FrankenPHP's sandbox/prepared/worker env tables belong to the calling
      * OS thread. A parallel interpreter starts from process env, not a parent
      * PHP overlay; its own bootstrap and task changes remain persistent. */
-    lease->script = strdup(current_request && current_request->script ? current_request->script : "");
-    lease->root = strdup(current_request && current_request->document_root ? current_request->document_root : "");
-    if (!lease->script || !lease->root) { lease_release(lease); zend_error_noreturn(E_ERROR, "Cannot copy parallel request metadata"); }
+    lease->script = strdup(request->script ? request->script : "");
+    lease->root = strdup(request->document_root ? request->document_root : "");
+    if (!lease->script || !lease->root) { lease_release(lease); zend_error_noreturn(E_ERROR, "Cannot copy request metadata"); }
     return lease;
-}
-static int pending_output(void)
-{
-    php_output_handler **handlers = zend_stack_base(&OG(handlers));
-    for (int i = 0; i < zend_stack_count(&OG(handlers)); ++i)
-        if (handlers[i]->buffer.used) return 1;
-    return 0;
 }
 /* newWorkerDummyContext uses the basename URI and a nil split list, which
  * defaults to .php independently of the HTTP server's configured delimiters.
@@ -256,123 +240,6 @@ static void bind_lease(hp_php_lease_t *lease)
     SG(request_info).headers_only = false;
     lease_release(old);
 }
-static void parallel_task_enter(void *opaque)
-{
-    if (hp_process_is_fork_child() || !opaque) return;
-    hp_php_lease_t *lease = opaque;
-    if (!local_auxiliary || lease->magic != HP_LEASE_MAGIC) return;
-    if (local_lease && local_lease->request != lease->request) {
-        php_output_flush_all();
-        if (pending_output()) {
-            zend_throw_exception(spl_ce_RuntimeException,
-                "Cannot switch parallel HTTP request: an output buffer from the previous task cannot be flushed", 0);
-            return;
-        }
-    }
-    bind_lease(lease);
-}
-static void parallel_task_leave(void *opaque)
-{
-    (void)opaque;
-    if (!hp_process_is_fork_child() && local_auxiliary) {
-        php_output_flush_all();
-        if (current_request && current_request != &dummy_request)
-            (void)hp_sapi_response_publish(current_request);
-    }
-    /* Keep the lease through idle time and shutdown hooks. A next task first
-     * flushes old buffers before changing generation, never into a new reply. */
-}
-static int parallel_native_output(void) { return !hp_process_is_fork_child() && local_slot.registered; }
-static void parallel_thread_idle(void *opaque)
-{
-    (void)opaque;
-    if (!local_auxiliary || hp_process_is_fork_child()) return;
-    pthread_mutex_lock(&slots_mutex);
-    local_slot.busy = false; pthread_cond_broadcast(&slots_cond);
-    wait_auxiliary_gate();
-    pthread_mutex_unlock(&slots_mutex);
-}
-static void parallel_thread_busy(void *opaque)
-{
-    (void)opaque;
-    if (!local_auxiliary || hp_process_is_fork_child()) return;
-    pthread_mutex_lock(&slots_mutex);
-    wait_auxiliary_gate(); local_slot.busy = true;
-    pthread_mutex_unlock(&slots_mutex);
-}
-static void *parallel_spawn_prepare(void *opaque)
-{
-    if (!opaque || hp_process_is_fork_child()) return NULL;
-    hp_php_lease_t *lease = opaque;
-    pthread_mutex_lock(&slots_mutex);
-    wait_auxiliary_gate();
-    atomic_store(&lease->spawn_pending, true); ++pending_spawns;
-    pthread_mutex_unlock(&slots_mutex);
-    hp_pcntl_spawn_prepare(&lease->parent_mask);
-    lease->have_parent_mask = true;
-    return lease;
-}
-static void parallel_spawn_parent(void *opaque, int created)
-{
-    if (!opaque || hp_process_is_fork_child()) return;
-    hp_php_lease_t *lease = opaque;
-    if (lease->have_parent_mask) hp_pcntl_spawn_restore(&lease->parent_mask);
-    if (created) return;
-    pthread_mutex_lock(&slots_mutex);
-    if (atomic_exchange(&lease->spawn_pending, false)) --pending_spawns;
-    pthread_cond_broadcast(&slots_cond); pthread_mutex_unlock(&slots_mutex);
-}
-
-static void parallel_thread_ready(void *opaque)
-{
-    hp_php_lease_t *lease = opaque;
-    if (local_auxiliary && !hp_process_is_fork_child()) {
-        if (lease && lease->have_parent_mask) hp_pcntl_spawn_restore(&lease->parent_mask);
-        hp_pcntl_context_enter();
-    }
-}
-static void parallel_thread_done(void *opaque)
-{
-    (void)opaque;
-    hp_php_lease_t *base = opaque;
-    if (hp_process_is_fork_child()) return;
-    pthread_mutex_lock(&slots_mutex);
-    if (base && atomic_exchange(&base->spawn_pending, false)) --pending_spawns;
-    pthread_cond_broadcast(&slots_cond); pthread_mutex_unlock(&slots_mutex);
-    if (!local_auxiliary) return;
-    /* parallel has already freed its own TSRM context. Only C ownership remains. */
-    if (local_lease && local_lease->request)
-        (void)hp_sapi_response_publish(local_lease->request);
-    lease_release(local_lease); local_lease = NULL; current_request = NULL;
-    owner_release(local_owner); local_owner = NULL; local_auxiliary = false;
-}
-static void parallel_thread_stopping(void *opaque)
-{
-    (void)opaque;
-    /* TSRM's virtual-CWD constructor allocates before the first RINIT, while
-     * its destructor only frees the realpath cache. This is also needed when
-     * request startup/shutdown bailed before ordinary CWD deactivation. */
-    virtual_cwd_deactivate();
-    if (!local_auxiliary || hp_process_is_fork_child()) return;
-    /* A shutdown callback can bail before sapi_deactivate. Remove all native
-     * references to Zend TLS before parallel frees that interpreter. Its PHP
-     * heap may already be gone; only clear environment pointers here. */
-    hp_pcntl_context_leave();
-    if (local_slot.registered) unregister_slot();
-    hp_env_after_shutdown();
-    if (current_request && current_request != &dummy_request)
-        (void)hp_sapi_response_publish(current_request);
-    current_request = NULL; SG(server_context) = NULL;
-}
-static void parallel_thread_joined(void *opaque)
-{
-    hp_php_lease_t *lease = opaque;
-    if (hp_process_is_fork_child() || !lease) return;
-    if (atomic_exchange_explicit(&lease->child_attached, false, memory_order_acq_rel)) {
-        atomic_fetch_sub_explicit(&auxiliary_threads, 1, memory_order_release);
-        pthread_mutex_lock(&slots_mutex); pthread_cond_broadcast(&slots_cond); pthread_mutex_unlock(&slots_mutex);
-    }
-}
 int hp_sapi_fork_prepare(uint64_t timeout_ms)
 {
     uint64_t now = hp_now_ns();
@@ -381,7 +248,7 @@ int hp_sapi_fork_prepare(uint64_t timeout_ms)
     if (auxiliary_fork_gate) { pthread_mutex_unlock(&slots_mutex); return -1; }
     auxiliary_fork_gate = true; auxiliary_fork_owner = pthread_self();
     for (;;) {
-        bool busy = pending_spawns != 0;
+        bool busy = false;
         for (hp_php_slot_t *slot = slots; slot; slot = slot->next)
             if (slot->auxiliary && slot->busy && !pthread_equal(slot->thread, pthread_self())) busy = true;
         if (!busy) { pthread_mutex_unlock(&slots_mutex); return 0; }
@@ -409,11 +276,12 @@ void hp_sapi_fork_child(void)
     slots_mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
     slots_cond = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
     slots = local_slot.registered ? &local_slot : NULL; local_slot.next = NULL;
-    auxiliary_fork_gate = false; pending_spawns = 0;
+    auxiliary_fork_gate = false;
     atomic_store(&auxiliary_threads, 0);
 }
 
 unsigned hp_sapi_aux_threads(void) { return atomic_load_explicit(&auxiliary_threads, memory_order_acquire); }
+bool hp_sapi_auxiliary_thread(void) { return local_auxiliary && !hp_process_is_fork_child(); }
 void *hp_sapi_worker_token(void) { return local_owner ? local_owner->token : local_slot.worker_token; }
 int64_t hp_sapi_memory_limit(void) { return PG(memory_limit); }
 
@@ -771,7 +639,8 @@ static void install_context(hp_request_t *request)
     http_finished = false;
     sapi_final_headers_sent = false;
     sapi_headers_finishing = false;
-    SG(server_context) = local_owner;
+    /* Stock ext-parallel propagates this value into parallel worker threads. */
+    SG(server_context) = lease_new(request);
     SG(sapi_headers).http_response_code = 200;
     SG(request_info).request_method = request->method ? request->method : "GET";
     SG(request_info).query_string = request->query;
@@ -802,6 +671,13 @@ static void clear_context(void)
     SG(request_info).path_translated = NULL;
     SG(request_info).request_uri = NULL;
     SG(request_info).content_type = NULL;
+    /* The creating thread owns the SG(server_context) lease reference; worker
+     * threads received the parent's lease and must not release it here. */
+    if (!hp_process_is_fork_child() && !local_auxiliary) {
+        hp_php_lease_t *lease = SG(server_context);
+        if (lease && lease->magic == HP_LEASE_MAGIC) lease_release(lease);
+    }
+    SG(server_context) = NULL;
 }
 
 static void finish_http(void)
@@ -1225,7 +1101,6 @@ static PHP_MINIT_FUNCTION(frankenphp)
 {
     register_frankenphp_symbols(module_number);
     if (hp_pcntl_install() != 0) return FAILURE;
-    register_parallel_hooks();
     hp_env_override_functions();
     override_opcache();
     return SUCCESS;
@@ -1302,14 +1177,13 @@ static bool (*parallel_is_worker)(void);
 /* Static PHP extensions have no dlopen handle or dynamic symbol table. Their
  * module entry keeps php_parallel.c linked, so weak direct references resolve
  * without imposing a parallel dependency on the shared development profile. */
-extern int php_parallel_set_host_hooks(const hp_parallel_host_hooks_t *) __attribute__((weak));
 extern bool php_parallel_is_parallel_worker_thread(void) __attribute__((weak));
 static void register_slot_locked(void)
 {
     local_slot.interrupt = &EG(vm_interrupt);
     local_slot.timed_out = &EG(timed_out);
     local_slot.request = NULL; local_slot.owner = local_owner;
-    local_slot.thread = pthread_self(); local_slot.auxiliary = local_auxiliary; local_slot.busy = true;
+    local_slot.thread = pthread_self(); local_slot.auxiliary = local_auxiliary; local_slot.busy = !local_auxiliary;
     local_slot.next = slots; slots = &local_slot; local_slot.registered = true;
 }
 static void register_slot(void)
@@ -1329,18 +1203,17 @@ static void unregister_slot(void)
 static int activate(void)
 {
     if (hp_process_is_fork_child() || local_slot.registered || !parallel_is_worker || !parallel_is_worker()) return SUCCESS;
+    /* Stock parallel sets this worker thread's SG(server_context) to the
+     * creating thread's value, which install_context made the request lease. */
     hp_php_lease_t *lease = SG(server_context);
     if (!lease || lease->magic != HP_LEASE_MAGIC) return SUCCESS;
     local_auxiliary = true; local_owner = lease->owner; owner_retain(local_owner);
     initialize_opcache_scalars();
     pthread_mutex_lock(&slots_mutex);
-    /* A pthread already counted as pending must finish bootstrap so the fork
-     * gate can observe it reaching idle; newly requested spawns stay frozen. */
-    if (!atomic_load(&lease->spawn_pending)) wait_auxiliary_gate();
-    if (atomic_exchange(&lease->spawn_pending, false)) --pending_spawns;
+    wait_auxiliary_gate();
     register_slot_locked();
     atomic_fetch_add_explicit(&auxiliary_threads, 1, memory_order_acq_rel);
-    atomic_store_explicit(&lease->child_attached, true, memory_order_release);
+
     pthread_cond_broadcast(&slots_cond); pthread_mutex_unlock(&slots_mutex);
     bind_lease(lease);
     return SUCCESS;
@@ -1353,40 +1226,35 @@ static int deactivate(void)
     if (!hp_process_is_fork_child() && local_auxiliary) {
         hp_pcntl_context_leave();
         hp_env_script_reset();
+        if (local_lease && local_lease->request)
+            (void)hp_sapi_response_publish(local_lease->request);
+        pthread_mutex_lock(&slots_mutex);
+        atomic_fetch_sub_explicit(&auxiliary_threads, 1, memory_order_release);
+        pthread_cond_broadcast(&slots_cond); pthread_mutex_unlock(&slots_mutex);
         clear_context();
+        lease_release(local_lease); local_lease = NULL;
         unregister_slot();
+        owner_release(local_owner); local_owner = NULL; local_auxiliary = false;
     }
     return SUCCESS;
 }
-static void register_parallel_hooks(void)
+static void init_parallel_support(void)
 {
     zend_module_entry *module = zend_hash_str_find_ptr(&module_registry, "parallel", sizeof("parallel") - 1);
     if (!module) return;
-    hp_parallel_set_host_hooks_t install = NULL;
     parallel_is_worker = NULL;
-    if (!module->handle) {
-        install = php_parallel_set_host_hooks;
-        parallel_is_worker = php_parallel_is_parallel_worker_thread;
-    }
-    if (!install || !parallel_is_worker) {
+    if (!module->handle) parallel_is_worker = php_parallel_is_parallel_worker_thread;
+    if (!parallel_is_worker) {
         void *handle = module->handle ? module->handle : RTLD_DEFAULT;
-        install = (hp_parallel_set_host_hooks_t)dlsym(handle, "php_parallel_set_host_hooks");
         parallel_is_worker = (bool (*)(void))dlsym(handle, "php_parallel_is_parallel_worker_thread");
     }
-    if (!install || !parallel_is_worker) {
-        zend_error_noreturn(E_CORE_ERROR, "h2o-php requires parallel built with its versioned native host integration patch");
-    }
-    const hp_parallel_host_hooks_t hooks = {
-        .abi = HP_PARALLEL_HOST_ABI, .size = sizeof(hooks),
-        .capture = lease_capture, .release = lease_release,
-        .enter = parallel_task_enter, .leave = parallel_task_leave,
-        .thread_ready = parallel_thread_ready, .thread_stopping = parallel_thread_stopping,
-        .thread_done = parallel_thread_done,
-        .thread_joined = parallel_thread_joined, .native_output = parallel_native_output,
-        .thread_idle = parallel_thread_idle, .thread_busy = parallel_thread_busy,
-        .spawn_prepare = parallel_spawn_prepare, .spawn_parent = parallel_spawn_parent,
-    };
-    if (install(&hooks) != SUCCESS) zend_error_noreturn(E_CORE_ERROR, "Incompatible parallel host integration ABI");
+    if (!parallel_is_worker)
+        zend_error_noreturn(E_CORE_ERROR, "h2o-php requires ext-parallel exporting php_parallel_is_parallel_worker_thread (php-zts-parallel 1.2.15+)");
+    /* parallel's MINIT wraps ub_write in a process-global mutex. This SAPI
+     * serializes output per request/owner, so restore the direct writer;
+     * parallel's wrapper then never runs and its unclean-shutdown unlock
+     * path (krakjoe/parallel#313) stays inert. */
+    if (sapi_module.ub_write != write_output) sapi_module.ub_write = write_output;
 }
 
 static sapi_module_struct hp_sapi_module = {
@@ -1478,7 +1346,7 @@ int hp_sapi_init(const char *ini, unsigned max_threads)
     (void)cfg_get_string("filter.default", &configured_filter);
     filter_server_variables = configured_filter != NULL;
     override_opcache();
-    register_parallel_hooks();
+    init_parallel_support();
     if (hp_pcntl_install() != 0) zend_error_noreturn(E_CORE_ERROR, "Cannot install the required PCNTL runtime integration");
     hp_pcntl_finalize();
     default_ignore_user_abort = PG(ignore_user_abort);
