@@ -15,24 +15,26 @@ hosts:
   "symfony.local:18084":
     paths:
       "/":
-        php.root: /home/m/h2o-php/examples/frameworks/symfony
-        php.worker:
-          file: /home/m/h2o-php/examples/frameworks/symfony/index.php
-          num: 1
-          env:
-            APP_ENV: prod
-            APP_DEBUG: "0"
+        php.root: ../symfony-demo/public
+        php_server:
+          worker:
+            file: index.php
+            num: 1
+            env:
+              APP_ENV: prod
+              APP_DEBUG: "0"
+              APP_RUNTIME_OPTIONS: '{"error_handler":false}'
       "/metrics":
         php.metrics: ON
   "laravel.local:18085":
     paths:
       "/":
-        php.root: /home/m/h2o-php/build/frameworks/laravel/public
+        php.root: build/frameworks/laravel/public
         php.worker:
-          file: /home/m/h2o-php/build/frameworks/laravel/vendor/laravel/octane/bin/frankenphp-worker.php
+          file: ../vendor/laravel/octane/bin/frankenphp-worker.php
           num: 1
           env:
-            APP_BASE_PATH: /home/m/h2o-php/build/frameworks/laravel
+            APP_BASE_PATH: !env APP_BASE_PATH
             APP_ENV: production
             APP_DEBUG: "false"
             SESSION_DRIVER: array

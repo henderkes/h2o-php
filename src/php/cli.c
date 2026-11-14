@@ -88,7 +88,7 @@ int hp_php_cli_main(int argc, char **argv)
 int hp_php_cli_main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    fputs("php-cli requires matching PHP 8.6+ ZTS headers/library with exported do_php_cli; rebuild with H2O_PHP_ENABLE_CLI=ON\n", stderr);
+    fputs("php-cli requires matching PHP ZTS headers/library with exported do_php_cli; rebuild with H2O_PHP_ENABLE_CLI=ON\n", stderr);
     return 70;
 }
 #endif

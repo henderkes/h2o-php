@@ -11,11 +11,8 @@ include(EmbedAssets)
 hp_embed_assets("${CMAKE_CURRENT_SOURCE_DIR}/assets/ca-bundle.pem"
   "${CMAKE_CURRENT_BINARY_DIR}/h2o-php-embedded-assets.h")
 option(H2O_PHP_PREFER_EMBEDDED_CA "Use the pinned bundled CA data before platform defaults (explicit user overrides still win)" OFF)
-set(_cli_default OFF)
-if(PHPZTS_VERSION VERSION_GREATER_EQUAL "8.6")
-  set(_cli_default ON)
-endif()
-option(H2O_PHP_ENABLE_CLI "Enable the real PHP CLI SAPI (PHP 8.6+)" ${_cli_default})
+option(H2O_PHP_ENABLE_CLI "Enable the real PHP CLI SAPI" ON)
+option(H2O_PHP_SET_CAPABILITIES "Try to allow Linux builds to bind privileged ports without running as root" ON)
 if(H2O_PHP_ENABLE_CLI)
   include(CMakePushCheckState)
   cmake_push_check_state(RESET)
@@ -24,15 +21,12 @@ if(H2O_PHP_ENABLE_CLI)
   check_c_source_compiles("#include <php.h>
 #include <php_main.h>
 #include <sapi/cli/cli.h>
-#if PHP_VERSION_ID < 80600
-#error PHP CLI embedding requires PHP 8.6 or later
-#endif
 int main(void) { int (*volatile cli)(int,char**) = do_php_cli;
   void *volatile modules = (void *)&php_register_internal_extensions_func;
   return cli == 0 || modules == 0; }" H2O_PHP_CLI_LINKS)
   cmake_pop_check_state()
   if(NOT H2O_PHP_CLI_LINKS)
-    message(FATAL_ERROR "CLI requested, but matching PHP 8.6 CLI headers/exported do_php_cli and module registration hook are unavailable")
+    message(FATAL_ERROR "CLI requested, but matching PHP CLI headers/exported do_php_cli and module registration hook are unavailable")
   endif()
 endif()
 
@@ -126,6 +120,22 @@ add_custom_target(native-server DEPENDS h2o)
 if(TARGET h2o-php-openssl-import-check)
   add_dependencies(native-server h2o-php-openssl-import-check)
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND H2O_PHP_SET_CAPABILITIES)
+  find_program(H2O_PHP_SETCAP_EXECUTABLE NAMES setcap)
+  find_program(H2O_PHP_GETCAP_EXECUTABLE NAMES getcap)
+  find_program(H2O_PHP_SUDO_EXECUTABLE NAMES sudo)
+  # Run after linking, including on a later build after sudo credentials become
+  # available. An existing capability makes this a read-only check.
+  add_custom_target(h2o-php-capabilities ALL
+    COMMAND "${CMAKE_COMMAND}"
+      "-DBINARY=$<TARGET_FILE:h2o>"
+      "-DSETCAP=${H2O_PHP_SETCAP_EXECUTABLE}"
+      "-DGETCAP=${H2O_PHP_GETCAP_EXECUTABLE}"
+      "-DSUDO=${H2O_PHP_SUDO_EXECUTABLE}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetCapabilities.cmake"
+    DEPENDS h2o VERBATIM)
+  add_dependencies(native-server h2o-php-capabilities)
+endif()
 
 add_custom_target(h2o-php-php-abi-check
   COMMAND "${CMAKE_COMMAND}"
@@ -165,10 +175,7 @@ install(FILES src/php/LICENSE.frankenphp DESTINATION share/licenses/h2o-php RENA
 install(FILES cmake/compat/LICENSE.OpenSSL DESTINATION share/licenses/h2o-php RENAME OpenSSL-Apache-2.0.txt)
 install(FILES assets/LICENSE.MPL-2.0 DESTINATION share/licenses/h2o-php RENAME Mozilla-CA-MPL-2.0.txt)
 install(FILES assets/README.md DESTINATION share/licenses/h2o-php RENAME Mozilla-CA-PROVENANCE.md)
-install(FILES upstream/php-src/LICENSE DESTINATION share/licenses/h2o-php RENAME PHP-3.01.txt)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/upstream/php-src-8.6/LICENSE")
-  install(FILES upstream/php-src-8.6/LICENSE DESTINATION share/licenses/h2o-php RENAME PHP-8.6-BSD-3-Clause.txt)
-endif()
+install(FILES upstream/php-src/LICENSE DESTINATION share/licenses/h2o-php RENAME PHP-8.6-BSD-3-Clause.txt)
 file(GLOB_RECURSE H2O_DEPENDENCY_NOTICES
   "${CMAKE_CURRENT_SOURCE_DIR}/upstream/h2o/deps/*LICENSE*"
   "${CMAKE_CURRENT_SOURCE_DIR}/upstream/h2o/deps/*COPYING*")

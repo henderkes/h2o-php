@@ -1,0 +1,1627 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Measured H2O PHP and FrankenPHP Symfony throughput, with tracing JIT enabled and disabled.">
+<title>H2O PHP vs FrankenPHP — Symfony benchmarks</title>
+<style>
+:root { color-scheme: light; --ink: #182333; --muted: #596779; --line: #dfe5ed; --paper: #fff; --accent: #24624c; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+body { margin: 0; color: var(--ink); background: #f3f5f8; font: 16px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+main { max-width: 1120px; margin: 0 auto; padding: 48px 28px 40px; }
+.kicker { color: var(--accent); font-size: 12px; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
+h1 { margin: 8px 0; font-size: clamp(29px, 4.2vw, 44px); letter-spacing: -.045em; line-height: 1.15; }
+.lead { margin: 14px 0 20px; max-width: 78ch; color: var(--muted); }
+nav { display: flex; flex-wrap: wrap; gap: 10px; margin: 24px 0; }
+nav a { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 7px 13px; text-decoration: none; font-weight: 600; font-size: 14px; }
+a { color: #245c83; text-underline-offset: 3px; }
+a:hover { color: #123a56; }
+a:focus-visible, .table-wrap:focus-visible { outline: 3px solid #578cbd; outline-offset: 4px; }
+.facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 22px 0 26px; }
+.fact { padding: 14px 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+.fact strong { display: block; font-size: 22px; letter-spacing: -.025em; }
+.fact span { color: var(--muted); font-size: 13px; }
+section { margin: 36px 0; }
+h2 { font-size: 23px; letter-spacing: -.025em; margin: 0 0 5px; }
+.description { color: var(--muted); margin: 0 0 15px; font-size: 14px; max-width: 85ch; }
+.table-wrap { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 650px; font-size: 14px; font-variant-numeric: tabular-nums; }
+thead { color: #4a586c; background: #eaf0f5; }
+th, td { text-align: right; padding: 10px 20px; white-space: nowrap; }
+th:first-child { text-align: left; }
+thead th { font-weight: 650; vertical-align: bottom; padding-top: 13px; padding-bottom: 13px; }
+.subhead { display: block; font-size: 11px; font-weight: 450; color: var(--muted); }
+tbody th { font-weight: 550; }
+tbody tr + tr { border-top: 1px solid #edf0f5; }
+tbody + tbody { border-top: 2px solid #d4dce6; }
+tbody tr:nth-child(even) { background: #fafbfd; }
+tbody tr:hover { background: #f0f5fa; }
+.positive { color: #216448; font-weight: 650; }
+.negative { color: #9a3e44; font-weight: 650; }
+.neutral { color: var(--muted); }
+.gain { font-size: 12px; margin-left: 5px; }
+#table-jit-impact { min-width: 760px; }
+.note { background: #e9f1ee; border-left: 3px solid #3c8065; padding: 14px 18px; border-radius: 0 8px 8px 0; font-size: 14px; color: #314e42; }
+.details-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; }
+.details-grid > div { min-width: 0; }
+h3 { margin: 0 0 10px; font-size: 16px; }
+ul { margin: 0; padding-left: 19px; }
+li + li { margin-top: 7px; }
+.details-grid li, .details-grid p { color: var(--muted); font-size: 14px; }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .88em; overflow-wrap: anywhere; }
+dl { margin: 0; font-size: 14px; }
+dt { font-weight: 600; margin-top: 10px; }
+dd { margin-left: 0; color: var(--muted); }
+.sources { padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+.sources ul { display: flex; flex-wrap: wrap; gap: 9px 25px; list-style: none; padding: 0; }
+.sources li { margin: 0; }
+footer { margin-top: 24px; color: var(--muted); font-size: 12px; }
+@media (max-width: 680px) { main { padding: 28px 16px; } .facts { grid-template-columns: 1fr 1fr; } .details-grid { grid-template-columns: 1fr; gap: 22px; } th, td { padding: 10px 14px; } }
+@media print { @page { margin: 14mm; } body { background: white; color: black; font-size: 10pt; } main { max-width: none; padding: 0; } h1 { font-size: 26pt; } nav { display: none; } section { margin: 20px 0; } .table-wrap { overflow: visible; border-radius: 0; } table, #table-jit-impact { min-width: 0; font-size: 9pt; } th, td { padding: 5px 8px; } tr { break-inside: avoid; } thead { display: table-header-group; } .facts { gap: 8px; } .fact { padding: 8px 12px; } .gain { font-size: 8pt; } a { color: inherit; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+<div class="kicker">Symfony · local HTTP benchmark · 7 November 2026</div>
+<h1>H2O PHP vs FrankenPHP</h1>
+<p class="lead">Homepage, blog index, and an individual post at five connection counts. All values below are measured median requests per second; higher is better.</p>
+<nav aria-label="Report sections"><a href="#jit-on">JIT enabled</a><a href="#jit-off">JIT disabled</a><a href="#jit-impact">JIT vs baseline</a><a href="#method">Method and routes</a></nav>
+<div class="facts">
+<div class="fact"><strong>48</strong><span>PHP workers per server</span></div>
+<div class="fact"><strong>3 × 10 s</strong><span>measured runs per point</span></div>
+<div class="fact"><strong>11,421,009</strong><span>requests across both matrices</span></div>
+<div class="fact"><strong>0</strong><span>HTTP or socket errors</span></div>
+</div>
+<div class="note">With tracing JIT, H2O's homepage throughput was 10–30% above FrankenPHP's. Blog and post results were closer. Small differences can fall within run-to-run variation; see the source data for ranges.</div>
+</header>
+<section id="jit-on" aria-labelledby="jit-on-title">
+<h2 id="jit-on-title">JIT enabled</h2>
+<p class="description">Tracing JIT on both servers, with a 64 MiB buffer each. H2O difference = (H2O ÷ FrankenPHP − 1) × 100%; a negative value favors FrankenPHP.</p>
+<div class="table-wrap" role="region" aria-label="jit-on benchmark table" tabindex="0"><table id="table-jit-on">
+<thead><tr><th scope="col">Route</th><th scope="col">Connections <span class="subhead">wrk -c</span></th>
+<th scope="col">H2O <span class="subhead">requests/sec</span></th>
+<th scope="col">FrankenPHP <span class="subhead">requests/sec</span></th>
+<th scope="col">H2O difference</th></tr></thead>
+<tbody data-route="homepage">
+<tr data-connections="1"><th scope="row">Homepage</th><td>1</td><td>1,722</td><td>1,523</td><td><span class="positive">+13.1%</span></td></tr>
+<tr data-connections="8"><th scope="row">Homepage</th><td>8</td><td>11,251</td><td>9,845</td><td><span class="positive">+14.3%</span></td></tr>
+<tr data-connections="32"><th scope="row">Homepage</th><td>32</td><td>19,018</td><td>17,234</td><td><span class="positive">+10.4%</span></td></tr>
+<tr data-connections="100"><th scope="row">Homepage</th><td>100</td><td>21,248</td><td>16,355</td><td><span class="positive">+29.9%</span></td></tr>
+<tr data-connections="256"><th scope="row">Homepage</th><td>256</td><td>21,051</td><td>18,016</td><td><span class="positive">+16.8%</span></td></tr>
+</tbody>
+<tbody data-route="blog">
+<tr data-connections="1"><th scope="row">Blog</th><td>1</td><td>353</td><td>344</td><td><span class="positive">+2.7%</span></td></tr>
+<tr data-connections="8"><th scope="row">Blog</th><td>8</td><td>2,268</td><td>2,287</td><td><span class="negative">−0.8%</span></td></tr>
+<tr data-connections="32"><th scope="row">Blog</th><td>32</td><td>3,777</td><td>3,728</td><td><span class="positive">+1.3%</span></td></tr>
+<tr data-connections="100"><th scope="row">Blog</th><td>100</td><td>3,823</td><td>3,747</td><td><span class="positive">+2.0%</span></td></tr>
+<tr data-connections="256"><th scope="row">Blog</th><td>256</td><td>3,849</td><td>3,690</td><td><span class="positive">+4.3%</span></td></tr>
+</tbody>
+<tbody data-route="post">
+<tr data-connections="1"><th scope="row">Post</th><td>1</td><td>363</td><td>356</td><td><span class="positive">+1.8%</span></td></tr>
+<tr data-connections="8"><th scope="row">Post</th><td>8</td><td>2,403</td><td>2,352</td><td><span class="positive">+2.2%</span></td></tr>
+<tr data-connections="32"><th scope="row">Post</th><td>32</td><td>3,973</td><td>3,952</td><td><span class="positive">+0.5%</span></td></tr>
+<tr data-connections="100"><th scope="row">Post</th><td>100</td><td>4,088</td><td>4,012</td><td><span class="positive">+1.9%</span></td></tr>
+<tr data-connections="256"><th scope="row">Post</th><td>256</td><td>4,010</td><td>3,725</td><td><span class="positive">+7.7%</span></td></tr>
+</tbody>
+</table></div>
+</section>
+<section id="jit-off" aria-labelledby="jit-off-title">
+<h2 id="jit-off-title">JIT disabled</h2>
+<p class="description">The original production comparison, with OPcache enabled and JIT disabled on both servers. 5,547,480 measured requests, zero errors.</p>
+<div class="table-wrap" role="region" aria-label="jit-off benchmark table" tabindex="0"><table id="table-jit-off">
+<thead><tr><th scope="col">Route</th><th scope="col">Connections <span class="subhead">wrk -c</span></th>
+<th scope="col">H2O <span class="subhead">requests/sec</span></th>
+<th scope="col">FrankenPHP <span class="subhead">requests/sec</span></th>
+<th scope="col">H2O difference</th></tr></thead>
+<tbody data-route="homepage">
+<tr data-connections="1"><th scope="row">Homepage</th><td>1</td><td>1,596</td><td>1,463</td><td><span class="positive">+9.1%</span></td></tr>
+<tr data-connections="8"><th scope="row">Homepage</th><td>8</td><td>10,704</td><td>9,372</td><td><span class="positive">+14.2%</span></td></tr>
+<tr data-connections="32"><th scope="row">Homepage</th><td>32</td><td>16,902</td><td>16,244</td><td><span class="positive">+4.1%</span></td></tr>
+<tr data-connections="100"><th scope="row">Homepage</th><td>100</td><td>18,926</td><td>15,776</td><td><span class="positive">+20.0%</span></td></tr>
+<tr data-connections="256"><th scope="row">Homepage</th><td>256</td><td>18,835</td><td>17,227</td><td><span class="positive">+9.3%</span></td></tr>
+</tbody>
+<tbody data-route="blog">
+<tr data-connections="1"><th scope="row">Blog</th><td>1</td><td>338</td><td>335</td><td><span class="positive">+0.8%</span></td></tr>
+<tr data-connections="8"><th scope="row">Blog</th><td>8</td><td>2,274</td><td>2,295</td><td><span class="negative">−0.9%</span></td></tr>
+<tr data-connections="32"><th scope="row">Blog</th><td>32</td><td>3,693</td><td>3,707</td><td><span class="negative">−0.4%</span></td></tr>
+<tr data-connections="100"><th scope="row">Blog</th><td>100</td><td>3,764</td><td>3,633</td><td><span class="positive">+3.6%</span></td></tr>
+<tr data-connections="256"><th scope="row">Blog</th><td>256</td><td>3,730</td><td>3,672</td><td><span class="positive">+1.6%</span></td></tr>
+</tbody>
+<tbody data-route="post">
+<tr data-connections="1"><th scope="row">Post</th><td>1</td><td>364</td><td>354</td><td><span class="positive">+2.7%</span></td></tr>
+<tr data-connections="8"><th scope="row">Post</th><td>8</td><td>2,413</td><td>2,454</td><td><span class="negative">−1.7%</span></td></tr>
+<tr data-connections="32"><th scope="row">Post</th><td>32</td><td>4,041</td><td>4,061</td><td><span class="negative">−0.5%</span></td></tr>
+<tr data-connections="100"><th scope="row">Post</th><td>100</td><td>4,115</td><td>4,073</td><td><span class="positive">+1.0%</span></td></tr>
+<tr data-connections="256"><th scope="row">Post</th><td>256</td><td>4,014</td><td>3,837</td><td><span class="positive">+4.6%</span></td></tr>
+</tbody>
+</table></div>
+</section>
+<section id="jit-impact" aria-labelledby="jit-impact-title">
+<h2 id="jit-impact-title">JIT vs baseline</h2>
+<p class="description">Requests per second with JIT enabled. Parentheses show each server's change from its own non-JIT baseline. The final column compares the two servers with JIT enabled. The matrices ran sequentially, so small changes should be interpreted alongside their run ranges.</p>
+<div class="table-wrap" role="region" aria-label="jit-impact benchmark table" tabindex="0"><table id="table-jit-impact">
+<thead><tr><th scope="col">Route</th><th scope="col">Connections <span class="subhead">wrk -c</span></th>
+<th scope="col">H2O <span class="subhead">requests/sec</span></th>
+<th scope="col">FrankenPHP <span class="subhead">requests/sec</span></th>
+<th scope="col">H2O difference</th></tr></thead>
+<tbody data-route="homepage">
+<tr data-connections="1"><th scope="row">Homepage</th><td>1</td><td>1,722 <span class="positive gain">(+7.9%)</span></td><td>1,523 <span class="positive gain">(+4.1%)</span></td><td><span class="positive">+13.1%</span></td></tr>
+<tr data-connections="8"><th scope="row">Homepage</th><td>8</td><td>11,251 <span class="positive gain">(+5.1%)</span></td><td>9,845 <span class="positive gain">(+5.0%)</span></td><td><span class="positive">+14.3%</span></td></tr>
+<tr data-connections="32"><th scope="row">Homepage</th><td>32</td><td>19,018 <span class="positive gain">(+12.5%)</span></td><td>17,234 <span class="positive gain">(+6.1%)</span></td><td><span class="positive">+10.4%</span></td></tr>
+<tr data-connections="100"><th scope="row">Homepage</th><td>100</td><td>21,248 <span class="positive gain">(+12.3%)</span></td><td>16,355 <span class="positive gain">(+3.7%)</span></td><td><span class="positive">+29.9%</span></td></tr>
+<tr data-connections="256"><th scope="row">Homepage</th><td>256</td><td>21,051 <span class="positive gain">(+11.8%)</span></td><td>18,016 <span class="positive gain">(+4.6%)</span></td><td><span class="positive">+16.8%</span></td></tr>
+</tbody>
+<tbody data-route="blog">
+<tr data-connections="1"><th scope="row">Blog</th><td>1</td><td>353 <span class="positive gain">(+4.3%)</span></td><td>344 <span class="positive gain">(+2.5%)</span></td><td><span class="positive">+2.7%</span></td></tr>
+<tr data-connections="8"><th scope="row">Blog</th><td>8</td><td>2,268 <span class="negative gain">(−0.3%)</span></td><td>2,287 <span class="negative gain">(−0.3%)</span></td><td><span class="negative">−0.8%</span></td></tr>
+<tr data-connections="32"><th scope="row">Blog</th><td>32</td><td>3,777 <span class="positive gain">(+2.3%)</span></td><td>3,728 <span class="positive gain">(+0.5%)</span></td><td><span class="positive">+1.3%</span></td></tr>
+<tr data-connections="100"><th scope="row">Blog</th><td>100</td><td>3,823 <span class="positive gain">(+1.6%)</span></td><td>3,747 <span class="positive gain">(+3.1%)</span></td><td><span class="positive">+2.0%</span></td></tr>
+<tr data-connections="256"><th scope="row">Blog</th><td>256</td><td>3,849 <span class="positive gain">(+3.2%)</span></td><td>3,690 <span class="positive gain">(+0.5%)</span></td><td><span class="positive">+4.3%</span></td></tr>
+</tbody>
+<tbody data-route="post">
+<tr data-connections="1"><th scope="row">Post</th><td>1</td><td>363 <span class="negative gain">(−0.2%)</span></td><td>356 <span class="positive gain">(+0.6%)</span></td><td><span class="positive">+1.8%</span></td></tr>
+<tr data-connections="8"><th scope="row">Post</th><td>8</td><td>2,403 <span class="negative gain">(−0.4%)</span></td><td>2,352 <span class="negative gain">(−4.2%)</span></td><td><span class="positive">+2.2%</span></td></tr>
+<tr data-connections="32"><th scope="row">Post</th><td>32</td><td>3,973 <span class="negative gain">(−1.7%)</span></td><td>3,952 <span class="negative gain">(−2.7%)</span></td><td><span class="positive">+0.5%</span></td></tr>
+<tr data-connections="100"><th scope="row">Post</th><td>100</td><td>4,088 <span class="negative gain">(−0.6%)</span></td><td>4,012 <span class="negative gain">(−1.5%)</span></td><td><span class="positive">+1.9%</span></td></tr>
+<tr data-connections="256"><th scope="row">Post</th><td>256</td><td>4,010 <span class="negative gain">(−0.1%)</span></td><td>3,725 <span class="negative gain">(−2.9%)</span></td><td><span class="positive">+7.7%</span></td></tr>
+</tbody>
+</table></div>
+</section>
+<section id="method" aria-labelledby="method-title">
+<h2 id="method-title">Method and routes</h2>
+<div class="details-grid">
+<div>
+<h3>Benchmark setup</h3>
+<ul>
+<li>Intel Core i7-13700, 24 logical CPUs; client and server shared the same machine.</li>
+<li>PHP 8.6.0RC5 ZTS; both servers linked to the same PHP library. FrankenPHP 1.13.4 / Caddy 2.11.8; H2O 2.3.0-DEV.</li>
+<li>48 PHP workers per server. Symfony production environment, SQLite, and the default 500-request worker recycling on both.</li>
+<li>One benchmark server at a time. Three independent starts per server; server order alternated between rounds.</li>
+<li>Three-second warmup per route, then three 10-second measurements per point; median throughput reported.</li>
+<li><code>wrk -c 1, 8, 32, 100, 256</code>; up to eight client threads. Counts shown are the requested <code>wrk -c</code> values.</li>
+<li>Plain HTTP/1.1 keep-alive over IPv4 loopback, with <code>Host: localhost</code>. The tests fetched HTML routes and did not fetch page assets.</li>
+</ul>
+</div>
+<div>
+<h3>Application routes</h3>
+<dl><dt>Homepage</dt><dd><code>/en/</code></dd><dt>Blog</dt><dd><code>/en/blog/</code></dd><dt>Post</dt><dd><code>/en/blog/posts/lorem-ipsum-dolor-sit-amet-consectetur-adipiscing-elit</code></dd></dl>
+<h3 style="margin-top:24px">Matching and validation</h3>
+<p>Production PHP INI/environment settings were matched in temporary benchmark configs. Deprecation logging and OPcache timestamp checks were disabled on both. The example configs and application files were left unchanged.</p>
+<p>Each matrix contains 90 measured samples. Preflight checked HTTP 200 responses, matching page titles/headings, and worker mode. Tracing JIT was verified over HTTP before warmup, after warmup, and after measurement for all six JIT server starts. Neither benchmark server used swap.</p>
+<p>JIT run: 5,873,529 requests, zero errors. Baseline: 5,547,480 requests, zero errors.</p>
+</div>
+</div>
+</section>
+<section class="sources" aria-label="Source measurements">
+<h3>Source measurements</h3>
+<p>All three tables and their underlying summary data are embedded in this file. The following links point to the local benchmark artifacts alongside the project.</p>
+<ul>
+<li><a href="bench/raw/20261107T033648Z-symfony-comparison-tracing-jit/summary.csv">JIT results and latency</a></li>
+<li><a href="bench/raw/20261107T031058Z-symfony-comparison/summary.csv">Non-JIT results and latency</a></li>
+<li><a href="bench/raw/20261107T033648Z-symfony-comparison-tracing-jit/jit-vs-baseline.csv">JIT vs baseline CSV</a></li>
+<li><a href="bench/compare-symfony.py">Benchmark runner</a></li>
+</ul>
+<p>Reproduce the JIT matrix: <code>python3 bench/compare-symfony.py --match-production --tracing-jit</code></p>
+</section>
+<footer>Measurements: 7 November 2026, 03:10–03:52 UTC. Medians use unrounded source values; display rounding may slightly change ratios calculated from the visible integers.</footer>
+</main>
+<script type="application/json" id="benchmark-data">{
+  "baseline": [
+    {
+      "workload": "homepage",
+      "connections": 1,
+      "h2o_rps": 1595.562,
+      "h2o_p50_ms": 0.604,
+      "h2o_p95_ms": 0.717,
+      "h2o_p99_ms": 0.901,
+      "h2o_server_rss_kib": 275620,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 1552.4305,
+      "h2o_rps_max": 1627.481,
+      "h2o_samples": 3,
+      "frankenphp_rps": 1462.5627,
+      "frankenphp_p50_ms": 0.671,
+      "frankenphp_p95_ms": 0.759,
+      "frankenphp_p99_ms": 0.918,
+      "frankenphp_server_rss_kib": 324332,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 1453.8855,
+      "frankenphp_rps_max": 1474.1969,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.090935793726997,
+      "h2o_rps_change_pct": 9.0935793726997
+    },
+    {
+      "workload": "homepage",
+      "connections": 8,
+      "h2o_rps": 10704.4921,
+      "h2o_p50_ms": 0.67,
+      "h2o_p95_ms": 1.211,
+      "h2o_p99_ms": 1.288,
+      "h2o_server_rss_kib": 224472,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 10309.706,
+      "h2o_rps_max": 10857.4385,
+      "h2o_samples": 3,
+      "frankenphp_rps": 9372.4213,
+      "frankenphp_p50_ms": 0.743,
+      "frankenphp_p95_ms": 1.35,
+      "frankenphp_p99_ms": 1.967,
+      "frankenphp_server_rss_kib": 278680,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 9054.699,
+      "frankenphp_rps_max": 9409.4337,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.1421266455446257,
+      "h2o_rps_change_pct": 14.212664554462574
+    },
+    {
+      "workload": "homepage",
+      "connections": 32,
+      "h2o_rps": 16901.5996,
+      "h2o_p50_ms": 1.628,
+      "h2o_p95_ms": 4.054,
+      "h2o_p99_ms": 5.931,
+      "h2o_server_rss_kib": 231848,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 16384.4916,
+      "h2o_rps_max": 18043.371,
+      "h2o_samples": 3,
+      "frankenphp_rps": 16243.5928,
+      "frankenphp_p50_ms": 1.736,
+      "frankenphp_p95_ms": 3.87,
+      "frankenphp_p99_ms": 5.984,
+      "frankenphp_server_rss_kib": 292660,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 15995.6215,
+      "frankenphp_rps_max": 16885.8083,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0405086982973373,
+      "h2o_rps_change_pct": 4.050869829733728
+    },
+    {
+      "workload": "homepage",
+      "connections": 100,
+      "h2o_rps": 18925.9648,
+      "h2o_p50_ms": 4.135,
+      "h2o_p95_ms": 10.223,
+      "h2o_p99_ms": 13.904,
+      "h2o_server_rss_kib": 223568,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 18051.102,
+      "h2o_rps_max": 19339.0514,
+      "h2o_samples": 3,
+      "frankenphp_rps": 15775.5626,
+      "frankenphp_p50_ms": 5.653,
+      "frankenphp_p95_ms": 13.338,
+      "frankenphp_p99_ms": 20.038,
+      "frankenphp_server_rss_kib": 276904,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 15700.4442,
+      "frankenphp_rps_max": 16488.8519,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.1997014166708706,
+      "h2o_rps_change_pct": 19.97014166708706
+    },
+    {
+      "workload": "homepage",
+      "connections": 256,
+      "h2o_rps": 18835.3913,
+      "h2o_p50_ms": 12.281,
+      "h2o_p95_ms": 22.535,
+      "h2o_p99_ms": 31.849,
+      "h2o_server_rss_kib": 223672,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 17547.5714,
+      "h2o_rps_max": 18835.5337,
+      "h2o_samples": 3,
+      "frankenphp_rps": 17227.1343,
+      "frankenphp_p50_ms": 13.797,
+      "frankenphp_p95_ms": 33.22,
+      "frankenphp_p99_ms": 44.871,
+      "frankenphp_server_rss_kib": 287104,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 16957.6527,
+      "frankenphp_rps_max": 17250.3326,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0933560377479612,
+      "h2o_rps_change_pct": 9.33560377479612
+    },
+    {
+      "workload": "blog",
+      "connections": 1,
+      "h2o_rps": 338.0616,
+      "h2o_p50_ms": 2.899,
+      "h2o_p95_ms": 3.2,
+      "h2o_p99_ms": 3.509,
+      "h2o_server_rss_kib": 224280,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 335.7229,
+      "h2o_rps_max": 339.0798,
+      "h2o_samples": 3,
+      "frankenphp_rps": 335.2784,
+      "frankenphp_p50_ms": 2.957,
+      "frankenphp_p95_ms": 3.127,
+      "frankenphp_p99_ms": 3.29,
+      "frankenphp_server_rss_kib": 271372,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 331.8107,
+      "frankenphp_rps_max": 335.6948,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.008301161064954,
+      "h2o_rps_change_pct": 0.8301161064953932
+    },
+    {
+      "workload": "blog",
+      "connections": 8,
+      "h2o_rps": 2274.3684,
+      "h2o_p50_ms": 3.179,
+      "h2o_p95_ms": 6.209,
+      "h2o_p99_ms": 6.39,
+      "h2o_server_rss_kib": 223768,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 2216.3681,
+      "h2o_rps_max": 2296.2655,
+      "h2o_samples": 3,
+      "frankenphp_rps": 2294.5011,
+      "frankenphp_p50_ms": 3.17,
+      "frankenphp_p95_ms": 6.213,
+      "frankenphp_p99_ms": 6.377,
+      "frankenphp_server_rss_kib": 270200,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 2292.1014,
+      "frankenphp_rps_max": 2312.0988,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 0.9912256742871032,
+      "h2o_rps_change_pct": -0.8774325712896824
+    },
+    {
+      "workload": "blog",
+      "connections": 32,
+      "h2o_rps": 3693.1737,
+      "h2o_p50_ms": 7.987,
+      "h2o_p95_ms": 14.998,
+      "h2o_p99_ms": 23.995,
+      "h2o_server_rss_kib": 235596,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3537.2405,
+      "h2o_rps_max": 3769.8083,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3707.3021,
+      "frankenphp_p50_ms": 7.826,
+      "frankenphp_p95_ms": 15.483,
+      "frankenphp_p99_ms": 24.82,
+      "frankenphp_server_rss_kib": 288220,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3685.4555,
+      "frankenphp_rps_max": 3718.6719,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 0.9961890346082128,
+      "h2o_rps_change_pct": -0.3810965391787158
+    },
+    {
+      "workload": "blog",
+      "connections": 100,
+      "h2o_rps": 3763.6021,
+      "h2o_p50_ms": 24.086,
+      "h2o_p95_ms": 40.343,
+      "h2o_p99_ms": 62.02,
+      "h2o_server_rss_kib": 230064,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3696.5285,
+      "h2o_rps_max": 3785.585,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3633.108,
+      "frankenphp_p50_ms": 24.33,
+      "frankenphp_p95_ms": 45.02,
+      "frankenphp_p99_ms": 67.116,
+      "frankenphp_server_rss_kib": 291412,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3626.1251,
+      "frankenphp_rps_max": 3745.1849,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0359180349166608,
+      "h2o_rps_change_pct": 3.591803491666079
+    },
+    {
+      "workload": "blog",
+      "connections": 256,
+      "h2o_rps": 3729.6146,
+      "h2o_p50_ms": 64.776,
+      "h2o_p95_ms": 94.909,
+      "h2o_p99_ms": 154.274,
+      "h2o_server_rss_kib": 224928,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3675.972,
+      "h2o_rps_max": 3796.3859,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3671.5736,
+      "frankenphp_p50_ms": 65.288,
+      "frankenphp_p95_ms": 97.965,
+      "frankenphp_p99_ms": 159.023,
+      "frankenphp_server_rss_kib": 289644,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3667.2258,
+      "frankenphp_rps_max": 3701.3604,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0158082082298445,
+      "h2o_rps_change_pct": 1.5808208229844523
+    },
+    {
+      "workload": "post",
+      "connections": 1,
+      "h2o_rps": 363.7045,
+      "h2o_p50_ms": 2.703,
+      "h2o_p95_ms": 2.92,
+      "h2o_p99_ms": 3.25,
+      "h2o_server_rss_kib": 271928,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 363.6633,
+      "h2o_rps_max": 365.4278,
+      "h2o_samples": 3,
+      "frankenphp_rps": 354.1702,
+      "frankenphp_p50_ms": 2.783,
+      "frankenphp_p95_ms": 2.977,
+      "frankenphp_p99_ms": 3.243,
+      "frankenphp_server_rss_kib": 324388,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 353.8176,
+      "frankenphp_rps_max": 358.1507,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0269201079029235,
+      "h2o_rps_change_pct": 2.692010790292354
+    },
+    {
+      "workload": "post",
+      "connections": 8,
+      "h2o_rps": 2412.529,
+      "h2o_p50_ms": 2.914,
+      "h2o_p95_ms": 5.505,
+      "h2o_p99_ms": 5.65,
+      "h2o_server_rss_kib": 271928,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 2303.8872,
+      "h2o_rps_max": 2474.9411,
+      "h2o_samples": 3,
+      "frankenphp_rps": 2454.1092,
+      "frankenphp_p50_ms": 2.969,
+      "frankenphp_p95_ms": 5.523,
+      "frankenphp_p99_ms": 5.694,
+      "frankenphp_server_rss_kib": 323968,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 2315.0533,
+      "frankenphp_rps_max": 2482.7797,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 0.9830569071661522,
+      "h2o_rps_change_pct": -1.6943092833847762
+    },
+    {
+      "workload": "post",
+      "connections": 32,
+      "h2o_rps": 4040.7672,
+      "h2o_p50_ms": 7.312,
+      "h2o_p95_ms": 14.18,
+      "h2o_p99_ms": 21.582,
+      "h2o_server_rss_kib": 275516,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3958.6598,
+      "h2o_rps_max": 4063.0855,
+      "h2o_samples": 3,
+      "frankenphp_rps": 4060.534,
+      "frankenphp_p50_ms": 7.161,
+      "frankenphp_p95_ms": 14.369,
+      "frankenphp_p99_ms": 21.754,
+      "frankenphp_server_rss_kib": 324384,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3853.2116,
+      "frankenphp_rps_max": 4081.0259,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 0.9951319703270555,
+      "h2o_rps_change_pct": -0.48680296729445294
+    },
+    {
+      "workload": "post",
+      "connections": 100,
+      "h2o_rps": 4114.511,
+      "h2o_p50_ms": 22.042,
+      "h2o_p95_ms": 36.802,
+      "h2o_p99_ms": 56.769,
+      "h2o_server_rss_kib": 278404,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 4097.7999,
+      "h2o_rps_max": 4143.5558,
+      "h2o_samples": 3,
+      "frankenphp_rps": 4072.8251,
+      "frankenphp_p50_ms": 22.077,
+      "frankenphp_p95_ms": 39.011,
+      "frankenphp_p99_ms": 60.015,
+      "frankenphp_server_rss_kib": 330108,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 4037.8714,
+      "frankenphp_rps_max": 4108.0502,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0102351313833733,
+      "h2o_rps_change_pct": 1.0235131383373286
+    },
+    {
+      "workload": "post",
+      "connections": 256,
+      "h2o_rps": 4013.6402,
+      "h2o_p50_ms": 59.477,
+      "h2o_p95_ms": 111.616,
+      "h2o_p99_ms": 141.036,
+      "h2o_server_rss_kib": 276296,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3823.1973,
+      "h2o_rps_max": 4398.2178,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3836.7948,
+      "frankenphp_p50_ms": 60.457,
+      "frankenphp_p95_ms": 130.481,
+      "frankenphp_p99_ms": 148.017,
+      "frankenphp_server_rss_kib": 341400,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3734.8485,
+      "frankenphp_rps_max": 4137.8428,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0460919619678384,
+      "h2o_rps_change_pct": 4.609196196783838
+    }
+  ],
+  "jit": [
+    {
+      "workload": "homepage",
+      "connections": 1,
+      "h2o_rps": 1721.7173,
+      "h2o_p50_ms": 0.568,
+      "h2o_p95_ms": 0.663,
+      "h2o_p99_ms": 0.837,
+      "h2o_server_rss_kib": 290736,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 1702.9953,
+      "h2o_rps_max": 1723.1004,
+      "h2o_samples": 3,
+      "frankenphp_rps": 1522.5287,
+      "frankenphp_p50_ms": 0.642,
+      "frankenphp_p95_ms": 0.72,
+      "frankenphp_p99_ms": 1.029,
+      "frankenphp_server_rss_kib": 333696,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 1508.0383,
+      "frankenphp_rps_max": 1536.3534,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.1308274845656439,
+      "h2o_rps_change_pct": 13.082748456564385
+    },
+    {
+      "workload": "homepage",
+      "connections": 8,
+      "h2o_rps": 11250.6444,
+      "h2o_p50_ms": 0.636,
+      "h2o_p95_ms": 1.014,
+      "h2o_p99_ms": 1.096,
+      "h2o_server_rss_kib": 237200,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 10685.5184,
+      "h2o_rps_max": 12117.4678,
+      "h2o_samples": 3,
+      "frankenphp_rps": 9845.1074,
+      "frankenphp_p50_ms": 0.712,
+      "frankenphp_p95_ms": 1.181,
+      "frankenphp_p99_ms": 1.289,
+      "frankenphp_server_rss_kib": 290844,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 9815.983,
+      "frankenphp_rps_max": 9925.7182,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.1427650245846985,
+      "h2o_rps_change_pct": 14.276502458469853
+    },
+    {
+      "workload": "homepage",
+      "connections": 32,
+      "h2o_rps": 19017.7765,
+      "h2o_p50_ms": 1.441,
+      "h2o_p95_ms": 3.636,
+      "h2o_p99_ms": 5.352,
+      "h2o_server_rss_kib": 241076,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 18460.3534,
+      "h2o_rps_max": 20327.3015,
+      "h2o_samples": 3,
+      "frankenphp_rps": 17233.6351,
+      "frankenphp_p50_ms": 1.656,
+      "frankenphp_p95_ms": 3.671,
+      "frankenphp_p99_ms": 5.903,
+      "frankenphp_server_rss_kib": 304988,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 16423.9419,
+      "frankenphp_rps_max": 17748.8108,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.1035267016881425,
+      "h2o_rps_change_pct": 10.35267016881425
+    },
+    {
+      "workload": "homepage",
+      "connections": 100,
+      "h2o_rps": 21248.4513,
+      "h2o_p50_ms": 3.601,
+      "h2o_p95_ms": 9.742,
+      "h2o_p99_ms": 13.254,
+      "h2o_server_rss_kib": 236204,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 20180.52,
+      "h2o_rps_max": 21611.5742,
+      "h2o_samples": 3,
+      "frankenphp_rps": 16355.1302,
+      "frankenphp_p50_ms": 5.444,
+      "frankenphp_p95_ms": 12.832,
+      "frankenphp_p99_ms": 18.855,
+      "frankenphp_server_rss_kib": 288928,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 16244.3982,
+      "frankenphp_rps_max": 17057.967,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.2991918156664997,
+      "h2o_rps_change_pct": 29.919181566649968
+    },
+    {
+      "workload": "homepage",
+      "connections": 256,
+      "h2o_rps": 21050.844,
+      "h2o_p50_ms": 10.845,
+      "h2o_p95_ms": 20.737,
+      "h2o_p99_ms": 29.654,
+      "h2o_server_rss_kib": 236240,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 20925.2632,
+      "h2o_rps_max": 21054.5428,
+      "h2o_samples": 3,
+      "frankenphp_rps": 18015.7719,
+      "frankenphp_p50_ms": 13.005,
+      "frankenphp_p95_ms": 34.531,
+      "frankenphp_p99_ms": 49.187,
+      "frankenphp_server_rss_kib": 300708,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 17984.7927,
+      "frankenphp_rps_max": 18054.5438,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.168467502633068,
+      "h2o_rps_change_pct": 16.8467502633068
+    },
+    {
+      "workload": "blog",
+      "connections": 1,
+      "h2o_rps": 352.6145,
+      "h2o_p50_ms": 2.775,
+      "h2o_p95_ms": 3.089,
+      "h2o_p99_ms": 3.458,
+      "h2o_server_rss_kib": 238028,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 349.5823,
+      "h2o_rps_max": 355.9602,
+      "h2o_samples": 3,
+      "frankenphp_rps": 343.5048,
+      "frankenphp_p50_ms": 2.852,
+      "frankenphp_p95_ms": 3.196,
+      "frankenphp_p99_ms": 3.543,
+      "frankenphp_server_rss_kib": 285520,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 339.1412,
+      "frankenphp_rps_max": 344.6726,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0265198623134233,
+      "h2o_rps_change_pct": 2.6519862313423292
+    },
+    {
+      "workload": "blog",
+      "connections": 8,
+      "h2o_rps": 2268.3389,
+      "h2o_p50_ms": 3.052,
+      "h2o_p95_ms": 5.97,
+      "h2o_p99_ms": 6.119,
+      "h2o_server_rss_kib": 236332,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 2185.8508,
+      "h2o_rps_max": 2510.8397,
+      "h2o_samples": 3,
+      "frankenphp_rps": 2287.0806,
+      "frankenphp_p50_ms": 3.12,
+      "frankenphp_p95_ms": 6.173,
+      "frankenphp_p99_ms": 6.375,
+      "frankenphp_server_rss_kib": 284016,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 2248.9559,
+      "frankenphp_rps_max": 2336.3122,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 0.99180540467179,
+      "h2o_rps_change_pct": -0.8194595328209986
+    },
+    {
+      "workload": "blog",
+      "connections": 32,
+      "h2o_rps": 3777.235,
+      "h2o_p50_ms": 7.88,
+      "h2o_p95_ms": 15.279,
+      "h2o_p99_ms": 23.74,
+      "h2o_server_rss_kib": 246824,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3614.3444,
+      "h2o_rps_max": 3798.3361,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3727.5532,
+      "frankenphp_p50_ms": 7.85,
+      "frankenphp_p95_ms": 15.718,
+      "frankenphp_p99_ms": 24.274,
+      "frankenphp_server_rss_kib": 301604,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3701.7545,
+      "frankenphp_rps_max": 3734.3067,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.013328260479287,
+      "h2o_rps_change_pct": 1.3328260479287035
+    },
+    {
+      "workload": "blog",
+      "connections": 100,
+      "h2o_rps": 3823.3225,
+      "h2o_p50_ms": 23.348,
+      "h2o_p95_ms": 39.978,
+      "h2o_p99_ms": 62.201,
+      "h2o_server_rss_kib": 239124,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3803.8566,
+      "h2o_rps_max": 3876.4108,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3747.2758,
+      "frankenphp_p50_ms": 23.99,
+      "frankenphp_p95_ms": 42.637,
+      "frankenphp_p99_ms": 64.868,
+      "frankenphp_server_rss_kib": 300700,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3679.8138,
+      "frankenphp_rps_max": 3789.6164,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0202938625440914,
+      "h2o_rps_change_pct": 2.029386254409138
+    },
+    {
+      "workload": "blog",
+      "connections": 256,
+      "h2o_rps": 3848.9189,
+      "h2o_p50_ms": 62.817,
+      "h2o_p95_ms": 92.121,
+      "h2o_p99_ms": 149.046,
+      "h2o_server_rss_kib": 238028,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3833.0349,
+      "h2o_rps_max": 3903.6237,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3690.0417,
+      "frankenphp_p50_ms": 65.138,
+      "frankenphp_p95_ms": 102.063,
+      "frankenphp_p99_ms": 155.086,
+      "frankenphp_server_rss_kib": 305120,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3494.7918,
+      "frankenphp_rps_max": 3776.7885,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0430556651974963,
+      "h2o_rps_change_pct": 4.305566519749626
+    },
+    {
+      "workload": "post",
+      "connections": 1,
+      "h2o_rps": 362.9603,
+      "h2o_p50_ms": 2.68,
+      "h2o_p95_ms": 2.984,
+      "h2o_p99_ms": 3.946,
+      "h2o_server_rss_kib": 285908,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 360.39,
+      "h2o_rps_max": 373.1044,
+      "h2o_samples": 3,
+      "frankenphp_rps": 356.3766,
+      "frankenphp_p50_ms": 2.763,
+      "frankenphp_p95_ms": 2.963,
+      "frankenphp_p99_ms": 3.314,
+      "frankenphp_server_rss_kib": 334524,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 354.4663,
+      "frankenphp_rps_max": 358.3432,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.018473996328603,
+      "h2o_rps_change_pct": 1.8473996328602915
+    },
+    {
+      "workload": "post",
+      "connections": 8,
+      "h2o_rps": 2403.3754,
+      "h2o_p50_ms": 2.964,
+      "h2o_p95_ms": 5.335,
+      "h2o_p99_ms": 5.473,
+      "h2o_server_rss_kib": 285908,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 2338.3468,
+      "h2o_rps_max": 2610.8766,
+      "h2o_samples": 3,
+      "frankenphp_rps": 2351.7682,
+      "frankenphp_p50_ms": 3.059,
+      "frankenphp_p95_ms": 5.528,
+      "frankenphp_p99_ms": 5.696,
+      "frankenphp_server_rss_kib": 335344,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 2335.5957,
+      "frankenphp_rps_max": 2360.6184,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0219439994128672,
+      "h2o_rps_change_pct": 2.1943999412867177
+    },
+    {
+      "workload": "post",
+      "connections": 32,
+      "h2o_rps": 3972.8002,
+      "h2o_p50_ms": 7.493,
+      "h2o_p95_ms": 14.195,
+      "h2o_p99_ms": 22.841,
+      "h2o_server_rss_kib": 288468,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3919.703,
+      "h2o_rps_max": 4003.5049,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3951.5645,
+      "frankenphp_p50_ms": 7.44,
+      "frankenphp_p95_ms": 14.523,
+      "frankenphp_p99_ms": 21.366,
+      "frankenphp_server_rss_kib": 332444,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3941.2668,
+      "frankenphp_rps_max": 3995.0844,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0053739980708907,
+      "h2o_rps_change_pct": 0.5373998070890673
+    },
+    {
+      "workload": "post",
+      "connections": 100,
+      "h2o_rps": 4088.2948,
+      "h2o_p50_ms": 22.162,
+      "h2o_p95_ms": 37.463,
+      "h2o_p99_ms": 58.165,
+      "h2o_server_rss_kib": 292192,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3941.3777,
+      "h2o_rps_max": 4256.3768,
+      "h2o_samples": 3,
+      "frankenphp_rps": 4011.6618,
+      "frankenphp_p50_ms": 22.36,
+      "frankenphp_p95_ms": 40.306,
+      "frankenphp_p99_ms": 60.856,
+      "frankenphp_server_rss_kib": 342204,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3939.1587,
+      "frankenphp_rps_max": 4041.1173,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0191025574488857,
+      "h2o_rps_change_pct": 1.910255744888567
+    },
+    {
+      "workload": "post",
+      "connections": 256,
+      "h2o_rps": 4010.4626,
+      "h2o_p50_ms": 60.1,
+      "h2o_p95_ms": 88.917,
+      "h2o_p99_ms": 140.998,
+      "h2o_server_rss_kib": 291848,
+      "h2o_server_swap_kib": 0,
+      "h2o_rps_min": 3868.7846,
+      "h2o_rps_max": 4492.4934,
+      "h2o_samples": 3,
+      "frankenphp_rps": 3725.4531,
+      "frankenphp_p50_ms": 61.564,
+      "frankenphp_p95_ms": 134.897,
+      "frankenphp_p99_ms": 152.089,
+      "frankenphp_server_rss_kib": 353752,
+      "frankenphp_server_swap_kib": 0,
+      "frankenphp_rps_min": 3686.3805,
+      "frankenphp_rps_max": 4076.5777,
+      "frankenphp_samples": 3,
+      "h2o_rps_ratio": 1.0765033117716607,
+      "h2o_rps_change_pct": 7.65033117716607
+    }
+  ],
+  "jit_vs_baseline": [
+    {
+      "workload": "homepage",
+      "connections": 1,
+      "h2o_baseline_rps": 1595.562,
+      "h2o_jit_rps": 1721.7173,
+      "h2o_baseline_p50_ms": 0.604,
+      "h2o_jit_p50_ms": 0.568,
+      "h2o_baseline_p95_ms": 0.717,
+      "h2o_jit_p95_ms": 0.663,
+      "h2o_baseline_p99_ms": 0.901,
+      "h2o_jit_p99_ms": 0.837,
+      "h2o_jit_rps_change_pct": 7.9066372851697375,
+      "h2o_jit_rps_min": 1702.9953,
+      "h2o_jit_rps_max": 1723.1004,
+      "frankenphp_baseline_rps": 1462.5627,
+      "frankenphp_jit_rps": 1522.5287,
+      "frankenphp_baseline_p50_ms": 0.671,
+      "frankenphp_jit_p50_ms": 0.642,
+      "frankenphp_baseline_p95_ms": 0.759,
+      "frankenphp_jit_p95_ms": 0.72,
+      "frankenphp_baseline_p99_ms": 0.918,
+      "frankenphp_jit_p99_ms": 1.029,
+      "frankenphp_jit_rps_change_pct": 4.100063539156307,
+      "frankenphp_jit_rps_min": 1508.0383,
+      "frankenphp_jit_rps_max": 1536.3534,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 13.082748456564385
+    },
+    {
+      "workload": "homepage",
+      "connections": 8,
+      "h2o_baseline_rps": 10704.4921,
+      "h2o_jit_rps": 11250.6444,
+      "h2o_baseline_p50_ms": 0.67,
+      "h2o_jit_p50_ms": 0.636,
+      "h2o_baseline_p95_ms": 1.211,
+      "h2o_jit_p95_ms": 1.014,
+      "h2o_baseline_p99_ms": 1.288,
+      "h2o_jit_p99_ms": 1.096,
+      "h2o_jit_rps_change_pct": 5.102085133025591,
+      "h2o_jit_rps_min": 10685.5184,
+      "h2o_jit_rps_max": 12117.4678,
+      "frankenphp_baseline_rps": 9372.4213,
+      "frankenphp_jit_rps": 9845.1074,
+      "frankenphp_baseline_p50_ms": 0.743,
+      "frankenphp_jit_p50_ms": 0.712,
+      "frankenphp_baseline_p95_ms": 1.35,
+      "frankenphp_jit_p95_ms": 1.181,
+      "frankenphp_baseline_p99_ms": 1.967,
+      "frankenphp_jit_p99_ms": 1.289,
+      "frankenphp_jit_rps_change_pct": 5.043372303376947,
+      "frankenphp_jit_rps_min": 9815.983,
+      "frankenphp_jit_rps_max": 9925.7182,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 14.276502458469853
+    },
+    {
+      "workload": "homepage",
+      "connections": 32,
+      "h2o_baseline_rps": 16901.5996,
+      "h2o_jit_rps": 19017.7765,
+      "h2o_baseline_p50_ms": 1.628,
+      "h2o_jit_p50_ms": 1.441,
+      "h2o_baseline_p95_ms": 4.054,
+      "h2o_jit_p95_ms": 3.636,
+      "h2o_baseline_p99_ms": 5.931,
+      "h2o_jit_p99_ms": 5.352,
+      "h2o_jit_rps_change_pct": 12.520571721507334,
+      "h2o_jit_rps_min": 18460.3534,
+      "h2o_jit_rps_max": 20327.3015,
+      "frankenphp_baseline_rps": 16243.5928,
+      "frankenphp_jit_rps": 17233.6351,
+      "frankenphp_baseline_p50_ms": 1.736,
+      "frankenphp_jit_p50_ms": 1.656,
+      "frankenphp_baseline_p95_ms": 3.87,
+      "frankenphp_jit_p95_ms": 3.671,
+      "frankenphp_baseline_p99_ms": 5.984,
+      "frankenphp_jit_p99_ms": 5.903,
+      "frankenphp_jit_rps_change_pct": 6.0949711814987095,
+      "frankenphp_jit_rps_min": 16423.9419,
+      "frankenphp_jit_rps_max": 17748.8108,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 10.35267016881425
+    },
+    {
+      "workload": "homepage",
+      "connections": 100,
+      "h2o_baseline_rps": 18925.9648,
+      "h2o_jit_rps": 21248.4513,
+      "h2o_baseline_p50_ms": 4.135,
+      "h2o_jit_p50_ms": 3.601,
+      "h2o_baseline_p95_ms": 10.223,
+      "h2o_jit_p95_ms": 9.742,
+      "h2o_baseline_p99_ms": 13.904,
+      "h2o_jit_p99_ms": 13.254,
+      "h2o_jit_rps_change_pct": 12.271429882401552,
+      "h2o_jit_rps_min": 20180.52,
+      "h2o_jit_rps_max": 21611.5742,
+      "frankenphp_baseline_rps": 15775.5626,
+      "frankenphp_jit_rps": 16355.1302,
+      "frankenphp_baseline_p50_ms": 5.653,
+      "frankenphp_jit_p50_ms": 5.444,
+      "frankenphp_baseline_p95_ms": 13.338,
+      "frankenphp_jit_p95_ms": 12.832,
+      "frankenphp_baseline_p99_ms": 20.038,
+      "frankenphp_jit_p99_ms": 18.855,
+      "frankenphp_jit_rps_change_pct": 3.673831575426667,
+      "frankenphp_jit_rps_min": 16244.3982,
+      "frankenphp_jit_rps_max": 17057.967,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 29.919181566649968
+    },
+    {
+      "workload": "homepage",
+      "connections": 256,
+      "h2o_baseline_rps": 18835.3913,
+      "h2o_jit_rps": 21050.844,
+      "h2o_baseline_p50_ms": 12.281,
+      "h2o_jit_p50_ms": 10.845,
+      "h2o_baseline_p95_ms": 22.535,
+      "h2o_jit_p95_ms": 20.737,
+      "h2o_baseline_p99_ms": 31.849,
+      "h2o_jit_p99_ms": 29.654,
+      "h2o_jit_rps_change_pct": 11.762180380080567,
+      "h2o_jit_rps_min": 20925.2632,
+      "h2o_jit_rps_max": 21054.5428,
+      "frankenphp_baseline_rps": 17227.1343,
+      "frankenphp_jit_rps": 18015.7719,
+      "frankenphp_baseline_p50_ms": 13.797,
+      "frankenphp_jit_p50_ms": 13.005,
+      "frankenphp_baseline_p95_ms": 33.22,
+      "frankenphp_jit_p95_ms": 34.531,
+      "frankenphp_baseline_p99_ms": 44.871,
+      "frankenphp_jit_p99_ms": 49.187,
+      "frankenphp_jit_rps_change_pct": 4.577880373289944,
+      "frankenphp_jit_rps_min": 17984.7927,
+      "frankenphp_jit_rps_max": 18054.5438,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 16.8467502633068
+    },
+    {
+      "workload": "blog",
+      "connections": 1,
+      "h2o_baseline_rps": 338.0616,
+      "h2o_jit_rps": 352.6145,
+      "h2o_baseline_p50_ms": 2.899,
+      "h2o_jit_p50_ms": 2.775,
+      "h2o_baseline_p95_ms": 3.2,
+      "h2o_jit_p95_ms": 3.089,
+      "h2o_baseline_p99_ms": 3.509,
+      "h2o_jit_p99_ms": 3.458,
+      "h2o_jit_rps_change_pct": 4.304807171237446,
+      "h2o_jit_rps_min": 349.5823,
+      "h2o_jit_rps_max": 355.9602,
+      "frankenphp_baseline_rps": 335.2784,
+      "frankenphp_jit_rps": 343.5048,
+      "frankenphp_baseline_p50_ms": 2.957,
+      "frankenphp_jit_p50_ms": 2.852,
+      "frankenphp_baseline_p95_ms": 3.127,
+      "frankenphp_jit_p95_ms": 3.196,
+      "frankenphp_baseline_p99_ms": 3.29,
+      "frankenphp_jit_p99_ms": 3.543,
+      "frankenphp_jit_rps_change_pct": 2.453602737307259,
+      "frankenphp_jit_rps_min": 339.1412,
+      "frankenphp_jit_rps_max": 344.6726,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 2.6519862313423292
+    },
+    {
+      "workload": "blog",
+      "connections": 8,
+      "h2o_baseline_rps": 2274.3684,
+      "h2o_jit_rps": 2268.3389,
+      "h2o_baseline_p50_ms": 3.179,
+      "h2o_jit_p50_ms": 3.052,
+      "h2o_baseline_p95_ms": 6.209,
+      "h2o_jit_p95_ms": 5.97,
+      "h2o_baseline_p99_ms": 6.39,
+      "h2o_jit_p99_ms": 6.119,
+      "h2o_jit_rps_change_pct": -0.26510656760794227,
+      "h2o_jit_rps_min": 2185.8508,
+      "h2o_jit_rps_max": 2510.8397,
+      "frankenphp_baseline_rps": 2294.5011,
+      "frankenphp_jit_rps": 2287.0806,
+      "frankenphp_baseline_p50_ms": 3.17,
+      "frankenphp_jit_p50_ms": 3.12,
+      "frankenphp_baseline_p95_ms": 6.213,
+      "frankenphp_jit_p95_ms": 6.173,
+      "frankenphp_baseline_p99_ms": 6.377,
+      "frankenphp_jit_p99_ms": 6.375,
+      "frankenphp_jit_rps_change_pct": -0.3234036366337012,
+      "frankenphp_jit_rps_min": 2248.9559,
+      "frankenphp_jit_rps_max": 2336.3122,
+      "h2o_vs_frankenphp_jit_rps_change_pct": -0.8194595328209986
+    },
+    {
+      "workload": "blog",
+      "connections": 32,
+      "h2o_baseline_rps": 3693.1737,
+      "h2o_jit_rps": 3777.235,
+      "h2o_baseline_p50_ms": 7.987,
+      "h2o_jit_p50_ms": 7.88,
+      "h2o_baseline_p95_ms": 14.998,
+      "h2o_jit_p95_ms": 15.279,
+      "h2o_baseline_p99_ms": 23.995,
+      "h2o_jit_p99_ms": 23.74,
+      "h2o_jit_rps_change_pct": 2.276126357122066,
+      "h2o_jit_rps_min": 3614.3444,
+      "h2o_jit_rps_max": 3798.3361,
+      "frankenphp_baseline_rps": 3707.3021,
+      "frankenphp_jit_rps": 3727.5532,
+      "frankenphp_baseline_p50_ms": 7.826,
+      "frankenphp_jit_p50_ms": 7.85,
+      "frankenphp_baseline_p95_ms": 15.483,
+      "frankenphp_jit_p95_ms": 15.718,
+      "frankenphp_baseline_p99_ms": 24.82,
+      "frankenphp_jit_p99_ms": 24.274,
+      "frankenphp_jit_rps_change_pct": 0.5462489825148076,
+      "frankenphp_jit_rps_min": 3701.7545,
+      "frankenphp_jit_rps_max": 3734.3067,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 1.3328260479287035
+    },
+    {
+      "workload": "blog",
+      "connections": 100,
+      "h2o_baseline_rps": 3763.6021,
+      "h2o_jit_rps": 3823.3225,
+      "h2o_baseline_p50_ms": 24.086,
+      "h2o_jit_p50_ms": 23.348,
+      "h2o_baseline_p95_ms": 40.343,
+      "h2o_jit_p95_ms": 39.978,
+      "h2o_baseline_p99_ms": 62.02,
+      "h2o_jit_p99_ms": 62.201,
+      "h2o_jit_rps_change_pct": 1.586788358950053,
+      "h2o_jit_rps_min": 3803.8566,
+      "h2o_jit_rps_max": 3876.4108,
+      "frankenphp_baseline_rps": 3633.108,
+      "frankenphp_jit_rps": 3747.2758,
+      "frankenphp_baseline_p50_ms": 24.33,
+      "frankenphp_jit_p50_ms": 23.99,
+      "frankenphp_baseline_p95_ms": 45.02,
+      "frankenphp_jit_p95_ms": 42.637,
+      "frankenphp_baseline_p99_ms": 67.116,
+      "frankenphp_jit_p99_ms": 64.868,
+      "frankenphp_jit_rps_change_pct": 3.142427915712931,
+      "frankenphp_jit_rps_min": 3679.8138,
+      "frankenphp_jit_rps_max": 3789.6164,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 2.029386254409138
+    },
+    {
+      "workload": "blog",
+      "connections": 256,
+      "h2o_baseline_rps": 3729.6146,
+      "h2o_jit_rps": 3848.9189,
+      "h2o_baseline_p50_ms": 64.776,
+      "h2o_jit_p50_ms": 62.817,
+      "h2o_baseline_p95_ms": 94.909,
+      "h2o_jit_p95_ms": 92.121,
+      "h2o_baseline_p99_ms": 154.274,
+      "h2o_jit_p99_ms": 149.046,
+      "h2o_jit_rps_change_pct": 3.198837220339068,
+      "h2o_jit_rps_min": 3833.0349,
+      "h2o_jit_rps_max": 3903.6237,
+      "frankenphp_baseline_rps": 3671.5736,
+      "frankenphp_jit_rps": 3690.0417,
+      "frankenphp_baseline_p50_ms": 65.288,
+      "frankenphp_jit_p50_ms": 65.138,
+      "frankenphp_baseline_p95_ms": 97.965,
+      "frankenphp_jit_p95_ms": 102.063,
+      "frankenphp_baseline_p99_ms": 159.023,
+      "frankenphp_jit_p99_ms": 155.086,
+      "frankenphp_jit_rps_change_pct": 0.5030023094185099,
+      "frankenphp_jit_rps_min": 3494.7918,
+      "frankenphp_jit_rps_max": 3776.7885,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 4.305566519749626
+    },
+    {
+      "workload": "post",
+      "connections": 1,
+      "h2o_baseline_rps": 363.7045,
+      "h2o_jit_rps": 362.9603,
+      "h2o_baseline_p50_ms": 2.703,
+      "h2o_jit_p50_ms": 2.68,
+      "h2o_baseline_p95_ms": 2.92,
+      "h2o_jit_p95_ms": 2.984,
+      "h2o_baseline_p99_ms": 3.25,
+      "h2o_jit_p99_ms": 3.946,
+      "h2o_jit_rps_change_pct": -0.20461665995333833,
+      "h2o_jit_rps_min": 360.39,
+      "h2o_jit_rps_max": 373.1044,
+      "frankenphp_baseline_rps": 354.1702,
+      "frankenphp_jit_rps": 356.3766,
+      "frankenphp_baseline_p50_ms": 2.783,
+      "frankenphp_jit_p50_ms": 2.763,
+      "frankenphp_baseline_p95_ms": 2.977,
+      "frankenphp_jit_p95_ms": 2.963,
+      "frankenphp_baseline_p99_ms": 3.243,
+      "frankenphp_jit_p99_ms": 3.314,
+      "frankenphp_jit_rps_change_pct": 0.622977314296902,
+      "frankenphp_jit_rps_min": 354.4663,
+      "frankenphp_jit_rps_max": 358.3432,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 1.8473996328602915
+    },
+    {
+      "workload": "post",
+      "connections": 8,
+      "h2o_baseline_rps": 2412.529,
+      "h2o_jit_rps": 2403.3754,
+      "h2o_baseline_p50_ms": 2.914,
+      "h2o_jit_p50_ms": 2.964,
+      "h2o_baseline_p95_ms": 5.505,
+      "h2o_jit_p95_ms": 5.335,
+      "h2o_baseline_p99_ms": 5.65,
+      "h2o_jit_p99_ms": 5.473,
+      "h2o_jit_rps_change_pct": -0.3794192733020063,
+      "h2o_jit_rps_min": 2338.3468,
+      "h2o_jit_rps_max": 2610.8766,
+      "frankenphp_baseline_rps": 2454.1092,
+      "frankenphp_jit_rps": 2351.7682,
+      "frankenphp_baseline_p50_ms": 2.969,
+      "frankenphp_jit_p50_ms": 3.059,
+      "frankenphp_baseline_p95_ms": 5.523,
+      "frankenphp_jit_p95_ms": 5.528,
+      "frankenphp_baseline_p99_ms": 5.694,
+      "frankenphp_jit_p99_ms": 5.696,
+      "frankenphp_jit_rps_change_pct": -4.170189329798357,
+      "frankenphp_jit_rps_min": 2335.5957,
+      "frankenphp_jit_rps_max": 2360.6184,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 2.1943999412867177
+    },
+    {
+      "workload": "post",
+      "connections": 32,
+      "h2o_baseline_rps": 4040.7672,
+      "h2o_jit_rps": 3972.8002,
+      "h2o_baseline_p50_ms": 7.312,
+      "h2o_jit_p50_ms": 7.493,
+      "h2o_baseline_p95_ms": 14.18,
+      "h2o_jit_p95_ms": 14.195,
+      "h2o_baseline_p99_ms": 21.582,
+      "h2o_jit_p99_ms": 22.841,
+      "h2o_jit_rps_change_pct": -1.6820320655938747,
+      "h2o_jit_rps_min": 3919.703,
+      "h2o_jit_rps_max": 4003.5049,
+      "frankenphp_baseline_rps": 4060.534,
+      "frankenphp_jit_rps": 3951.5645,
+      "frankenphp_baseline_p50_ms": 7.161,
+      "frankenphp_jit_p50_ms": 7.44,
+      "frankenphp_baseline_p95_ms": 14.369,
+      "frankenphp_jit_p95_ms": 14.523,
+      "frankenphp_baseline_p99_ms": 21.754,
+      "frankenphp_jit_p99_ms": 21.366,
+      "frankenphp_jit_rps_change_pct": -2.683624863133771,
+      "frankenphp_jit_rps_min": 3941.2668,
+      "frankenphp_jit_rps_max": 3995.0844,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 0.5373998070890673
+    },
+    {
+      "workload": "post",
+      "connections": 100,
+      "h2o_baseline_rps": 4114.511,
+      "h2o_jit_rps": 4088.2948,
+      "h2o_baseline_p50_ms": 22.042,
+      "h2o_jit_p50_ms": 22.162,
+      "h2o_baseline_p95_ms": 36.802,
+      "h2o_jit_p95_ms": 37.463,
+      "h2o_baseline_p99_ms": 56.769,
+      "h2o_jit_p99_ms": 58.165,
+      "h2o_jit_rps_change_pct": -0.6371644163790102,
+      "h2o_jit_rps_min": 3941.3777,
+      "h2o_jit_rps_max": 4256.3768,
+      "frankenphp_baseline_rps": 4072.8251,
+      "frankenphp_jit_rps": 4011.6618,
+      "frankenphp_baseline_p50_ms": 22.077,
+      "frankenphp_jit_p50_ms": 22.36,
+      "frankenphp_baseline_p95_ms": 39.011,
+      "frankenphp_jit_p95_ms": 40.306,
+      "frankenphp_baseline_p99_ms": 60.015,
+      "frankenphp_jit_p99_ms": 60.856,
+      "frankenphp_jit_rps_change_pct": -1.5017413833950388,
+      "frankenphp_jit_rps_min": 3939.1587,
+      "frankenphp_jit_rps_max": 4041.1173,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 1.910255744888567
+    },
+    {
+      "workload": "post",
+      "connections": 256,
+      "h2o_baseline_rps": 4013.6402,
+      "h2o_jit_rps": 4010.4626,
+      "h2o_baseline_p50_ms": 59.477,
+      "h2o_jit_p50_ms": 60.1,
+      "h2o_baseline_p95_ms": 111.616,
+      "h2o_jit_p95_ms": 88.917,
+      "h2o_baseline_p99_ms": 141.036,
+      "h2o_jit_p99_ms": 140.998,
+      "h2o_jit_rps_change_pct": -0.07917002625198455,
+      "h2o_jit_rps_min": 3868.7846,
+      "h2o_jit_rps_max": 4492.4934,
+      "frankenphp_baseline_rps": 3836.7948,
+      "frankenphp_jit_rps": 3725.4531,
+      "frankenphp_baseline_p50_ms": 60.457,
+      "frankenphp_jit_p50_ms": 61.564,
+      "frankenphp_baseline_p95_ms": 130.481,
+      "frankenphp_jit_p95_ms": 134.897,
+      "frankenphp_baseline_p99_ms": 148.017,
+      "frankenphp_jit_p99_ms": 152.089,
+      "frankenphp_jit_rps_change_pct": -2.9019456552641265,
+      "frankenphp_jit_rps_min": 3686.3805,
+      "frankenphp_jit_rps_max": 4076.5777,
+      "h2o_vs_frankenphp_jit_rps_change_pct": 7.65033117716607
+    }
+  ],
+  "settings": {
+    "workers_per_server": 48,
+    "repeat": 3,
+    "duration_seconds": 10,
+    "warmup_seconds_per_route": 3,
+    "wrk_threads_max": 8,
+    "connections": [
+      1,
+      8,
+      32,
+      100,
+      256
+    ],
+    "address": "127.0.0.1",
+    "host_header": "localhost",
+    "protocol": "HTTP/1.1",
+    "jit": {
+      "opcache.jit": "tracing",
+      "opcache.jit_buffer_size": "64M"
+    },
+    "routes": {
+      "homepage": "/en/",
+      "blog": "/en/blog/",
+      "post": "/en/blog/posts/lorem-ipsum-dolor-sit-amet-consectetur-adipiscing-elit"
+    },
+    "production_ini": {
+      "error_reporting": "6143",
+      "log_errors": "1",
+      "display_errors": "0",
+      "opcache.enable": "1",
+      "opcache.validate_timestamps": "0"
+    },
+    "production_environment": {
+      "APP_ENV": "prod",
+      "APP_DEBUG": "0",
+      "APP_RUNTIME_OPTIONS": "{\"error_handler\":false}"
+    }
+  },
+  "runs": {
+    "baseline": {
+      "started_utc": "20261107T031058Z",
+      "completed_utc": "2026-11-07T03:27:01.065098+00:00",
+      "requests": 5547480,
+      "errors": 0
+    },
+    "jit": {
+      "started_utc": "20261107T033648Z",
+      "completed_utc": "2026-11-07T03:52:51.440526+00:00",
+      "requests": 5873529,
+      "errors": 0
+    }
+  },
+  "binaries": {
+    "h2o": {
+      "path": "/home/m/Projects/h2o-php/build/release/h2o-php",
+      "sha256": "1fdf3bf62d15b9c891d7ae40201050f1f3c99a2d464ccd81e90f7248007d075d",
+      "version": "h2o version 2.3.0-DEV@7bbb3e39b\nh2o-php runtime revision: b33c7a9cdfe0f5d3bb7fb96f28726c4f0edade96+dirty (source SHA256 4d7c45d2d36e5352e53ab1c7472732ebe2b80f9134ac188cb43a49accf7b9c5f)\nH2O revision: 7bbb3e39bf03027344f36b4650e5383c3b6b1014\nPHP: 8.6.0RC5 (ZTS: YES, ABI: 20260924)\nBundled CA: 2026-10-20 (SHA256 796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe)\nOpenSSL: OpenSSL 4.0.3 29 Sep 2026\nbrotli: YES\nzstd: YES\ncapabilities: YES\nfusion: YES\nssl-zerocopy: YES\nktls: YES\nio_uring: YES\nkey-exchanges: X25519MLKEM768, secp521r1, secp384r1, x25519, SecP384r1MLKEM1024, SecP256r1MLKEM768, MLKEM1024, MLKEM768, MLKEM512, secp256r1"
+    },
+    "frankenphp": {
+      "path": "/usr/bin/frankenphp",
+      "sha256": "27bd1bcb4b96593daa27aec161ca7b109e784c0fdbedb5e4670ce92520c45af9",
+      "version": "FrankenPHP v1.13.4 PHP 8.6.0RC5 Caddy v2.11.8 h1:E2pv1BoZ5bJaWqFkU6QvLa21iGAX8bDzlEQG4dDQ/Vc="
+    }
+  },
+  "jit_verification": [
+    {
+      "server": "r1-frankenphp",
+      "phase": "after",
+      "buffer_used": 1285439,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65823409
+    },
+    {
+      "server": "r1-frankenphp",
+      "phase": "before",
+      "buffer_used": 155255,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 66953593
+    },
+    {
+      "server": "r1-frankenphp",
+      "phase": "warmed",
+      "buffer_used": 1283919,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65824929
+    },
+    {
+      "server": "r1-h2o",
+      "phase": "after",
+      "buffer_used": 1146351,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65962497
+    },
+    {
+      "server": "r1-h2o",
+      "phase": "before",
+      "buffer_used": 61678,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 67047170
+    },
+    {
+      "server": "r1-h2o",
+      "phase": "warmed",
+      "buffer_used": 1144815,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65964033
+    },
+    {
+      "server": "r2-frankenphp",
+      "phase": "after",
+      "buffer_used": 1214591,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65894257
+    },
+    {
+      "server": "r2-frankenphp",
+      "phase": "before",
+      "buffer_used": 123018,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 66985830
+    },
+    {
+      "server": "r2-frankenphp",
+      "phase": "warmed",
+      "buffer_used": 1212851,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65895997
+    },
+    {
+      "server": "r2-h2o",
+      "phase": "after",
+      "buffer_used": 1159807,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65949041
+    },
+    {
+      "server": "r2-h2o",
+      "phase": "before",
+      "buffer_used": 69918,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 67038930
+    },
+    {
+      "server": "r2-h2o",
+      "phase": "warmed",
+      "buffer_used": 1158463,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65950385
+    },
+    {
+      "server": "r3-frankenphp",
+      "phase": "after",
+      "buffer_used": 1237199,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65871649
+    },
+    {
+      "server": "r3-frankenphp",
+      "phase": "before",
+      "buffer_used": 126128,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 66982720
+    },
+    {
+      "server": "r3-frankenphp",
+      "phase": "warmed",
+      "buffer_used": 1235567,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 65873281
+    },
+    {
+      "server": "r3-h2o",
+      "phase": "after",
+      "buffer_used": 1098671,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 66010177
+    },
+    {
+      "server": "r3-h2o",
+      "phase": "before",
+      "buffer_used": 77447,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 67031401
+    },
+    {
+      "server": "r3-h2o",
+      "phase": "warmed",
+      "buffer_used": 1097423,
+      "enabled": true,
+      "on": true,
+      "kind": 5,
+      "opt_level": 4,
+      "opt_flags": 6,
+      "buffer_size": 67108848,
+      "buffer_free": 66011425
+    }
+  ]
+}</script>
+</body>
+</html>

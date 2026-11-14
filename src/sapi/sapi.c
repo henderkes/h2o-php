@@ -41,9 +41,6 @@
 #ifndef ZTS
 #error "h2o-php requires the installed ZTS PHP runtime"
 #endif
-#if PHP_VERSION_ID < 80500 || PHP_VERSION_ID >= 80700
-#error "This SAPI lifecycle port requires PHP 8.5 or 8.6 headers and library"
-#endif
 
 static _Thread_local hp_request_t *current_request;
 static _Thread_local hp_worker_group_t *current_group;
@@ -964,9 +961,6 @@ static void worker_request_shutdown(void)
     zend_try { sapi_deactivate(); } zend_end_try();
     SG(request_info).content_type_dup = NULL;
     SG(request_info).current_user = NULL;
-#if PHP_VERSION_ID < 80600
-    SG(request_info).current_user_length = 0;
-#endif
     if (body) frankenphp_release_request_body(body);
     clear_context();
     hp_env_request_clear();
@@ -990,11 +984,7 @@ static int worker_request_startup(hp_request_t *request)
         zend_set_timeout(PG(max_input_time) == -1 ? EG(timeout_seconds) : PG(max_input_time), 1);
 #endif
         if (PG(expose_php)) sapi_add_header(SAPI_PHP_VERSION_HEADER, sizeof(SAPI_PHP_VERSION_HEADER) - 1, 1);
-#if PHP_VERSION_ID >= 80600
         const char *output_handler = PG(output_handler) ? ZSTR_VAL(PG(output_handler)) : NULL;
-#else
-        const char *output_handler = PG(output_handler);
-#endif
         if (output_handler && output_handler[0]) {
             zval handler;
             ZVAL_STRING(&handler, output_handler);
@@ -1268,7 +1258,7 @@ static zend_module_entry frankenphp_module = {
     STANDARD_MODULE_PROPERTIES
 };
 
-/* PHP 8.5's two OPcache sizing update handlers reject refresh after SHM
+/* PHP's two OPcache sizing update handlers reject refresh after SHM
  * startup, including zend_new_thread_end_handler's initialization of a new
  * ZTS thread. Preserve the controller's validated scalar caches using Zend's
  * public INI entry address metadata; no private accelerator layout is used. */
@@ -1411,7 +1401,6 @@ static sapi_module_struct hp_sapi_module = {
     STANDARD_SAPI_MODULE_PROPERTIES
 };
 
-#if PHP_VERSION_ID >= 80400 && defined(ZTS)
 static void (*previous_opcache_restart_hook)(int);
 static void php_metrics_opcache_restart_hook(int reason)
 {
@@ -1444,10 +1433,6 @@ static void restore_php_metrics_opcache_hook(void)
         zend_accel_schedule_restart_hook = previous_opcache_restart_hook;
     previous_opcache_restart_hook = NULL;
 }
-#else
-static void install_php_metrics_opcache_hook(void) { hp_php_metrics_opcache_available(false); }
-static void restore_php_metrics_opcache_hook(void) {}
-#endif
 
 int hp_sapi_init(const char *ini, unsigned max_threads)
 {

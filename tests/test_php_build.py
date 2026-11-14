@@ -81,11 +81,15 @@ class PHPBuildTest(unittest.TestCase):
             self.assertNotEqual(mismatch.returncode, 0, mismatch.stdout)
             self.assertIn("runtime version differs", mismatch.stdout)
 
-            version_header.write_text(original.replace(f"PHP_VERSION_ID {version_id}",
-                                                       "PHP_VERSION_ID 80700"))
-            unsupported = configure()
-            self.assertNotEqual(unsupported.returncode, 0, unsupported.stdout)
-            self.assertIn("PHPZTS_ABI_LINKS - Failed", unsupported.stdout)
+            # Version numbers are not gated; mismatched headers/library still fail.
+            for changed_id in (80500, 80700):
+                with self.subTest(version_id=changed_id):
+                    version_header.write_text(original.replace(f"PHP_VERSION_ID {version_id}",
+                                                               f"PHP_VERSION_ID {changed_id}"))
+                    mismatch = configure()
+                    self.assertNotEqual(mismatch.returncode, 0, mismatch.stdout)
+                    self.assertIn("PHPZTS_ABI_LINKS - Success", mismatch.stdout)
+                    self.assertIn("runtime version differs", mismatch.stdout)
 
 
 if __name__ == "__main__":

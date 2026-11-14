@@ -1,24 +1,29 @@
 listen:
-  host: 127.0.0.1
-  port: 18084
-num-threads: 2
+  host: localhost
+  port: 80
+num-threads: 48
+error-log.emit-request-errors: ON
 php.runtime:
-  threads: 2
-  max-threads: 16
   request-timeout: 10s
 php.ini:
+  error_reporting: '6143' # E_ALL without E_DEPRECATED and E_USER_DEPRECATED
+  log_errors: '1'
+  display_errors: '0'
   opcache.enable: '1'
   opcache.validate_timestamps: '0'
 hosts:
-  symfony.local:18084:
+  localhost:
     paths:
+      /assets/:
+        file.dir: ../symfony-demo/public/assets
       /:
-        php.root: /home/m/h2o-php/examples/frameworks/symfony
+        php.root: ../symfony-demo/public
+        php.env:
+          APP_ENV: prod
+          APP_DEBUG: '0'
+          APP_RUNTIME_OPTIONS: '{"error_handler":false}'
         php.worker:
-          file: /home/m/h2o-php/examples/frameworks/symfony/index.php
-          num: 1
-          env:
-            APP_ENV: prod
-            APP_DEBUG: '0'
+          num: 48
+          file: index.php
       /metrics:
         php.metrics: ON

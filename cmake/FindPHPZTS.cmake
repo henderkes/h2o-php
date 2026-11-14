@@ -57,7 +57,8 @@ if(PHPZTS_CONFIG)
 endif()
 
 if(PHPZTS_INCLUDE_DIRS AND PHPZTS_LIBRARY)
-  set(PHPZTS_ABI_FILES "${PHPZTS_CONFIG}" "${PHPZTS_LIBRARY}")
+  # Recheck cached results when the ABI probes themselves change as well.
+  set(PHPZTS_ABI_FILES "${CMAKE_CURRENT_LIST_FILE}" "${PHPZTS_CONFIG}" "${PHPZTS_LIBRARY}")
   foreach(_php_include IN LISTS PHPZTS_INCLUDE_DIRS)
     foreach(_header main/php_version.h Zend/zend_modules.h Zend/zend_API.h main/SAPI.h)
       if(EXISTS "${_php_include}/${_header}")
@@ -81,16 +82,13 @@ if(PHPZTS_INCLUDE_DIRS AND PHPZTS_LIBRARY)
 #ifndef ZTS
 #error This PHP was built without ZTS
 #endif
-#if PHP_VERSION_ID < 80500 || PHP_VERSION_ID >= 80700
-#error The worker lifecycle port requires matching PHP 8.5 or 8.6 headers and runtime
-#endif
 int main(void) {
   void *volatile p[] = {(void *)php_module_startup, (void *)php_request_startup,
                        (void *)sapi_startup, (void *)tsrm_startup,
                        (void *)zend_call_known_function};
   return p[0] == 0;
 }" PHPZTS_ABI_LINKS)
-  if(PHPZTS_ABI_LINKS AND PHPZTS_VERSION VERSION_GREATER_EQUAL "8.5" AND NOT CMAKE_CROSSCOMPILING)
+  if(PHPZTS_ABI_LINKS AND NOT CMAKE_CROSSCOMPILING)
     check_c_source_runs("#include <php.h>
 #include <php_main.h>
 int main(void) { return php_version_id() != PHP_VERSION_ID; }
@@ -105,7 +103,7 @@ endif()
 find_package_handle_standard_args(PHPZTS REQUIRED_VARS
   PHPZTS_CONFIG PHPZTS_LIBRARY PHPZTS_INCLUDE_DIRS PHPZTS_ABI_LINKS
   VERSION_VAR PHPZTS_VERSION
-  FAIL_MESSAGE "An installed embed-capable ZTS PHP 8.5 or 8.6 runtime is required. Set PHPZTS_CONFIG and PHPZTS_LIBRARY to matching headers/library. Inspect CMakeConfigureLog.yaml for ABI errors.")
+  FAIL_MESSAGE "An installed embed-capable ZTS PHP runtime is required. Set PHPZTS_CONFIG and PHPZTS_LIBRARY to matching headers/library. Inspect CMakeConfigureLog.yaml for ABI errors.")
 
 if(PHPZTS_FOUND AND NOT TARGET PHPZTS::PHPZTS)
   set(PHPZTS_CHECKED_FINGERPRINT "${PHPZTS_FINGERPRINT}" CACHE INTERNAL "Validated PHP ZTS dependencies" FORCE)

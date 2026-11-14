@@ -18,7 +18,7 @@ import time
 from run import sample
 
 ROOT = Path(__file__).resolve().parent.parent
-APP = Path('/home/m/symfony_demo')
+APP = ROOT.parent / 'symfony-demo'
 MODES = ['h2o-classic', 'frankenphp-classic', 'h2o-worker', 'frankenphp-worker', 'php-fpm-classic']
 WORKLOADS = {'homepage': '/en/', 'blog': '/en/blog/'}
 WRK = ROOT / 'upstream/wrk/wrk'

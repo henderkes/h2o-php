@@ -1,0 +1,18 @@
+localhost:80 {
+    root * /home/m/Projects/symfony-demo/public
+
+    @assets path /assets/*
+
+    route {
+        file_server @assets
+
+        rewrite index.php
+        php {
+            root /home/m/Projects/symfony-demo/public
+            worker {
+                file index.php
+                match *
+            }
+        }
+    }
+}

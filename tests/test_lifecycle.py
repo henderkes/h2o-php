@@ -88,12 +88,12 @@ hosts:
         return subprocess.run([str(BINARY), command, "--address", f"unix/{self.address}", *arguments],
                               capture_output=True, text=True, timeout=15)
 
-    def start(self):
+    def start(self, *arguments):
         self.log.seek(0)
         self.log.truncate()
         self.log.flush()
         self.process = subprocess.Popen([str(BINARY), "run", "--config", str(self.config),
-                                         "--address", f"unix/{self.address}"],
+                                         "--address", f"unix/{self.address}", *arguments],
                                         stdout=self.log, stderr=subprocess.STDOUT)
 
         def ready():
@@ -150,6 +150,91 @@ hosts:
         status, length = struct.unpack("=iI", read_exact(8))
         self.assertLessEqual(length, 8192)
         return status, read_exact(length)
+
+    def test_watch_reloads_atomic_edits_and_preserves_invalid_configuration(self):
+        self.config = self.base / "config[prod].yml"
+        self.config.write_text(self.yaml("v1"))
+        self.start("--watch")
+        first = self.fetch()
+        self.config.write_text("invalid: [\n")
+        wait_for(lambda: (self.base / "server.log").read_text().count("h2o.watch:") >= 2)
+        self.assertEqual(self.fetch(), first)
+
+        replacement = self.base / "saved.tmp"
+        replacement.write_text(self.yaml("v2"))
+        replacement.replace(self.config)
+        wait_for(lambda: self.fetch()["version"] == "v2")
+        second = self.fetch()
+        self.config.write_text("# cosmetic edit\n" + self.yaml("v2"))
+        wait_for(lambda: "h2o.watch: configuration unchanged" in (self.base / "server.log").read_text())
+        self.assertEqual(self.fetch(), second)
+
+        self.config.unlink()
+        wait_for(lambda: "h2o.watch: cannot read" in (self.base / "server.log").read_text())
+        self.assertEqual(self.fetch(), second)
+        self.config.write_text(self.yaml("v3"))
+        wait_for(lambda: self.fetch()["version"] == "v3")
+
+    def test_watch_glob_reloads_active_config_and_resolves_includes(self):
+        included = self.base / "included.yml"
+        included.write_text(self.yaml("v1"))
+        self.config.write_text(f"!file {included}\n")
+        self.start(f"--watch={self.base}/*.yml")
+        included.write_text(self.yaml("v2"))
+        wait_for(lambda: self.fetch()["version"] == "v2")
+        before = self.fetch()
+
+        # A different matched YAML triggers validation of the startup file;
+        # it must not become the serving configuration itself.
+        (self.base / "other.yml").write_text(self.yaml("wrong-file"))
+        wait_for(lambda: "h2o.watch: configuration unchanged" in (self.base / "server.log").read_text())
+        self.assertEqual(self.fetch(), before)
+
+    def test_watch_edits_during_drain_apply_latest_contents(self):
+        self.start("--watch")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            held = pool.submit(self.fetch, "/?hold=1")
+            wait_for(lambda: (self.base / "entered").exists())
+            self.config.write_text(self.yaml("v2"))
+            wait_for(lambda: "h2o.watch: configuration loaded" in (self.base / "server.log").read_text())
+            self.assertEqual(self.fetch()["version"], "v2")
+            self.config.write_text(self.yaml("v3"))
+            self.config.write_text(self.yaml("v4"))
+            time.sleep(0.4)
+            self.assertEqual(self.fetch()["version"], "v2")
+            (self.base / "release").touch()
+            self.assertEqual(held.result(timeout=5)["version"], "v1")
+            wait_for(lambda: self.fetch()["version"] == "v4")
+
+    def test_watch_nonregular_source_does_not_block_stop(self):
+        self.start("--watch")
+        before = self.fetch()
+        self.config.unlink()
+        os.mkfifo(self.config)
+        wait_for(lambda: "h2o.watch: cannot read" in (self.base / "server.log").read_text())
+        self.assertEqual(self.fetch(), before)
+        started = time.monotonic()
+        result = self.command("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.process.wait(timeout=2), 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_configuration_watch_is_opt_in_and_rejects_invalid_options(self):
+        for command, arguments in (("run", ("-c", str(self.config), "--watch=")),
+                                   ("reload", ("-c", str(self.config), "--watch")),
+                                   ("stop", ("--watch",)), ("run", ("-c", "-", "--watch"))):
+            with self.subTest(command=command, arguments=arguments):
+                result = self.command(command, *arguments)
+                self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+        fifo = self.base / "startup.fifo"
+        os.mkfifo(fifo)
+        result = self.command("run", "-c", str(fifo), "--watch")
+        self.assertEqual(result.returncode, 66, result.stdout + result.stderr)
+        self.start()
+        first = self.fetch()
+        self.config.write_text(self.yaml("v2"))
+        time.sleep(0.6)
+        self.assertEqual(self.fetch(), first)
 
     def test_partial_control_clients_do_not_delay_signal_or_stop(self):
         self.config.write_text(self.yaml("v1").replace("shutdown-timeout: 4s", "shutdown-timeout: 200ms"))

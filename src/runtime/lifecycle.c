@@ -513,7 +513,7 @@ static void default_control_address(char *buffer, size_t size)
 static void usage(const char *command)
 {
     if (!strcmp(command, "run"))
-        puts("Usage: h2o-php run --config FILE [--address unix//PATH]\nRuns in the foreground with graceful reload support.");
+        puts("Usage: h2o-php run --config FILE [--address unix//PATH] [--watch[=GLOB]]\nRuns in the foreground with graceful reload support.\n--watch reloads FILE after edits; repeat --watch=GLOB to watch additional YAML/includes.");
     else if (!strcmp(command, "reload"))
         puts("Usage: h2o-php reload --config FILE [--address unix//PATH] [--force]\nApplies the supplied H2O YAML; waits for success or failure.");
     else
@@ -524,11 +524,19 @@ int hp_lifecycle_command(int argc, char **argv)
     if (argc < 2 || (strcmp(argv[1], "run") && strcmp(argv[1], "reload") && strcmp(argv[1], "stop"))) return -1;
     const char *command = argv[1], *config_path = NULL, *address = NULL;
     bool run = !strcmp(command, "run"), stop = !strcmp(command, "stop"), force = false;
+    const char *watch_patterns[32]; size_t num_watch_patterns = 0;
+    bool watch_enabled = false;
     for (int i = 2; i < argc; ++i) {
         const char *argument = argv[i], *value = strchr(argument, '=');
         size_t key_length = value ? (size_t)(value - argument) : strlen(argument);
         if (value) ++value;
         if (!strcmp(argument, "--help") || !strcmp(argument, "-h")) { usage(command); return 0; }
+        if (key_length == 7 && !strncmp(argument, "--watch", 7)) {
+            if (!run || (value && !*value) || num_watch_patterns == 32) goto Usage;
+            watch_enabled = true;
+            if (value) watch_patterns[num_watch_patterns++] = value;
+            continue;
+        }
         if (!strcmp(argument, "--force") || !strcmp(argument, "-f")) {
             if (run || stop) goto Usage;
             force = true; continue;
@@ -542,6 +550,9 @@ int hp_lifecycle_command(int argc, char **argv)
         *slot = value;
     }
     if (!stop && !config_path) goto Usage;
+    if (watch_enabled && !strcmp(config_path, "-")) {
+        fputs("h2o-php run: --watch requires a configuration file, not stdin\n", stderr); return EX_USAGE;
+    }
     char default_address[108];
     default_control_address(default_address, sizeof(default_address));
     if (!address) address = default_address;
@@ -549,24 +560,26 @@ int hp_lifecycle_command(int argc, char **argv)
     if (address[0] != '/') {
         fputs("h2o-php: --address must be an absolute Unix socket path (unix//PATH)\n", stderr); return EX_USAGE;
     }
+    hp_config_watch_t *watch = watch_enabled ? hp_config_watch_create(config_path, watch_patterns, num_watch_patterns) : NULL;
+    if (watch_enabled && !watch) { perror("h2o-php: cannot watch configuration"); return EX_OSERR; }
     size_t length = 0;
-    char *yaml = stop ? NULL : read_file(config_path, &length);
-    if (!stop && !yaml) { perror(config_path); return EX_NOINPUT; }
+    char *yaml = stop ? NULL : watch ? hp_config_watch_read(watch, &length) : read_file(config_path, &length);
+    if (!stop && !yaml) { perror(config_path); hp_config_watch_destroy(watch); return EX_NOINPUT; }
     int lock_fd = -1;
     if (run) {
         char *lock_path = NULL;
-        if (asprintf(&lock_path, "%s.lock", address) < 0) { free(yaml); return EX_OSERR; }
+        if (asprintf(&lock_path, "%s.lock", address) < 0) { hp_config_watch_destroy(watch); free(yaml); return EX_OSERR; }
         lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600); free(lock_path);
         struct stat st;
         if (lock_fd < 0 || fstat(lock_fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
             flock(lock_fd, LOCK_EX | LOCK_NB)) {
             fputs("h2o-php: instance address is locked or unavailable\n", stderr);
             if (lock_fd >= 0) close(lock_fd);
-            free(yaml); return EX_UNAVAILABLE;
+            hp_config_watch_destroy(watch); free(yaml); return EX_UNAVAILABLE;
         }
     }
     int fd = control_socket(address, run);
-    if (fd < 0) { fprintf(stderr, "h2o-php: control socket %s: %s\n", address, strerror(errno)); if (lock_fd >= 0) close(lock_fd); free(yaml); return EX_UNAVAILABLE; }
+    if (fd < 0) { fprintf(stderr, "h2o-php: control socket %s: %s\n", address, strerror(errno)); if (lock_fd >= 0) close(lock_fd); hp_config_watch_destroy(watch); free(yaml); return EX_UNAVAILABLE; }
     int result;
     if (run) {
         struct sigaction action = {.sa_handler = interrupt_run}, previous_int, previous_term;
@@ -575,7 +588,7 @@ int hp_lifecycle_command(int argc, char **argv)
         char *error;
         hp_lifecycle_config_t *config = hp_lifecycle_load(argv[0], yaml, length, &error, run_cancelled);
         if (!config) { fprintf(stderr, "h2o-php: %s\n", error ? error : "out of memory"); free(error); result = interrupted ? 0 : EX_CONFIG; }
-        else { result = interrupted ? 0 : hp_native_lifecycle_run(config, fd); hp_lifecycle_release(config); }
+        else { result = interrupted ? 0 : hp_native_lifecycle_run(config, fd, watch); hp_lifecycle_release(config); }
         close(fd); unlink(address);
         close(lock_fd);
         sigaction(SIGINT, &previous_int, NULL); sigaction(SIGTERM, &previous_term, NULL);
@@ -596,7 +609,7 @@ int hp_lifecycle_command(int argc, char **argv)
         }
         close(fd);
     }
-    free(yaml); return result;
+    hp_config_watch_destroy(watch); free(yaml); return result;
 Usage:
     usage(command); return EX_USAGE;
 }

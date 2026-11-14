@@ -1,0 +1,28 @@
+listen:
+    host: 127.0.0.1
+    port: 80
+error-log.emit-request-errors: ON
+num-threads: 48
+php.runtime:
+    request-timeout: 10s
+php.ini:
+    error_reporting: '6143'
+    log_errors: '1'
+    display_errors: '0'
+    opcache.enable: '1'
+    opcache.validate_timestamps: '0'
+hosts:
+    localhost:
+        paths:
+            /:
+                php.root: ../symfony-demo/public
+                php_server:
+                    worker:
+                        num: 48
+                        file: index.php
+                        env:
+                            APP_ENV: prod
+                            APP_DEBUG: '0'
+                            APP_RUNTIME_OPTIONS: '{"error_handler":false}'
+            /metrics:
+                php.metrics: ON

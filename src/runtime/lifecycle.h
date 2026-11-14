@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <poll.h>
+#include "config_watch.h"
 
 /* Owned immutable input. Serving generations retain the exact submitted YAML,
  * not a filename whose contents can change during startup or rollback. */
@@ -49,7 +50,7 @@ void hp_lifecycle_control_process(hp_lifecycle_control_t *control, const struct 
 hp_lifecycle_client_t *hp_lifecycle_control_request(hp_lifecycle_control_t *control, unsigned *command,
                                                    bool *force, char **yaml, size_t *length);
 void hp_lifecycle_reply(hp_lifecycle_client_t *client, int status, const char *message);
-int hp_native_lifecycle_run(hp_lifecycle_config_t *config, int control_fd);
+int hp_native_lifecycle_run(hp_lifecycle_config_t *config, int control_fd, hp_config_watch_t *watch);
 
 #define HP_LIFECYCLE_LOAD 1U
 #define HP_LIFECYCLE_STOP 2U

@@ -69,7 +69,8 @@ typedef struct master {
     hp_lifecycle_control_t *control;
     hp_lifecycle_client_t *reply_client, *validation_client;
     hp_lifecycle_validation_t *validation;
-    bool validation_force;
+    bool validation_force, validation_watch, pending_watch;
+    hp_config_watch_t *watch;
     int next_log_fd, original_output[2];
     enum log_state log_state;
     bool log_socket;
@@ -172,6 +173,14 @@ static void master_diagnostic(const char *format, ...)
     }
 Done:
     errno = saved_errno;
+}
+static void reload_reply(hp_lifecycle_client_t *client, int status, const char *message, bool watched)
+{
+    hp_lifecycle_reply(client, status, message);
+    if (watched) {
+        size_t length = strlen(message);
+        master_diagnostic("h2o.watch: %s%s", message, length && message[length - 1] == '\n' ? "" : "\n");
+    }
 }
 static int open_master_log(const char *path)
 {
@@ -555,7 +564,8 @@ static void dispose(master_t *m, bool remove_paths);
 static void begin_shutdown(master_t *m, uint64_t now);
 static void reject_reload(master_t *m, const char *message)
 {
-    hp_lifecycle_reply(m->reply_client, EX_CONFIG, message); m->reply_client = NULL;
+    reload_reply(m->reply_client, EX_CONFIG, message, m->pending_watch); m->reply_client = NULL;
+    m->pending_watch = false;
     if (m->pending) {
         dispose(m->pending, true); hp_lifecycle_release(m->pending->config);
         free(m->pending); m->pending = NULL;
@@ -592,7 +602,8 @@ static void begin_shutdown(master_t *m, uint64_t now)
     if (m->config) reject_reload(m, "server is shutting down\n");
     if (m->validation) {
         hp_lifecycle_validation_cancel(m->validation, "configuration validation interrupted by shutdown");
-        hp_lifecycle_reply(m->validation_client, EX_TEMPFAIL, "server is shutting down\n");
+        reload_reply(m->validation_client, EX_TEMPFAIL, "server is shutting down\n", m->validation_watch);
+        m->validation_watch = false;
         m->validation_client = NULL;
     }
     while (m->requests) {
@@ -606,15 +617,32 @@ static void begin_shutdown(master_t *m, uint64_t now)
     for (size_t i = 0; i < 3; ++i) if (children[i]->pid) kill(children[i]->pid, SIGTERM);
     master_diagnostic("h2o.master: draining worker generations\n");
 }
-static void start_validation(master_t *m, hp_lifecycle_client_t *client, bool force, char *yaml, size_t length)
+static void start_validation(master_t *m, hp_lifecycle_client_t *client, bool force, char *yaml, size_t length, bool watched)
 {
     char *error;
     m->validation = hp_lifecycle_validation_begin(m->worker_argv[0], yaml, length, &error);
     free(yaml);
     if (!m->validation) {
-        hp_lifecycle_reply(client, EX_CONFIG, error ? error : "cannot validate configuration\n"); free(error); return;
+        reload_reply(client, EX_CONFIG, error ? error : "cannot validate configuration\n", watched); free(error); return;
     }
     m->validation_client = client; m->validation_force = force;
+    m->validation_watch = watched;
+}
+static void advance_config_watch(master_t *m, uint64_t now)
+{
+    if (!m->watch || m->stopping) return;
+    hp_config_watch_step(m->watch, now);
+    if (!hp_config_watch_ready(m->watch) || !m->current.pid || m->candidate.pid || m->retiring.pid ||
+        m->pending || m->validation || m->requests) return;
+    size_t length = 0;
+    char *yaml = hp_config_watch_read(m->watch, &length);
+    if (!yaml) {
+        master_diagnostic("h2o.watch: cannot read %s: %s; active configuration kept\n",
+                          hp_config_watch_path(m->watch), strerror(errno));
+        return;
+    }
+    master_diagnostic("h2o.watch: change detected; reloading %s\n", hp_config_watch_path(m->watch));
+    start_validation(m, NULL, false, yaml, length, true);
 }
 static int finish_log_open(master_t *target)
 {
@@ -685,28 +713,28 @@ static void advance_generation_log(master_t *m, short events, uint64_t now)
     char message[256]; snprintf(message, sizeof(message), "cannot prepare replacement log: %s; active configuration kept\n", strerror(error));
     reject_reload(m, message);
 }
-static void prepare_reload(master_t *m, hp_lifecycle_client_t *client, bool force, hp_lifecycle_config_t *config)
+static void prepare_reload(master_t *m, hp_lifecycle_client_t *client, bool force, hp_lifecycle_config_t *config, bool watched)
 {
     if (!force && config->length == m->config->length && !memcmp(config->yaml, m->config->yaml, config->length)) {
-        hp_lifecycle_reply(client, 0, "configuration unchanged\n"); hp_lifecycle_release(config); return;
+        reload_reply(client, 0, "configuration unchanged\n", watched); hp_lifecycle_release(config); return;
     }
     master_t *pending = calloc(1, sizeof(*pending));
-    if (!pending) { hp_lifecycle_release(config); hp_lifecycle_reply(client, EX_OSERR, "out of memory\n"); return; }
+    if (!pending) { hp_lifecycle_release(config); reload_reply(client, EX_OSERR, "out of memory\n", watched); return; }
     *pending = (master_t){.pid_fd = -1, .wake = {-1, -1}, .daemon_ready = -1,
         .reuse = m, .config = config, .startup_ms = config->startup_ms ? config->startup_ms : 30000,
         .shutdown_ms = config->shutdown_ms, .next_log_fd = -1, .original_output = {-1, -1}};
     bool parsed = parse_arguments(pending, config->argv) == 0;
     if (parsed && ((pending->pid_path == NULL) != (m->pid_path == NULL) ||
                    (pending->pid_path && strcmp(pending->pid_path, m->pid_path)))) {
-        hp_lifecycle_reply(client, EX_CONFIG, "pid-file is a process setting; changing it requires a restart\n");
+        reload_reply(client, EX_CONFIG, "pid-file is a process setting; changing it requires a restart\n", watched);
         dispose(pending, true); hp_lifecycle_release(config); free(pending); return;
     }
     if (!parsed) {
         char message[256]; snprintf(message, sizeof(message), "cannot prepare replacement listeners/log: %s\n", strerror(errno));
-        hp_lifecycle_reply(client, EX_CONFIG, message); dispose(pending, true); hp_lifecycle_release(config); free(pending); return;
+        reload_reply(client, EX_CONFIG, message, watched); dispose(pending, true); hp_lifecycle_release(config); free(pending); return;
     }
     pending->preparation_deadline = deadline(now_ms(), pending->startup_ms);
-    m->pending = pending; m->reply_client = client;
+    m->pending = pending; m->reply_client = client; m->pending_watch = watched;
 }
 static void advance_validation(master_t *m)
 {
@@ -714,11 +742,12 @@ static void advance_validation(master_t *m)
     if (!m->validation || !hp_lifecycle_validation_step(m->validation, &config, &error)) return;
     hp_lifecycle_validation_destroy(m->validation); m->validation = NULL;
     hp_lifecycle_client_t *client = m->validation_client; m->validation_client = NULL;
+    bool watched = m->validation_watch; m->validation_watch = false;
     if (!config || m->stopping) {
-        hp_lifecycle_reply(client, EX_CONFIG, error ? error : "server is shutting down\n");
+        reload_reply(client, EX_CONFIG, error ? error : "server is shutting down\n", watched);
         free(error); hp_lifecycle_release(config); return;
     }
-    prepare_reload(m, client, m->validation_force, config);
+    prepare_reload(m, client, m->validation_force, config, watched);
 }
 static void handle_control(master_t *m)
 {
@@ -760,7 +789,8 @@ static void commit_reload(master_t *m)
     m->startup_ms = pending->startup_ms; m->shutdown_ms = pending->shutdown_ms;
     hp_lifecycle_release(m->config); m->config = pending->config; pending->config = NULL;
     dispose(pending, true); free(pending); m->pending = NULL;
-    hp_lifecycle_reply(m->reply_client, 0, "configuration loaded\n"); m->reply_client = NULL;
+    reload_reply(m->reply_client, 0, "configuration loaded\n", m->pending_watch); m->reply_client = NULL;
+    m->pending_watch = false;
 }
 static int supervise(master_t *m)
 {
@@ -783,9 +813,11 @@ static int supervise(master_t *m)
             control_request_t *request = m->requests; m->requests = request->next;
             if (!m->requests) m->request_tail = &m->requests;
             --m->request_count;
-            start_validation(m, request->client, request->force, request->yaml, request->length);
+            start_validation(m, request->client, request->force, request->yaml, request->length, false);
             free(request); now = now_ms();
         }
+        advance_config_watch(m, now);
+        now = now_ms();
         if (m->stopping) {
             if (!m->current.pid && !m->candidate.pid && !m->retiring.pid && !m->validation) break;
             if (now >= m->shutdown_at) {
@@ -818,6 +850,7 @@ static int supervise(master_t *m)
             {.fd = m->control && !m->stopping && hp_lifecycle_control_has_capacity(m->control) ? m->control_fd : -1, .events = POLLIN},
             {.fd = m->pending && m->pending->log_state == LOG_CONNECTING ? m->pending->next_log_fd : -1, .events = POLLOUT}};
         uint64_t next = deadline(now, 1000);
+        if (!m->stopping && hp_config_watch_deadline(m->watch) < next) next = hp_config_watch_deadline(m->watch);
         if (m->requests && !m->candidate.pid && !m->retiring.pid && !m->pending && !m->validation && !m->stopping) next = now;
         if (m->validation && hp_lifecycle_validation_deadline(m->validation) < next)
             next = hp_lifecycle_validation_deadline(m->validation);
@@ -913,12 +946,12 @@ int hp_native_master_run(char *const arguments[], uint64_t startup_ms, uint64_t 
 Done:
     dispose(&m, true); return result;
 }
-int hp_native_lifecycle_run(hp_lifecycle_config_t *config, int control_fd)
+int hp_native_lifecycle_run(hp_lifecycle_config_t *config, int control_fd, hp_config_watch_t *watch)
 {
     master_t m = {.pid_fd = -1, .wake = {-1, -1}, .daemon_ready = -1,
         .current.ready_fd = -1, .candidate.ready_fd = -1, .retiring.ready_fd = -1,
         .startup_ms = config->startup_ms ? config->startup_ms : 30000, .shutdown_ms = config->shutdown_ms,
-        .config = config, .control_fd = control_fd, .next_log_fd = -1, .original_output = {-1, -1}};
+        .config = config, .control_fd = control_fd, .watch = watch, .next_log_fd = -1, .original_output = {-1, -1}};
     hp_lifecycle_retain(config);
     m.control = hp_lifecycle_control_create();
     m.request_tail = &m.requests;
